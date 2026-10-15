@@ -4,129 +4,186 @@ export default {
       return new Response("Bot is running ✅", { status: 200 });
     }
 
-    const report = {
+    const debug = {
       timestamp: new Date().toISOString(),
-      envCheck: {},
+      env: {},
       steps: {},
       errors: [],
+      chatId: null,
     };
 
     try {
       // ============================================
       // STEP 0: Check all environment variables
       // ============================================
-      report.envCheck = {
-        hasTelegramToken: !!env.TELEGRAM_BOT_TOKEN,
-        hasProjectId: !!env.FIREBASE_PROJECT_ID,
-        hasClientEmail: !!env.FIREBASE_CLIENT_EMAIL,
-        hasPrivateKey: !!env.FIREBASE_PRIVATE_KEY,
-        hasCloudName: !!env.CLOUDINARY_CLOUD_NAME,
-        hasUploadPreset: !!env.CLOUDINARY_UPLOAD_PRESET,
-        projectId: env.FIREBASE_PROJECT_ID || "MISSING",
+      debug.env = {
+        telegramToken: env.TELEGRAM_BOT_TOKEN
+          ? `set (${env.TELEGRAM_BOT_TOKEN.length} chars)`
+          : "❌ MISSING",
+        projectId: env.FIREBASE_PROJECT_ID || "❌ MISSING",
         clientEmail: env.FIREBASE_CLIENT_EMAIL
-          ? env.FIREBASE_CLIENT_EMAIL.substring(0, 40) + "..."
-          : "MISSING",
-        cloudName: env.CLOUDINARY_CLOUD_NAME || "MISSING",
-        uploadPreset: env.CLOUDINARY_UPLOAD_PRESET || "MISSING",
-        privateKeyStart: env.FIREBASE_PRIVATE_KEY
-          ? env.FIREBASE_PRIVATE_KEY.substring(0, 40)
-          : "MISSING",
-        privateKeyLength: env.FIREBASE_PRIVATE_KEY
-          ? env.FIREBASE_PRIVATE_KEY.length
-          : 0,
+          ? env.FIREBASE_CLIENT_EMAIL.substring(0, 50) + "..."
+          : "❌ MISSING",
+        privateKey: env.FIREBASE_PRIVATE_KEY
+          ? `set (${env.FIREBASE_PRIVATE_KEY.length} chars, starts: ${env.FIREBASE_PRIVATE_KEY.substring(0, 30)})`
+          : "❌ MISSING",
+        cloudName: env.CLOUDINARY_CLOUD_NAME || "❌ MISSING",
+        uploadPreset: env.CLOUDINARY_UPLOAD_PRESET || "❌ MISSING",
       };
 
+      // ============================================
+      // STEP 1: Parse Telegram update
+      // ============================================
       const update = await request.json();
       const message = update.message || update.channel_post;
 
       if (!message) {
-        report.steps.parse = "no message object";
-        return new Response(JSON.stringify(report), { status: 200 });
+        debug.steps.parse = "❌ No message in update";
+        return new Response("OK", { status: 200 });
       }
 
-      report.steps.messageType = message.photo ? "photo" : "text";
-      report.steps.messageText = message.text
+      debug.chatId = message.chat?.id;
+      debug.steps.messageText = message.text
         ? message.text.substring(0, 100)
         : "none";
-      report.steps.hasPhoto = !!message.photo;
-
-      if (!message.text) {
-        report.steps.parse = "no text in message";
-        return new Response(JSON.stringify(report), { status: 200 });
-      }
+      debug.steps.hasPhoto = !!message.photo;
 
       // ============================================
-      // TEST 1: Can we get a Firebase token?
+      // STEP 2: Test Firebase Token
       // ============================================
+      let firebaseToken = null;
       try {
-        const token = await getFirebaseToken(env);
-        report.steps.firebaseToken = token ? "✅ OK" : "❌ empty";
+        firebaseToken = await getFirebaseToken(env);
+        debug.steps.firebaseToken = "✅ Got token";
       } catch (e) {
-        report.steps.firebaseToken = "❌ FAILED";
-        report.errors.push("Firebase token: " + e.message);
+        debug.steps.firebaseToken = "❌ FAILED";
+        debug.errors.push("Firebase token error: " + e.message);
       }
 
       // ============================================
-      // TEST 2: Try saving a simple ad
+      // STEP 3: Try saving to Firebase
       // ============================================
-      try {
-        const token = await getFirebaseToken(env);
-        const projectId = env.FIREBASE_PROJECT_ID;
+      if (firebaseToken) {
+        try {
+          const adData = {
+            fields: {
+              title: { stringValue: "BOT DEBUG TEST" },
+              description: { stringValue: "If you see this, the bot works!" },
+              price: { stringValue: "0" },
+              phone: { stringValue: "" },
+              city: { stringValue: "" },
+              category: { stringValue: "Telegram" },
+              image: { stringValue: "" },
+              status: { stringValue: "draft" },
+              source: { stringValue: "telegram" },
+              views: { integerValue: "0" },
+              createdAt: { timestampValue: new Date().toISOString() },
+            },
+          };
 
-        const adData = {
-          fields: {
-            title: { stringValue: "TEST AD FROM BOT" },
-            description: { stringValue: "Debug test" },
-            price: { stringValue: "0" },
-            phone: { stringValue: "" },
-            city: { stringValue: "" },
-            category: { stringValue: "Telegram" },
-            image: { stringValue: "" },
-            status: { stringValue: "draft" },
-            source: { stringValue: "telegram" },
-            views: { integerValue: "0" },
-            createdAt: { timestampValue: new Date().toISOString() },
-          },
-        };
+          const url = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/ads`;
 
-        const firebaseUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads`;
+          const saveRes = await fetch(url, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${firebaseToken}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(adData),
+          });
 
-        const saveRes = await fetch(firebaseUrl, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(adData),
-        });
+          const responseText = await saveRes.text();
 
-        const responseText = await saveRes.text();
-
-        if (saveRes.ok) {
-          report.steps.firebaseSave = "✅ OK";
-          report.steps.firebaseResponse = responseText.substring(0, 200);
-        } else {
-          report.steps.firebaseSave = "❌ FAILED (" + saveRes.status + ")";
-          report.errors.push("Firebase save: " + responseText.substring(0, 300));
+          if (saveRes.ok) {
+            debug.steps.firebaseSave = "✅ SAVED";
+          } else {
+            debug.steps.firebaseSave = `❌ FAILED (HTTP ${saveRes.status})`;
+            debug.errors.push("Firebase response: " + responseText.substring(0, 500));
+          }
+        } catch (e) {
+          debug.steps.firebaseSave = "❌ EXCEPTION";
+          debug.errors.push("Save exception: " + e.message);
         }
-      } catch (e) {
-        report.steps.firebaseSave = "❌ EXCEPTION";
-        report.errors.push("Save exception: " + e.message);
+      } else {
+        debug.steps.firebaseSave = "⏭️ SKIPPED (no token)";
       }
 
-      return new Response(JSON.stringify(report, null, 2), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
+      // ============================================
+      // STEP 4: Send debug report to Telegram
+      // ============================================
+      if (debug.chatId && env.TELEGRAM_BOT_TOKEN) {
+        try {
+          const reportText = formatDebugReport(debug);
+          await fetch(
+            `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                chat_id: debug.chatId,
+                text: reportText,
+                parse_mode: "HTML",
+              }),
+            }
+          );
+        } catch (e) {
+          // Silent fail — we don't want to break the webhook
+        }
+      }
+
+      return new Response("OK", { status: 200 });
     } catch (error) {
-      report.errors.push("Main error: " + error.message);
-      return new Response(JSON.stringify(report, null, 2), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
+      debug.errors.push("Main error: " + error.message);
+
+      // Try to send error to Telegram
+      const update = await request.clone().json().catch(() => ({}));
+      const message = update.message || update.channel_post;
+      if (message?.chat?.id && env.TELEGRAM_BOT_TOKEN) {
+        try {
+          await fetch(
+            `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                chat_id: message.chat.id,
+                text: "🚨 Bot error:\n\n" + debug.errors.join("\n\n"),
+              }),
+            }
+          );
+        } catch (e) {}
+      }
+
+      return new Response("OK", { status: 200 });
     }
   },
 };
+
+// ===============================================
+// DEBUG: Format the report for Telegram
+// ===============================================
+function formatDebugReport(debug) {
+  let text = "🤖 <b>BOT DEBUG REPORT</b>\n\n";
+
+  text += "<b>📋 Environment:</b>\n";
+  for (const [key, val] of Object.entries(debug.env)) {
+    text += `• <code>${key}</code>: ${val}\n`;
+  }
+
+  text += "\n<b>🔧 Steps:</b>\n";
+  for (const [key, val] of Object.entries(debug.steps)) {
+    text += `• <code>${key}</code>: ${val}\n`;
+  }
+
+  if (debug.errors.length > 0) {
+    text += "\n<b>❌ Errors:</b>\n";
+    debug.errors.forEach((e) => {
+      text += `• ${e.substring(0, 500)}\n\n`;
+    });
+  }
+
+  return text;
+}
 
 // ===============================================
 // HELPER: Get Firebase Access Token
