@@ -1,4 +1,11 @@
 name = "abaybot-worker"
 main = "worker.js"
 compatibility_date = "2024-10-01"
-keep_vars = true
+
+[vars]
+TELEGRAM_BOT_TOKEN = "7123456789:AAHxxxxxxxxxxxxxxxx"
+FIREBASE_PROJECT_ID = "yeegna-gebeya"
+FIREBASE_CLIENT_EMAIL = "firebase-adminsdk-xxxxx@yeegna-gebeya.iam.gserviceaccount.com"
+FIREBASE_PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----\nMIIEv...\n-----END PRIVATE KEY-----\n"
+CLOUDINARY_CLOUD_NAME = "lisqr7zn"
+CLOUDINARY_UPLOAD_PRESET = "yeegna_uploads"
