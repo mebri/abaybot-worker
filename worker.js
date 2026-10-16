@@ -3,18 +3,31 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/test") {
-      const report = { envCheck: {} };
+      const report = { envCheck: {}, serviceAccountInfo: {}, firebaseTest: {} };
       report.envCheck = {
         hasTelegramToken: !!env.TELEGRAM_BOT_TOKEN,
         hasServiceAccount: !!env.FIREBASE_SERVICE_ACCOUNT,
         hasCloudName: !!env.CLOUDINARY_CLOUD_NAME,
         hasUploadPreset: !!env.CLOUDINARY_UPLOAD_PRESET,
-        hasTelegramUserId: !!env.TELEGRAM_USER_ID,
       };
-      return new Response(JSON.stringify(report, null, 2), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
+      try {
+        const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
+        report.serviceAccountInfo = {
+          projectId: sa.project_id,
+          clientEmail: sa.client_email,
+          privateKeyLength: sa.private_key?.length || 0,
+        };
+      } catch (e) {
+        report.serviceAccountInfo.error = e.message;
+        return jsonResponse(report);
+      }
+      try {
+        const token = await getFirebaseToken(env);
+        report.firebaseTest.token = "✅ Got token";
+      } catch (e) {
+        report.firebaseTest.error = e.message;
+      }
+      return jsonResponse(report);
     }
 
     if (request.method !== "POST") {
@@ -24,115 +37,68 @@ export default {
     try {
       const update = await request.json();
       const message = update.message || update.channel_post;
-      if (!message) return new Response("OK", { status: 200 });
+
+      if (!message) {
+        return new Response("OK", { status: 200 });
+      }
 
       const messageText = message.text || message.caption;
-      if (!messageText) return new Response("OK", { status: 200 });
 
+      if (!messageText) {
+        return new Response("OK", { status: 200 });
+      }
+
+      // ============================================
+      // PARSE MESSAGE
+      // ============================================
       const lines = messageText.split("\n").map((l) => l.trim()).filter(Boolean);
       const title = lines[0] || "Untitled Ad";
       let price = "";
       let phone = "";
       let city = "";
-      let category = "";
-      let subcategory = "";
-      let condition = "";
-      let type = "";
-      let furnitureType = "";
-      let laborType = "";
 
-      // ============================================
-      // PARSE FIELDS
-      // ============================================
       for (const line of lines) {
-        // Price
+        // ✅ SMART PRICE PARSER
+        // Handles: price, peric, pris, ዋጋ, ETB, ብር
+        // Handles: 4.200.000 (dots), 4,200,000 (commas), 4 200 000 (spaces)
+        // Handles: 12.5 MILLION, 1.5M, 500K, ሚሊዮን, ሺህ
         const priceMatch = line.match(
-          /(?:price|ዋጋ|ETB|ብር)[\s:]*([\d,.]+)\s*(MILLION|Million|M|K|Thousand|THOUSAND|ሚሊዮን|ሺህ)?/i
+          /(?:price|peric|pris|pric|ዋጋ|ETB|ብር)[\s:.]*([\d.,\s]+)\s*(MILLION|Million|M|K|Thousand|THOUSAND|ሚሊዮን|ሺህ)?/i
         );
         if (priceMatch && !price) {
-          let val = parseFloat(priceMatch[1].replace(/,/g, ""));
+          // Clean the number: remove all dots, commas, and spaces
+          let rawNum = priceMatch[1].replace(/[\s.,]/g, "");
+          let val = parseFloat(rawNum);
           const unit = (priceMatch[2] || "").toUpperCase();
-          if (unit.includes("MILLION") || unit === "M" || unit.includes("ሚሊዮን")) val *= 1000000;
-          else if (unit.includes("THOUSAND") || unit === "K" || unit.includes("ሺህ")) val *= 1000;
-          price = String(Math.round(val));
+
+          if (unit.includes("MILLION") || unit === "M" || unit.includes("ሚሊዮን")) {
+            val *= 1000000;
+          } else if (unit.includes("THOUSAND") || unit === "K" || unit.includes("ሺህ")) {
+            val *= 1000;
+          }
+
+          if (!isNaN(val) && val > 0) {
+            const rounded = Math.round(val);
+            price = rounded.toLocaleString("en-US");
+          }
         }
 
         // Phone
         const phoneMatch = line.match(/(?:\+251|0)[\s-]?9[\d\s-]{7,}/);
-        if (phoneMatch && !phone) phone = phoneMatch[0].replace(/[\s-]/g, "");
+        if (phoneMatch && !phone) {
+          phone = phoneMatch[0].replace(/[\s-]/g, "");
+        }
 
         // City
         const cityMatch = line.match(/(?:city|location|ከተማ)[\s:]+(.+)/i);
-        if (cityMatch && !city) city = cityMatch[1].trim();
-        else if (/addis|ababa|adama|hawassa|bahir dar|mekelle|gondar|jimma|dire dawa|bishoftu/i.test(line) && !city) {
+        if (cityMatch && !city) {
+          city = cityMatch[1].trim();
+        } else if (
+          /addis|ababa|adama|hawassa|bahir dar|mekelle|gondar|jimma|dire dawa|bishoftu/i.test(line) &&
+          !city
+        ) {
           city = line.trim();
         }
-      }
-
-      // ============================================
-      // AUTO-DETECT CATEGORY
-      // ============================================
-      const lowerText = messageText.toLowerCase();
-
-      // Cars
-      if (/\b(car|toyota|nissan|honda|hyundai|mazda|ford|mitsubishi|suzuki|isuzu|hilux|corolla|vitz|prado|rav4|crv|civic|benz|bmw|kia|chevrolet|land cruiser|pickup|sedan|suv)\b/i.test(lowerText)) {
-        category = "Cars";
-        if (/\b(rent|rental)\b/i.test(lowerText)) condition = "Rent";
-        else if (/\b(electric|ev)\b/i.test(lowerText)) condition = "Electric";
-        else if (/\b(new|brand new|0 km)\b/i.test(lowerText)) condition = "New";
-        else if (/\b(used|second|km)\b/i.test(lowerText)) condition = "Used";
-      }
-      // Houses
-      else if (/\b(house|home|villa|bungalow|real estate|ቤት)\b/i.test(lowerText)) {
-        category = "Houses";
-        if (/\b(rent)\b/i.test(lowerText)) type = "rent";
-        else if (/\b(sale|sell)\b/i.test(lowerText)) type = "sale";
-      }
-      // Rentals (apartments, shops, offices)
-      else if (/\b(apartment|condominium|shop|store|office|rental|studio)\b/i.test(lowerText)) {
-        category = "Rentals";
-        if (/\b(apartment|condo|studio)\b/i.test(lowerText)) type = "apartment";
-        else if (/\b(shop|store)\b/i.test(lowerText)) type = "shop";
-        else if (/\b(office)\b/i.test(lowerText)) type = "office";
-      }
-      // Electronics
-      else if (/\b(phone|iphone|samsung|tecno|infinix|huawei|oppo|laptop|computer|pc|macbook|tv|television|speaker|headphone|earphone|airpod|tablet|ipad|camera|electronics)\b/i.test(lowerText)) {
-        category = "Electronics";
-        if (/\b(phone|iphone|samsung|tecno|infinix|huawei|oppo)\b/i.test(lowerText)) subcategory = "Phones";
-        else if (/\b(laptop|computer|pc|macbook)\b/i.test(lowerText)) subcategory = "Computers";
-        else if (/\b(tv|television)\b/i.test(lowerText)) subcategory = "TVs";
-        else if (/\b(speaker|headphone|earphone|airpod|audio)\b/i.test(lowerText)) subcategory = "Audio";
-        else subcategory = "Other";
-
-        if (/\b(new|brand new|sealed)\b/i.test(lowerText)) condition = "New";
-        else if (/\b(used|second)\b/i.test(lowerText)) condition = "Used";
-      }
-      // Furniture
-      else if (/\b(sofa|couch|chair|table|bed|mattress|cabinet|wardrobe|furniture|shelf|desk)\b/i.test(lowerText)) {
-        category = "Furniture";
-        if (/\b(sofa|couch)\b/i.test(lowerText)) furnitureType = "Sofas";
-        else if (/\b(bed|mattress)\b/i.test(lowerText)) furnitureType = "Beds";
-        else if (/\b(chair|table|desk)\b/i.test(lowerText)) furnitureType = "Chairs and Tables";
-        else if (/\b(cabinet|wardrobe|shelf)\b/i.test(lowerText)) furnitureType = "Cabinets";
-        else furnitureType = "Other";
-
-        if (/\b(new)\b/i.test(lowerText)) condition = "New";
-        else if (/\b(used)\b/i.test(lowerText)) condition = "Used";
-      }
-      // Labor & Services
-      else if (/\b(electrician|plumber|painter|cleaning|construction|worker|technician|carpenter|welder|driver)\b/i.test(lowerText)) {
-        category = "Labor & Services";
-        if (/\b(electrician)\b/i.test(lowerText)) laborType = "Electrician";
-        else if (/\b(plumber)\b/i.test(lowerText)) laborType = "Plumber";
-        else if (/\b(painter)\b/i.test(lowerText)) laborType = "Painter";
-        else if (/\b(cleaning)\b/i.test(lowerText)) laborType = "Cleaning";
-        else if (/\b(construction|worker)\b/i.test(lowerText)) laborType = "Construction";
-        else laborType = "Other";
-      }
-      // Fallback
-      else {
-        category = "ምንአለሽ ተራ";
-        condition = "Used";
       }
 
       // ============================================
@@ -143,18 +109,23 @@ export default {
 
       if (message.photo && message.photo.length > 0) {
         try {
-          imageDebug = "ok. ";
+          imageDebug = "photo found. ";
           const largest = message.photo[message.photo.length - 1];
+
           const fileRes = await fetch(
             `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${largest.file_id}`
           );
           const fileInfo = await fileRes.json();
+          imageDebug += "getFile=" + (fileInfo.ok ? "ok" : "fail") + ". ";
 
           if (fileInfo.ok) {
             const imgRes = await fetch(
               `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`
             );
+            imageDebug += "download=" + (imgRes.ok ? "ok" : "fail") + ". ";
+
             const blob = await imgRes.blob();
+            imageDebug += "size=" + Math.round(blob.size / 1024) + "KB. ";
 
             const formData = new FormData();
             formData.append("file", blob);
@@ -165,6 +136,8 @@ export default {
               { method: "POST", body: formData }
             );
             const cloudData = await cloudRes.json();
+            imageDebug += "cloud=" + cloudRes.status + ". ";
+
             if (cloudData.secure_url) {
               imageUrl = cloudData.secure_url;
               imageDebug += "✅ uploaded";
@@ -176,11 +149,11 @@ export default {
           imageDebug += "exception: " + e.message;
         }
       } else {
-        imageDebug = "❌ no photo";
+        imageDebug = "❌ no photo in message";
       }
 
       // ============================================
-      // SAVE — LIKE A NORMAL USER AD
+      // SAVE TO FIREBASE
       // ============================================
       const token = await getFirebaseToken(env);
       const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
@@ -192,26 +165,17 @@ export default {
           price: { stringValue: price || "0" },
           phone: { stringValue: phone },
           city: { stringValue: city },
-          category: { stringValue: category }, // ✅ Auto-detected, not "Telegram"
-          subcategory: { stringValue: subcategory },
-          condition: { stringValue: condition },
-          type: { stringValue: type },
-          furnitureType: { stringValue: furnitureType },
-          laborType: { stringValue: laborType },
+          category: { stringValue: "Telegram" },
           image: { stringValue: imageUrl },
           images: {
             arrayValue: imageUrl
               ? { values: [{ stringValue: imageUrl }] }
               : { values: [] },
           },
-          status: { stringValue: "available" },
-          source: { stringValue: "telegram" }, // internal marker (not shown on cards)
+          status: { stringValue: "draft" },
+          source: { stringValue: "telegram" },
           views: { integerValue: "0" },
           createdAt: { timestampValue: new Date().toISOString() },
-          // ✅ Owned by the Telegram user account
-          userId: { stringValue: env.TELEGRAM_USER_ID || "" },
-          userEmail: { stringValue: env.TELEGRAM_EMAIL || "telegram@yegnagebeya.com" },
-          userName: { stringValue: env.TELEGRAM_NAME || "Yegna Gebeya" },
         },
       };
 
@@ -225,11 +189,11 @@ export default {
         body: JSON.stringify(adData),
       });
 
+      // Reply to Telegram
       if (env.TELEGRAM_BOT_TOKEN && message.chat?.id) {
         const replyText =
-          (saveRes.ok ? "✅ Posted live on marketplace!\n" : "⚠️ Save failed.\n") +
-          "📂 Category: " + category + "\n" +
-          "💰 Price: " + (price || "0") + " ETB\n" +
+          (saveRes.ok ? "✅ Ad saved to drafts!\n" : "⚠️ Save failed.\n") +
+          "💰 Price: " + (price ? price + " ETB" : "not found") + "\n" +
           "📸 Image: " + imageDebug;
 
         await fetch(
@@ -237,7 +201,10 @@ export default {
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ chat_id: message.chat.id, text: replyText }),
+            body: JSON.stringify({
+              chat_id: message.chat.id,
+              text: replyText,
+            }),
           }
         );
       }
@@ -248,6 +215,13 @@ export default {
     }
   },
 };
+
+function jsonResponse(obj) {
+  return new Response(JSON.stringify(obj, null, 2), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
 async function getFirebaseToken(env) {
   const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
@@ -274,6 +248,7 @@ async function getFirebaseToken(env) {
     .replace(/\s/g, "");
 
   const der = Uint8Array.from(atob(pem), (c) => c.charCodeAt(0));
+
   const key = await crypto.subtle.importKey(
     "pkcs8",
     der,
@@ -298,7 +273,9 @@ async function getFirebaseToken(env) {
   });
 
   const tokData = await tokRes.json();
-  if (!tokData.access_token) throw new Error(JSON.stringify(tokData));
+  if (!tokData.access_token) {
+    throw new Error(JSON.stringify(tokData));
+  }
   return tokData.access_token;
 }
 
@@ -309,6 +286,8 @@ function base64UrlEncodeString(str) {
 
 function base64UrlEncodeBytes(bytes) {
   let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
