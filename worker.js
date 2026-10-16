@@ -1,4 +1,3 @@
-
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -43,21 +42,16 @@ export default {
         if (priceMatch && !price) {
           const rawNum = priceMatch[1].trim();
           const unit = (priceMatch[2] || "").toUpperCase();
-
-          // Detect thousand-separator format: X.XXX, X.XXX.XXX, X,XXX,XXX
           const cleaned = rawNum.replace(/\s/g, "");
           const thousandPattern = /^\d{1,3}([.,]\d{3})+$/;
 
           let numVal;
           if (thousandPattern.test(cleaned)) {
-            // "5.300.000" → 5300000  (dots are thousand separators)
             numVal = parseFloat(cleaned.replace(/[.,]/g, ""));
           } else {
-            // "12.5" → 12.5  (dot is decimal)
             numVal = parseFloat(cleaned.replace(/,/g, ""));
           }
 
-          // Apply unit multiplier ONLY if number is small
           if (unit.includes("MILLION") || unit.includes("ሚሊዮን")) {
             if (numVal < 100000) numVal *= 1000000;
           } else if (unit.includes("BILLION") || unit.includes("ቢሊዮን")) {
@@ -71,7 +65,7 @@ export default {
           }
         }
 
-        // Phone — pick FIRST phone from the list
+        // Phone
         const phoneMatch = line.match(/(?:\+251|0)[\s-]?9[\d\s-]{7,}/);
         if (phoneMatch && !phone) {
           phone = phoneMatch[0].replace(/[\s-]/g, "");
@@ -140,7 +134,7 @@ export default {
       }
 
       // ============================================
-      // SAVE TO FIREBASE
+      // SAVE TO FIREBASE — status "available" (no draft)
       // ============================================
       const token = await getFirebaseToken(env);
       const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
@@ -159,7 +153,7 @@ export default {
               ? { values: [{ stringValue: imageUrl }] }
               : { values: [] },
           },
-          status: { stringValue: "draft" },
+          status: { stringValue: "available" }, // ✅ Direct publish, no draft
           source: { stringValue: "telegram" },
           views: { integerValue: "0" },
           createdAt: { timestampValue: new Date().toISOString() },
@@ -178,7 +172,7 @@ export default {
 
       if (env.TELEGRAM_BOT_TOKEN && message.chat?.id) {
         const replyText =
-          (saveRes.ok ? "✅ Ad saved!\n" : "⚠️ Save failed.\n") +
+          (saveRes.ok ? "✅ Ad posted to marketplace!\n" : "⚠️ Save failed.\n") +
           "💰 Price: " + (price || "not found") + " ETB\n" +
           "📞 Phone: " + (phone || "not found") + "\n" +
           "📍 City: " + (city || "not found") + "\n" +
