@@ -1,16 +1,17 @@
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (url.pathname === "/test") {
-      const report = { envCheck: {} };
-      report.envCheck = {
-        hasTelegramToken: !!env.TELEGRAM_BOT_TOKEN,
-        hasServiceAccount: !!env.FIREBASE_SERVICE_ACCOUNT,
-        hasCloudName: !!env.CLOUDINARY_CLOUD_NAME,
-        hasUploadPreset: !!env.CLOUDINARY_UPLOAD_PRESET,
-      };
-      return jsonResponse(report);
+      return jsonResponse({
+        envCheck: {
+          hasTelegramToken: !!env.TELEGRAM_BOT_TOKEN,
+          hasServiceAccount: !!env.FIREBASE_SERVICE_ACCOUNT,
+          hasCloudName: !!env.CLOUDINARY_CLOUD_NAME,
+          hasUploadPreset: !!env.CLOUDINARY_UPLOAD_PRESET,
+        },
+      });
     }
 
     if (request.method !== "POST") {
@@ -20,8 +21,8 @@ export default {
     try {
       const update = await request.json();
       const message = update.message || update.channel_post;
-
       if (!message) return new Response("OK", { status: 200 });
+
       const messageText = message.text || message.caption;
       if (!messageText) return new Response("OK", { status: 200 });
 
@@ -35,20 +36,24 @@ export default {
       let city = "";
 
       for (const line of lines) {
-        // ✅ ULTRA-SMART PRICE PARSER
+        // ✅ SMART PRICE PARSER — handles "Price:-", "Price..", "peric", dots, commas, spaces
         const priceMatch = line.match(
-          /(?:price|peric|pris|ዋጋ|ETB|ብር)[\s:.]*([\d.,\s]+)\s*(MILLION|Million|BILLION|Billion|K\b|Thousand|THOUSAND|ሚሊዮን|ቢሊዮን|ሺህ)?/i
+          /(?:price|peric|pris|ዋጋ|ETB|ብር)[\s:.\-]*([\d.,\s]+)\s*(MILLION|Million|BILLION|Billion|K\b|Thousand|THOUSAND|ሚሊዮን|ቢሊዮን|ሺህ)?/i
         );
+
         if (priceMatch && !price) {
           const rawNum = priceMatch[1].trim();
           const unit = (priceMatch[2] || "").toUpperCase();
+
           const cleaned = rawNum.replace(/\s/g, "");
           const thousandPattern = /^\d{1,3}([.,]\d{3})+$/;
 
           let numVal;
           if (thousandPattern.test(cleaned)) {
+            // "5.300.000" → 5300000 (dots = thousand separators)
             numVal = parseFloat(cleaned.replace(/[.,]/g, ""));
           } else {
+            // "12.5" → 12.5 (dot = decimal)
             numVal = parseFloat(cleaned.replace(/,/g, ""));
           }
 
@@ -56,7 +61,11 @@ export default {
             if (numVal < 100000) numVal *= 1000000;
           } else if (unit.includes("BILLION") || unit.includes("ቢሊዮን")) {
             if (numVal < 100000) numVal *= 1000000000;
-          } else if (unit.includes("THOUSAND") || unit === "K" || unit.includes("ሺህ")) {
+          } else if (
+            unit.includes("THOUSAND") ||
+            unit === "K" ||
+            unit.includes("ሺህ")
+          ) {
             if (numVal < 1000) numVal *= 1000;
           }
 
@@ -76,7 +85,9 @@ export default {
         if (cityMatch && !city) {
           city = cityMatch[1].trim();
         } else if (
-          /addis|ababa|adama|hawassa|bahir dar|mekelle|gondar|jimma|dire dawa|bishoftu/i.test(line) &&
+          /addis|ababa|adama|hawassa|bahir dar|mekelle|gondar|jimma|dire dawa|bishoftu/i.test(
+            line
+          ) &&
           !city
         ) {
           city = line.trim();
@@ -134,7 +145,7 @@ export default {
       }
 
       // ============================================
-      // SAVE TO FIREBASE — status "available" (no draft)
+      // SAVE TO FIREBASE
       // ============================================
       const token = await getFirebaseToken(env);
       const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
@@ -153,7 +164,7 @@ export default {
               ? { values: [{ stringValue: imageUrl }] }
               : { values: [] },
           },
-          status: { stringValue: "available" }, // ✅ Direct publish, no draft
+          status: { stringValue: "draft" },
           source: { stringValue: "telegram" },
           views: { integerValue: "0" },
           createdAt: { timestampValue: new Date().toISOString() },
@@ -172,7 +183,7 @@ export default {
 
       if (env.TELEGRAM_BOT_TOKEN && message.chat?.id) {
         const replyText =
-          (saveRes.ok ? "✅ Ad posted to marketplace!\n" : "⚠️ Save failed.\n") +
+          (saveRes.ok ? "✅ Ad saved!\n" : "⚠️ Save failed.\n") +
           "💰 Price: " + (price || "not found") + " ETB\n" +
           "📞 Phone: " + (phone || "not found") + "\n" +
           "📍 City: " + (city || "not found") + "\n" +
@@ -223,15 +234,21 @@ async function getFirebaseToken(env) {
     .replace("-----END PRIVATE KEY-----", "")
     .replace(/\s/g, "");
   const der = Uint8Array.from(atob(pem), (c) => c.charCodeAt(0));
+
   const key = await crypto.subtle.importKey(
-    "pkcs8", der,
+    "pkcs8",
+    der,
     { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false, ["sign"]
+    false,
+    ["sign"]
   );
+
   const sigBuffer = await crypto.subtle.sign(
-    "RSASSA-PKCS1-v1_5", key,
+    "RSASSA-PKCS1-v1_5",
+    key,
     new TextEncoder().encode(signingInput)
   );
+
   const signature = base64UrlEncodeBytes(new Uint8Array(sigBuffer));
   const jwt = `${signingInput}.${signature}`;
 
@@ -240,6 +257,7 @@ async function getFirebaseToken(env) {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
   });
+
   const tokData = await tokRes.json();
   if (!tokData.access_token) throw new Error(JSON.stringify(tokData));
   return tokData.access_token;
@@ -252,6 +270,8 @@ function base64UrlEncodeString(str) {
 
 function base64UrlEncodeBytes(bytes) {
   let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
