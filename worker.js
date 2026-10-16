@@ -2,9 +2,6 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // ============================================
-    // TEST MODE
-    // ============================================
     if (url.pathname === "/test") {
       const report = { envCheck: {}, serviceAccountInfo: {}, firebaseTest: {} };
       report.envCheck = {
@@ -27,43 +24,12 @@ export default {
       try {
         const token = await getFirebaseToken(env);
         report.firebaseTest.token = "✅ Got token";
-        const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
-        const adData = {
-          fields: {
-            title: { stringValue: "TEST FROM /test" },
-            description: { stringValue: "Debug test" },
-            price: { stringValue: "0" },
-            phone: { stringValue: "" },
-            city: { stringValue: "" },
-            category: { stringValue: "Telegram" },
-            image: { stringValue: "" },
-            status: { stringValue: "draft" },
-            source: { stringValue: "telegram" },
-            views: { integerValue: "0" },
-            createdAt: { timestampValue: new Date().toISOString() },
-          },
-        };
-        const fbUrl = `https://firestore.googleapis.com/v1/projects/${sa.project_id}/databases/(default)/documents/ads`;
-        const saveRes = await fetch(fbUrl, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(adData),
-        });
-        report.firebaseTest.saveStatus = saveRes.status;
-        report.firebaseTest.saveOk = saveRes.ok;
-        report.firebaseTest.saveResponse = (await saveRes.text()).substring(0, 300);
       } catch (e) {
         report.firebaseTest.error = e.message;
       }
       return jsonResponse(report);
     }
 
-    // ============================================
-    // NORMAL WEBHOOK MODE
-    // ============================================
     if (request.method !== "POST") {
       return new Response("Bot is running ✅", { status: 200 });
     }
@@ -72,40 +38,40 @@ export default {
       const update = await request.json();
       const message = update.message || update.channel_post;
 
-      if (!message || !message.text) {
+      if (!message) {
         return new Response("OK", { status: 200 });
       }
+
+      // ✅ THE FIX: Read from text OR caption
+      const messageText = message.text || message.caption;
+
+      if (!messageText) {
+        return new Response("OK", { status: 200 });
+      }
+
+      console.log("📩 Got message:", messageText.substring(0, 50));
 
       // ============================================
       // PARSE MESSAGE
       // ============================================
-      const lines = message.text.split("\n").filter((l) => l.trim());
+      const lines = messageText.split("\n").filter((l) => l.trim());
       const title = lines[0] || "Untitled Ad";
       let price = "";
       let phone = "";
       let city = "";
 
       for (const line of lines) {
-        // Price
         const priceMatch = line.match(/(?:price|ዋጋ|ETB|ብር)[\s:]*([\d,]+)/i);
-        if (priceMatch && !price) {
-          price = priceMatch[1].replace(/,/g, "");
-        }
+        if (priceMatch && !price) price = priceMatch[1].replace(/,/g, "");
 
-        // Phone
         const phoneMatch = line.match(/(?:\+251|0)[\s-]?9[\d\s-]{7,}/);
-        if (phoneMatch && !phone) {
-          phone = phoneMatch[0].replace(/[\s-]/g, "");
-        }
+        if (phoneMatch && !phone) phone = phoneMatch[0].replace(/[\s-]/g, "");
 
-        // City — strip the "City:" prefix
         const cityMatch = line.match(/(?:city|location|ከተማ)[\s:]+(.+)/i);
         if (cityMatch && !city) {
           city = cityMatch[1].trim();
         } else if (
-          /addis|ababa|adama|hawassa|bahir dar|mekelle|gondar|jimma|dire dawa|bishoftu|shashemene/i.test(
-            line
-          ) &&
+          /addis|ababa|adama|hawassa|bahir dar|mekelle|gondar|jimma|dire dawa|bishoftu/i.test(line) &&
           !city
         ) {
           city = line.trim();
@@ -113,7 +79,7 @@ export default {
       }
 
       // ============================================
-      // UPLOAD IMAGE (with debug info)
+      // UPLOAD IMAGE
       // ============================================
       let imageUrl = "";
       let imageDebug = "";
@@ -122,7 +88,6 @@ export default {
         try {
           imageDebug = "photo found. ";
           const largest = message.photo[message.photo.length - 1];
-          imageDebug += "fileId=" + largest.file_id.substring(0, 10) + "... ";
 
           const fileRes = await fetch(
             `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${largest.file_id}`
@@ -154,7 +119,7 @@ export default {
               imageUrl = cloudData.secure_url;
               imageDebug += "✅ uploaded";
             } else {
-              imageDebug += "❌ " + (cloudData.error?.message || "unknown error");
+              imageDebug += "❌ " + (cloudData.error?.message || "unknown");
             }
           }
         } catch (e) {
@@ -173,7 +138,7 @@ export default {
       const adData = {
         fields: {
           title: { stringValue: title },
-          description: { stringValue: message.text },
+          description: { stringValue: messageText },
           price: { stringValue: price || "0" },
           phone: { stringValue: phone },
           city: { stringValue: city },
@@ -201,9 +166,7 @@ export default {
         body: JSON.stringify(adData),
       });
 
-      // ============================================
-      // REPLY TO TELEGRAM WITH DEBUG INFO
-      // ============================================
+      // Reply to Telegram
       if (env.TELEGRAM_BOT_TOKEN && message.chat?.id) {
         const replyText =
           (saveRes.ok ? "✅ Ad saved to drafts!\n" : "⚠️ Save failed.\n") +
@@ -230,9 +193,6 @@ export default {
   },
 };
 
-// ===============================================
-// HELPERS
-// ===============================================
 function jsonResponse(obj) {
   return new Response(JSON.stringify(obj, null, 2), {
     status: 200,
