@@ -42,31 +42,48 @@ export default {
         return new Response("OK", { status: 200 });
       }
 
-      // ✅ THE FIX: Read from text OR caption
       const messageText = message.text || message.caption;
 
       if (!messageText) {
         return new Response("OK", { status: 200 });
       }
 
-      console.log("📩 Got message:", messageText.substring(0, 50));
-
       // ============================================
       // PARSE MESSAGE
       // ============================================
-      const lines = messageText.split("\n").filter((l) => l.trim());
+      const lines = messageText.split("\n").map((l) => l.trim()).filter(Boolean);
       const title = lines[0] || "Untitled Ad";
       let price = "";
       let phone = "";
       let city = "";
 
       for (const line of lines) {
-        const priceMatch = line.match(/(?:price|ዋጋ|ETB|ብር)[\s:]*([\d,]+)/i);
-        if (priceMatch && !price) price = priceMatch[1].replace(/,/g, "");
+        // ✅ PRICE PARSER with comma formatting (Option B)
+        const priceMatch = line.match(
+          /(?:price|ዋጋ|ETB|ብር)[\s:]*([\d,.]+)\s*(MILLION|Million|M|K|Thousand|THOUSAND|ሚሊዮን|ሺህ)?/i
+        );
+        if (priceMatch && !price) {
+          let val = parseFloat(priceMatch[1].replace(/,/g, ""));
+          const unit = (priceMatch[2] || "").toUpperCase();
 
+          if (unit.includes("MILLION") || unit === "M" || unit.includes("ሚሊዮን")) {
+            val *= 1000000;
+          } else if (unit.includes("THOUSAND") || unit === "K" || unit.includes("ሺህ")) {
+            val *= 1000;
+          }
+
+          // ✅ Store with commas: "17,500,000"
+          const rounded = Math.round(val);
+          price = rounded.toLocaleString("en-US");
+        }
+
+        // Phone
         const phoneMatch = line.match(/(?:\+251|0)[\s-]?9[\d\s-]{7,}/);
-        if (phoneMatch && !phone) phone = phoneMatch[0].replace(/[\s-]/g, "");
+        if (phoneMatch && !phone) {
+          phone = phoneMatch[0].replace(/[\s-]/g, "");
+        }
 
+        // City
         const cityMatch = line.match(/(?:city|location|ከተማ)[\s:]+(.+)/i);
         if (cityMatch && !city) {
           city = cityMatch[1].trim();
@@ -139,7 +156,7 @@ export default {
         fields: {
           title: { stringValue: title },
           description: { stringValue: messageText },
-          price: { stringValue: price || "0" },
+          price: { stringValue: price || "0" }, // ✅ Already formatted with commas
           phone: { stringValue: phone },
           city: { stringValue: city },
           category: { stringValue: "Telegram" },
@@ -170,6 +187,7 @@ export default {
       if (env.TELEGRAM_BOT_TOKEN && message.chat?.id) {
         const replyText =
           (saveRes.ok ? "✅ Ad saved to drafts!\n" : "⚠️ Save failed.\n") +
+          "💰 Price: " + (price || "not found") + " ETB\n" +
           "📸 Image: " + imageDebug;
 
         await fetch(
@@ -187,7 +205,6 @@ export default {
 
       return new Response("OK", { status: 200 });
     } catch (error) {
-      console.error("Main error:", error.message);
       return new Response("Error: " + error.message, { status: 200 });
     }
   },
