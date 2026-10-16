@@ -200,7 +200,7 @@ async function signRS256(data, privateKeyPem) {
     { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
     false,
     ["sign"]
-  );
+  ); 
 
   const signature = await crypto.subtle.sign(
     "RSASSA-PKCS1-v1_5",
