@@ -1,32 +1,16 @@
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (url.pathname === "/test") {
-      const report = { envCheck: {}, serviceAccountInfo: {}, firebaseTest: {} };
+      const report = { envCheck: {} };
       report.envCheck = {
         hasTelegramToken: !!env.TELEGRAM_BOT_TOKEN,
         hasServiceAccount: !!env.FIREBASE_SERVICE_ACCOUNT,
         hasCloudName: !!env.CLOUDINARY_CLOUD_NAME,
         hasUploadPreset: !!env.CLOUDINARY_UPLOAD_PRESET,
       };
-      try {
-        const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
-        report.serviceAccountInfo = {
-          projectId: sa.project_id,
-          clientEmail: sa.client_email,
-          privateKeyLength: sa.private_key?.length || 0,
-        };
-      } catch (e) {
-        report.serviceAccountInfo.error = e.message;
-        return jsonResponse(report);
-      }
-      try {
-        const token = await getFirebaseToken(env);
-        report.firebaseTest.token = "✅ Got token";
-      } catch (e) {
-        report.firebaseTest.error = e.message;
-      }
       return jsonResponse(report);
     }
 
@@ -38,15 +22,9 @@ export default {
       const update = await request.json();
       const message = update.message || update.channel_post;
 
-      if (!message) {
-        return new Response("OK", { status: 200 });
-      }
-
+      if (!message) return new Response("OK", { status: 200 });
       const messageText = message.text || message.caption;
-
-      if (!messageText) {
-        return new Response("OK", { status: 200 });
-      }
+      if (!messageText) return new Response("OK", { status: 200 });
 
       // ============================================
       // PARSE MESSAGE
@@ -58,32 +36,42 @@ export default {
       let city = "";
 
       for (const line of lines) {
-        // ✅ SMART PRICE PARSER
-        // Handles: price, peric, pris, ዋጋ, ETB, ብር
-        // Handles: 4.200.000 (dots), 4,200,000 (commas), 4 200 000 (spaces)
-        // Handles: 12.5 MILLION, 1.5M, 500K, ሚሊዮን, ሺህ
+        // ✅ ULTRA-SMART PRICE PARSER
         const priceMatch = line.match(
-          /(?:price|peric|pris|pric|ዋጋ|ETB|ብር)[\s:.]*([\d.,\s]+)\s*(MILLION|Million|M|K|Thousand|THOUSAND|ሚሊዮን|ሺህ)?/i
+          /(?:price|peric|pris|ዋጋ|ETB|ብር)[\s:.]*([\d.,\s]+)\s*(MILLION|Million|BILLION|Billion|K\b|Thousand|THOUSAND|ሚሊዮን|ቢሊዮን|ሺህ)?/i
         );
         if (priceMatch && !price) {
-          // Clean the number: remove all dots, commas, and spaces
-          let rawNum = priceMatch[1].replace(/[\s.,]/g, "");
-          let val = parseFloat(rawNum);
+          const rawNum = priceMatch[1].trim();
           const unit = (priceMatch[2] || "").toUpperCase();
 
-          if (unit.includes("MILLION") || unit === "M" || unit.includes("ሚሊዮን")) {
-            val *= 1000000;
-          } else if (unit.includes("THOUSAND") || unit === "K" || unit.includes("ሺህ")) {
-            val *= 1000;
+          // Detect thousand-separator format: X.XXX, X.XXX.XXX, X,XXX,XXX
+          const cleaned = rawNum.replace(/\s/g, "");
+          const thousandPattern = /^\d{1,3}([.,]\d{3})+$/;
+
+          let numVal;
+          if (thousandPattern.test(cleaned)) {
+            // "5.300.000" → 5300000  (dots are thousand separators)
+            numVal = parseFloat(cleaned.replace(/[.,]/g, ""));
+          } else {
+            // "12.5" → 12.5  (dot is decimal)
+            numVal = parseFloat(cleaned.replace(/,/g, ""));
           }
 
-          if (!isNaN(val) && val > 0) {
-            const rounded = Math.round(val);
-            price = rounded.toLocaleString("en-US");
+          // Apply unit multiplier ONLY if number is small
+          if (unit.includes("MILLION") || unit.includes("ሚሊዮን")) {
+            if (numVal < 100000) numVal *= 1000000;
+          } else if (unit.includes("BILLION") || unit.includes("ቢሊዮን")) {
+            if (numVal < 100000) numVal *= 1000000000;
+          } else if (unit.includes("THOUSAND") || unit === "K" || unit.includes("ሺህ")) {
+            if (numVal < 1000) numVal *= 1000;
+          }
+
+          if (!isNaN(numVal) && numVal > 0) {
+            price = Math.round(numVal).toLocaleString("en-US");
           }
         }
 
-        // Phone
+        // Phone — pick FIRST phone from the list
         const phoneMatch = line.match(/(?:\+251|0)[\s-]?9[\d\s-]{7,}/);
         if (phoneMatch && !phone) {
           phone = phoneMatch[0].replace(/[\s-]/g, "");
@@ -123,7 +111,6 @@ export default {
               `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`
             );
             imageDebug += "download=" + (imgRes.ok ? "ok" : "fail") + ". ";
-
             const blob = await imgRes.blob();
             imageDebug += "size=" + Math.round(blob.size / 1024) + "KB. ";
 
@@ -149,7 +136,7 @@ export default {
           imageDebug += "exception: " + e.message;
         }
       } else {
-        imageDebug = "❌ no photo in message";
+        imageDebug = "❌ no photo";
       }
 
       // ============================================
@@ -189,11 +176,12 @@ export default {
         body: JSON.stringify(adData),
       });
 
-      // Reply to Telegram
       if (env.TELEGRAM_BOT_TOKEN && message.chat?.id) {
         const replyText =
-          (saveRes.ok ? "✅ Ad saved to drafts!\n" : "⚠️ Save failed.\n") +
-          "💰 Price: " + (price ? price + " ETB" : "not found") + "\n" +
+          (saveRes.ok ? "✅ Ad saved!\n" : "⚠️ Save failed.\n") +
+          "💰 Price: " + (price || "not found") + " ETB\n" +
+          "📞 Phone: " + (phone || "not found") + "\n" +
+          "📍 City: " + (city || "not found") + "\n" +
           "📸 Image: " + imageDebug;
 
         await fetch(
@@ -201,10 +189,7 @@ export default {
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              chat_id: message.chat.id,
-              text: replyText,
-            }),
+            body: JSON.stringify({ chat_id: message.chat.id, text: replyText }),
           }
         );
       }
@@ -225,13 +210,10 @@ function jsonResponse(obj) {
 
 async function getFirebaseToken(env) {
   const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
-  const clientEmail = sa.client_email;
-  const privateKey = sa.private_key;
-
   const now = Math.floor(Date.now() / 1000);
   const header = { alg: "RS256", typ: "JWT" };
   const payload = {
-    iss: clientEmail,
+    iss: sa.client_email,
     scope: "https://www.googleapis.com/auth/datastore",
     aud: "https://oauth2.googleapis.com/token",
     iat: now,
@@ -242,27 +224,20 @@ async function getFirebaseToken(env) {
   const p = base64UrlEncodeString(JSON.stringify(payload));
   const signingInput = `${h}.${p}`;
 
-  const pem = privateKey
+  const pem = sa.private_key
     .replace("-----BEGIN PRIVATE KEY-----", "")
     .replace("-----END PRIVATE KEY-----", "")
     .replace(/\s/g, "");
-
   const der = Uint8Array.from(atob(pem), (c) => c.charCodeAt(0));
-
   const key = await crypto.subtle.importKey(
-    "pkcs8",
-    der,
+    "pkcs8", der,
     { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["sign"]
+    false, ["sign"]
   );
-
   const sigBuffer = await crypto.subtle.sign(
-    "RSASSA-PKCS1-v1_5",
-    key,
+    "RSASSA-PKCS1-v1_5", key,
     new TextEncoder().encode(signingInput)
   );
-
   const signature = base64UrlEncodeBytes(new Uint8Array(sigBuffer));
   const jwt = `${signingInput}.${signature}`;
 
@@ -271,11 +246,8 @@ async function getFirebaseToken(env) {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
   });
-
   const tokData = await tokRes.json();
-  if (!tokData.access_token) {
-    throw new Error(JSON.stringify(tokData));
-  }
+  if (!tokData.access_token) throw new Error(JSON.stringify(tokData));
   return tokData.access_token;
 }
 
@@ -286,8 +258,6 @@ function base64UrlEncodeString(str) {
 
 function base64UrlEncodeBytes(bytes) {
   let binary = "";
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
