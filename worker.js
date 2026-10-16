@@ -2,6 +2,9 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // ============================================
+    // TEST MODE
+    // ============================================
     if (url.pathname === "/test") {
       const report = { envCheck: {}, serviceAccountInfo: {}, firebaseTest: {} };
       report.envCheck = {
@@ -24,12 +27,11 @@ export default {
       try {
         const token = await getFirebaseToken(env);
         report.firebaseTest.token = "✅ Got token";
-
         const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
         const adData = {
           fields: {
             title: { stringValue: "TEST FROM /test" },
-            description: { stringValue: "If you see this in Firebase, it works!" },
+            description: { stringValue: "Debug test" },
             price: { stringValue: "0" },
             phone: { stringValue: "" },
             city: { stringValue: "" },
@@ -59,6 +61,9 @@ export default {
       return jsonResponse(report);
     }
 
+    // ============================================
+    // NORMAL WEBHOOK MODE
+    // ============================================
     if (request.method !== "POST") {
       return new Response("Bot is running ✅", { status: 200 });
     }
@@ -66,50 +71,102 @@ export default {
     try {
       const update = await request.json();
       const message = update.message || update.channel_post;
+
       if (!message || !message.text) {
         return new Response("OK", { status: 200 });
       }
 
+      // ============================================
+      // PARSE MESSAGE
+      // ============================================
       const lines = message.text.split("\n").filter((l) => l.trim());
       const title = lines[0] || "Untitled Ad";
-      let price = "", phone = "", city = "";
+      let price = "";
+      let phone = "";
+      let city = "";
 
       for (const line of lines) {
-        const priceMatch = line.match(/(?:price|ዋጋ|ETB)[\s:]*([\d,]+)/i);
-        if (priceMatch && !price) price = priceMatch[1].replace(/,/g, "");
-        const phoneMatch = line.match(/(?:\+251|0)[\s-]?9[\d\s-]{8,}/);
-        if (phoneMatch && !phone) phone = phoneMatch[0].replace(/[\s-]/g, "");
-        if (/addis|ababa|adama|hawassa|bahir dar|mekelle|gondar|jimma|dire dawa/i.test(line) && !city) city = line;
+        // Price
+        const priceMatch = line.match(/(?:price|ዋጋ|ETB|ብር)[\s:]*([\d,]+)/i);
+        if (priceMatch && !price) {
+          price = priceMatch[1].replace(/,/g, "");
+        }
+
+        // Phone
+        const phoneMatch = line.match(/(?:\+251|0)[\s-]?9[\d\s-]{7,}/);
+        if (phoneMatch && !phone) {
+          phone = phoneMatch[0].replace(/[\s-]/g, "");
+        }
+
+        // City — strip the "City:" prefix
+        const cityMatch = line.match(/(?:city|location|ከተማ)[\s:]+(.+)/i);
+        if (cityMatch && !city) {
+          city = cityMatch[1].trim();
+        } else if (
+          /addis|ababa|adama|hawassa|bahir dar|mekelle|gondar|jimma|dire dawa|bishoftu|shashemene/i.test(
+            line
+          ) &&
+          !city
+        ) {
+          city = line.trim();
+        }
       }
 
+      // ============================================
+      // UPLOAD IMAGE (with debug info)
+      // ============================================
       let imageUrl = "";
+      let imageDebug = "";
+
       if (message.photo && message.photo.length > 0) {
         try {
+          imageDebug = "photo found. ";
           const largest = message.photo[message.photo.length - 1];
+          imageDebug += "fileId=" + largest.file_id.substring(0, 10) + "... ";
+
           const fileRes = await fetch(
             `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${largest.file_id}`
           );
           const fileInfo = await fileRes.json();
+          imageDebug += "getFile=" + (fileInfo.ok ? "ok" : "fail") + ". ";
+
           if (fileInfo.ok) {
             const imgRes = await fetch(
               `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`
             );
+            imageDebug += "download=" + (imgRes.ok ? "ok" : "fail") + ". ";
+
             const blob = await imgRes.blob();
+            imageDebug += "size=" + Math.round(blob.size / 1024) + "KB. ";
+
             const formData = new FormData();
             formData.append("file", blob);
             formData.append("upload_preset", env.CLOUDINARY_UPLOAD_PRESET);
+
             const cloudRes = await fetch(
               `https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/image/upload`,
               { method: "POST", body: formData }
             );
             const cloudData = await cloudRes.json();
-            if (cloudData.secure_url) imageUrl = cloudData.secure_url;
+            imageDebug += "cloud=" + cloudRes.status + ". ";
+
+            if (cloudData.secure_url) {
+              imageUrl = cloudData.secure_url;
+              imageDebug += "✅ uploaded";
+            } else {
+              imageDebug += "❌ " + (cloudData.error?.message || "unknown error");
+            }
           }
         } catch (e) {
-          console.error("Image error:", e.message);
+          imageDebug += "exception: " + e.message;
         }
+      } else {
+        imageDebug = "❌ no photo in message";
       }
 
+      // ============================================
+      // SAVE TO FIREBASE
+      // ============================================
       const token = await getFirebaseToken(env);
       const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
 
@@ -122,7 +179,11 @@ export default {
           city: { stringValue: city },
           category: { stringValue: "Telegram" },
           image: { stringValue: imageUrl },
-          images: { arrayValue: imageUrl ? { values: [{ stringValue: imageUrl }] } : { values: [] } },
+          images: {
+            arrayValue: imageUrl
+              ? { values: [{ stringValue: imageUrl }] }
+              : { values: [] },
+          },
           status: { stringValue: "draft" },
           source: { stringValue: "telegram" },
           views: { integerValue: "0" },
@@ -140,24 +201,38 @@ export default {
         body: JSON.stringify(adData),
       });
 
+      // ============================================
+      // REPLY TO TELEGRAM WITH DEBUG INFO
+      // ============================================
       if (env.TELEGRAM_BOT_TOKEN && message.chat?.id) {
-        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            chat_id: message.chat.id,
-            text: saveRes.ok ? "✅ Ad saved to drafts!" : "⚠️ Save failed.",
-          }),
-        });
+        const replyText =
+          (saveRes.ok ? "✅ Ad saved to drafts!\n" : "⚠️ Save failed.\n") +
+          "📸 Image: " + imageDebug;
+
+        await fetch(
+          `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              chat_id: message.chat.id,
+              text: replyText,
+            }),
+          }
+        );
       }
 
       return new Response("OK", { status: 200 });
     } catch (error) {
+      console.error("Main error:", error.message);
       return new Response("Error: " + error.message, { status: 200 });
     }
   },
 };
 
+// ===============================================
+// HELPERS
+// ===============================================
 function jsonResponse(obj) {
   return new Response(JSON.stringify(obj, null, 2), {
     status: 200,
@@ -205,7 +280,6 @@ async function getFirebaseToken(env) {
     new TextEncoder().encode(signingInput)
   );
 
-  // ✅ FIXED: encode signature byte-by-byte (not as UTF-8 string)
   const signature = base64UrlEncodeBytes(new Uint8Array(sigBuffer));
   const jwt = `${signingInput}.${signature}`;
 
@@ -216,17 +290,17 @@ async function getFirebaseToken(env) {
   });
 
   const tokData = await tokRes.json();
-  if (!tokData.access_token) throw new Error(JSON.stringify(tokData));
+  if (!tokData.access_token) {
+    throw new Error(JSON.stringify(tokData));
+  }
   return tokData.access_token;
 }
 
-// For JSON strings (ASCII) — uses the safe trick
 function base64UrlEncodeString(str) {
   const base64 = btoa(unescape(encodeURIComponent(str)));
   return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-// ✅ For binary data (signatures, etc.) — encodes each byte directly
 function base64UrlEncodeBytes(bytes) {
   let binary = "";
   for (let i = 0; i < bytes.length; i++) {
