@@ -18,25 +18,27 @@ export default {
       const messageText = message.text || message.caption;
       if (!messageText) return new Response("OK", { status: 200 });
 
-      const lowerText = messageText.toLowerCase();
+      // ✅ 1. REMOVE PHONE NUMBERS FROM THE TEXT
+      const cleanText = messageText.replace(/(?:\+251|0)[\s-]?9[\d\s-]{7,}/g, "");
+      const lowerText = cleanText.toLowerCase();
 
-      // 1. DETECT LANGUAGE
-      const isAmharic = /[\u1200-\u137F]/.test(messageText);
+      // 2. DETECT LANGUAGE
+      const isAmharic = /[\u1200-\u137F]/.test(cleanText);
       const language = isAmharic ? "am" : "en";
 
-      // 2. SMART CATEGORY DETECTION (Hashtags First, Then Keywords)
+      // 3. SMART CATEGORY DETECTION
       let category = "Other";
       let subcategory = "";
       let condition = "";
 
-      if (/#cars/i.test(messageText) || /#መኪና/i.test(messageText)) category = "Cars";
-      else if (/#houses/i.test(messageText) || /#ቤት/i.test(messageText)) category = "Houses";
-      else if (/#apartments/i.test(messageText) || /#rentals/i.test(messageText) || /#ኪራይ/i.test(messageText)) category = "Rentals";
-      else if (/#electronics/i.test(messageText) || /#ኤሌክትሮኒክስ/i.test(messageText)) category = "Electronics";
-      else if (/#furniture/i.test(messageText) || /#እቃ/i.test(messageText)) category = "Furniture";
-      else if (/#clothes/i.test(messageText) || /#ልብስ/i.test(messageText)) category = "Clothes";
-      else if (/#labor/i.test(messageText) || /#ሰራተኛ/i.test(messageText)) category = "Labor & Services";
-      else if (/#used/i.test(messageText) || /#ምንአለሽ/i.test(messageText)) category = "ምንአለሽ ተራ";
+      if (/#cars/i.test(cleanText) || /#መኪና/i.test(cleanText)) category = "Cars";
+      else if (/#houses/i.test(cleanText) || /#ቤት/i.test(cleanText)) category = "Houses";
+      else if (/#apartments/i.test(cleanText) || /#rentals/i.test(cleanText) || /#ኪራይ/i.test(cleanText)) category = "Rentals";
+      else if (/#electronics/i.test(cleanText) || /#ኤሌክትሮኒክስ/i.test(cleanText)) category = "Electronics";
+      else if (/#furniture/i.test(cleanText) || /#እቃ/i.test(cleanText)) category = "Furniture";
+      else if (/#clothes/i.test(cleanText) || /#ልብስ/i.test(cleanText)) category = "Clothes";
+      else if (/#labor/i.test(cleanText) || /#ሰራተኛ/i.test(cleanText)) category = "Labor & Services";
+      else if (/#used/i.test(cleanText) || /#ምንአለሽ/i.test(cleanText)) category = "ምንአለሽ ተራ";
 
       if (category === "Other") {
         if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
@@ -58,7 +60,7 @@ export default {
         }
       }
 
-      // 3. DETECT SUBCATEGORY & CONDITION
+      // 4. DETECT SUBCATEGORY & CONDITION
       if (category === "Cars") {
         if (/(new|አዲስ)/i.test(lowerText)) condition = "New";
         else if (/(electric|ኤሌክትሪክ|ኢቪ)/i.test(lowerText)) condition = "Electric";
@@ -81,16 +83,14 @@ export default {
         else condition = "Used";
       }
 
-      // 4. PARSE MESSAGE
-      const lines = messageText.split("\n").map((l) => l.trim()).filter(Boolean);
+      // 5. PARSE MESSAGE (Using cleanText)
+      const lines = cleanText.split("\n").map((l) => l.trim()).filter(Boolean);
       let title = lines[0] || "Untitled Ad";
       title = title.replace(/[‼️✅👉👇💥🔥⚡✨📌📢]+/g, "").trim();
       if (title.length > 60) title = title.substring(0, 60) + "...";
 
       let price = "";
       let city = "";
-
-      // ✅ Notice: We removed the phone number matching from here.
 
       for (const line of lines) {
         const priceMatch = line.match(/(?:price|peric|pris|ዋጋ|ETB|ብር)[\s:.\-]*([\d.,\s]+)\s*(MILLION|Million|BILLION|Billion|K\b|Thousand|THOUSAND|ሚሊዮን|ቢሊዮን|ሺህ)?/i);
@@ -120,7 +120,7 @@ export default {
         else if (/addis|ababa|adama|hawassa|bahir dar|mekelle|gondar|jimma|dire dawa|bishoftu/i.test(line) && !city) city = line.trim();
       }
 
-      // 5. UPLOAD IMAGE
+      // 6. UPLOAD IMAGE
       let imageUrl = "";
       if (message.photo && message.photo.length > 0) {
         try {
@@ -142,7 +142,7 @@ export default {
         } catch (e) {}
       }
 
-      // 6. SAVE TO FIREBASE
+      // 7. SAVE TO FIREBASE
       const token = await getFirebaseToken(env);
       const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
       const adOwnerId = env.ADMIN_UID || "admin_bot"; 
@@ -150,9 +150,9 @@ export default {
       const adData = {
         fields: {
           title: { stringValue: title },
-          description: { stringValue: messageText },
+          description: { stringValue: cleanText }, // ✅ Saves clean text
           price: { stringValue: price || "0" },
-          phone: { stringValue: "0911680790" }, // ✅ YOUR OFFICIAL NUMBER
+          phone: { stringValue: "0911680790" }, // ✅ Your official number
           city: { stringValue: city },
           category: { stringValue: category },
           subcategory: { stringValue: subcategory }, 
@@ -175,14 +175,14 @@ export default {
         body: JSON.stringify(adData),
       });
 
-      // 7. REPLY TO TELEGRAM
+      // 8. REPLY TO TELEGRAM
       if (env.TELEGRAM_BOT_TOKEN && message.chat?.id) {
         const replyText =
           (saveRes.ok ? "Ad saved successfully.\n\n" : "Save failed.\n\n") +
           "Category: " + category + (subcategory ? " > " + subcategory : "") + "\n" +
           "Title: " + title + "\n" +
           "Price: " + (price || "not found") + " ETB\n" +
-          "Phone: 0911680790\n"; // ✅ Shows in the Telegram reply
+          "Phone: 0911680790\n";
 
         try {
           await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
