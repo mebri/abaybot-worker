@@ -19,17 +19,25 @@ export default {
       if (!messageText) return new Response("OK", { status: 200 });
 
       // ============================================
-      // ✅ 1. ULTIMATE TEXT CLEANUP
+      // ✅ 1. BULLETPROOF CLEANUP
       // ============================================
-      // Removes phone numbers, emails, links, and @handles
-      const cleanText = messageText
-        .replace(/(?:\+251|0)[\s-]?9[\d\s-]{7,}/g, "[Hidden]") // Hide phone numbers
-        .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, "[Hidden]") // Hide emails
-        .replace(/https?:\/\/[^\s]+/g, "")             // Remove web links
-        .replace(/t\.me\/[^\s]+/g, "")                 // Remove Telegram links
-        .replace(/@[a-zA-Z0-9_]+/g, "")                // Remove @mentions/handles
-        .replace(/\n{3,}/g, "\n\n")                    // Clean up extra blank lines
-        .trim();
+      let cleanText = messageText;
+
+      // Remove Telegram links (t.me/...)
+      cleanText = cleanText.replace(/https?:\/\/t\.me\/[^\s]+/gi, "");
+      
+      // Remove general web links (http:// or www.)
+      cleanText = cleanText.replace(/(https?:\/\/[^\s]+|www\.[^\s]+)/gi, "");
+
+      // Remove any @username handles
+      cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
+
+      // Remove ALL phone numbers (handles +251, 09, 07, and any spaces or dots)
+      cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?9[\d\s.-]{7,}/g, "[Contact Hidden]");
+      cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?7[\d\s.-]{7,}/g, "[Contact Hidden]");
+
+      // Clean up extra blank lines left behind
+      cleanText = cleanText.replace(/\n{3,}/g, "\n\n").trim();
 
       const lowerText = cleanText.toLowerCase();
 
@@ -52,23 +60,14 @@ export default {
       else if (/#used/i.test(cleanText) || /#ምንአለሽ/i.test(cleanText)) category = "ምንአለሽ ተራ";
 
       if (category === "Other") {
-        if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
-          category = "Cars";
-        } else if (/(house|villa|condominium|condo|ቤት|ቪላ|ኮንዶሚኒየም)/i.test(lowerText)) {
-          category = "Houses";
-        } else if (/(apartment|office|shop|አፓርታማ|ቢሮ|ሱቅ|መጋዘን)/i.test(lowerText)) {
-          category = "Rentals";
-        } else if (/(iphone|samsung|tecno|infinix|phone|smartphone|laptop|computer|tv|camera|ስልክ|ሞባይል|ላፕቶፕ|ኮምፒውተር|ቲቪ|ቴሌቪዥን|ካሜራ)/i.test(lowerText)) {
-          category = "Electronics";
-        } else if (/(sofa|bed|table|chair|furniture|cabinet|ሶፋ|አልጋ|ጠረጴዛ|ጠረንጴዛ|ወንበር|ቁምሳጥን|እቃ)/i.test(lowerText)) {
-          category = "Furniture";
-        } else if (/(clothes|shoes|dress|shirt|pants|fashion|ልብስ|ጫማ|ቀሚስ|ሱሪ|ሸሚዝ)/i.test(lowerText)) {
-          category = "Clothes";
-        } else if (/(construction|electrician|plumber|painter|cleaning|worker|ግንባታ|ኤሌክትሪሺያን|ቧንቧ|ቀለም|ጽዳት|ሰራተኛ|ሠራተኛ)/i.test(lowerText)) {
-          category = "Labor & Services";
-        } else if (/(used|second-hand|ምንአለሽ ተራ|ያገለገለ)/i.test(lowerText)) {
-          category = "ምንአለሽ ተራ";
-        }
+        if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) category = "Cars";
+        else if (/(house|villa|condominium|condo|ቤት|ቪላ|ኮንዶሚኒየም)/i.test(lowerText)) category = "Houses";
+        else if (/(apartment|office|shop|አፓርታማ|ቢሮ|ሱቅ|መጋዘን)/i.test(lowerText)) category = "Rentals";
+        else if (/(iphone|samsung|tecno|infinix|phone|smartphone|laptop|computer|tv|camera|ስልክ|ሞባይል|ላፕቶፕ|ኮምፒውተር|ቲቪ|ቴሌቪዥን|ካሜራ)/i.test(lowerText)) category = "Electronics";
+        else if (/(sofa|bed|table|chair|furniture|cabinet|ሶፋ|አልጋ|ጠረጴዛ|ጠረንጴዛ|ወንበር|ቁምሳጥን|እቃ)/i.test(lowerText)) category = "Furniture";
+        else if (/(clothes|shoes|dress|shirt|pants|fashion|ልብስ|ጫማ|ቀሚስ|ሱሪ|ሸሚዝ)/i.test(lowerText)) category = "Clothes";
+        else if (/(construction|electrician|plumber|painter|cleaning|worker|ግንባታ|ኤሌክትሪሺያን|ቧንቧ|ቀለም|ጽዳት|ሰራተኛ|ሠራተኛ)/i.test(lowerText)) category = "Labor & Services";
+        else if (/(used|second-hand|ምንአለሽ ተራ|ያገለገለ)/i.test(lowerText)) category = "ምንአለሽ ተራ";
       }
 
       // 4. DETECT SUBCATEGORY & CONDITION
