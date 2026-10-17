@@ -29,7 +29,7 @@ export default {
       cleanText = cleanText.replace(/(https?:\/\/[^\s]+|www\.[^\s]+)/gi, "");
       // Remove @username handles
       cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
-      // Remove phone numbers
+      // Remove phone numbers (handles +251, 09, 07, and spaces/dots)
       cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?9[\d\s.-]{7,}/g, "");
       cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?7[\d\s.-]{7,}/g, "");
       // Clean up extra blank lines
@@ -186,20 +186,22 @@ export default {
       // ============================================
       if (env.TELEGRAM_BOT_TOKEN && message.chat?.id) {
         
+        // Wait 2 seconds so Telegram doesn't think it's spam
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
         // Build the clean message text
         let newPostText = `✅ Official Ad Posted!\n\n`;
         newPostText += `📂 Category: ${category}${subcategory ? " > " + subcategory : ""}\n`;
         newPostText += `📝 Title: ${title}\n`;
         if (price) newPostText += `💰 Price: ${price} ETB\n`;
         if (city) newPostText += `📍 City: ${city}\n`;
-        newPostText += `\n📞 Contact: 0911680790\n`;
-        newPostText += `🌐 View on website: https://mebri.yegna.workers.dev\n`;
+        newPostText += `\n📞 Contact: 0911680790\n`; 
         
-        // Optional: Add the cleaned description (without contacts)
+        // Add the cleaned description (removes the seller's number)
         newPostText += `\n📄 Details:\n${cleanText}`;
 
         try {
-          // If the original message had a photo, send the photo with the new caption
+          // Replies directly to the user's ad
           if (imageUrl && message.photo && message.photo.length > 0) {
             await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
               method: "POST",
@@ -207,17 +209,18 @@ export default {
               body: JSON.stringify({ 
                 chat_id: message.chat.id, 
                 photo: imageUrl, 
-                caption: newPostText.substring(0, 1024) // Telegram caption limit
+                caption: newPostText.substring(0, 1024),
+                reply_to_message_id: message.message_id 
               }),
             });
           } else {
-            // Send text only
             await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ 
                 chat_id: message.chat.id, 
-                text: newPostText.substring(0, 4096) // Telegram text limit
+                text: newPostText.substring(0, 4096),
+                reply_to_message_id: message.message_id
               }),
             });
           }
