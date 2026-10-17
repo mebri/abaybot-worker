@@ -3,11 +3,11 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/test") {
-      return jsonResponse({ status: "Test endpoint is live", time: new Date().toISOString() });
+      return new Response("Worker is live", { status: 200 });
     }
 
     if (request.method !== "POST") {
-      return new Response("Bot is running ✅", { status: 200 });
+      return new Response("Bot is running", { status: 200 });
     }
 
     try {
@@ -114,23 +114,22 @@ export default {
 
             if (cloudData.secure_url) {
               imageUrl = cloudData.secure_url;
-              imageDebug += "✅ uploaded";
+              imageDebug += "uploaded";
             } else {
-              imageDebug += "❌ " + (cloudData.error?.message || "unknown");
+              imageDebug += "cloud_error: " + (cloudData.error?.message || "unknown");
             }
           }
         } catch (e) {
           imageDebug += "exception: " + e.message;
         }
       } else {
-        imageDebug = "❌ no photo";
+        imageDebug = "no photo";
       }
 
-      // 5. SAVE TO FIREBASE (Now assigned to Admin!)
+      // 5. SAVE TO FIREBASE
       const token = await getFirebaseToken(env);
       const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
 
-      // ✅ DEFAULT TO ADMIN UID IF NOT SET
       const adOwnerId = env.ADMIN_UID || "admin_bot"; 
 
       const adData = {
@@ -144,9 +143,9 @@ export default {
           language: { stringValue: language },
           image: { stringValue: imageUrl },
           images: { arrayValue: imageUrl ? { values: [{ stringValue: imageUrl }] } : { values: [] } },
-          status: { stringValue: "available" }, // ✅ Posts directly to live website
+          status: { stringValue: "available" }, 
           source: { stringValue: "telegram" },
-          userId: { stringValue: adOwnerId }, // ✅ Assigns ad to YOU
+          userId: { stringValue: adOwnerId }, 
           views: { integerValue: "0" },
           createdAt: { timestampValue: new Date().toISOString() },
         },
@@ -159,23 +158,35 @@ export default {
         body: JSON.stringify(adData),
       });
 
+      // ✅ 6. REPLY TO TELEGRAM (PLAIN TEXT, NO EMOJIS)
       if (env.TELEGRAM_BOT_TOKEN && message.chat?.id) {
         const replyText =
-          (saveRes.ok ? "✅ Ad saved!\n" : "⚠️ Save failed.\n") +
-          "📂 Category: " + category + "\n" +
-          "📝 Title: " + title + "\n" +
-          "💰 Price: " + (price || "not found") + " ETB\n" +
-          "📸 Image: " + imageDebug;
+          (saveRes.ok ? "Ad saved successfully.\n\n" : "Save failed.\n\n") +
+          "Category: " + category + "\n" +
+          "Title: " + title + "\n" +
+          "Price: " + (price || "not found") + " ETB\n" +
+          "Language: " + (language === "am" ? "Amharic" : "English") + "\n" +
+          "Image: " + imageDebug;
 
-        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ chat_id: message.chat.id, text: replyText }),
-        });
+        try {
+          const replyRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat_id: message.chat.id, text: replyText }),
+          });
+          
+          const replyData = await replyRes.json();
+          if (!replyData.ok) {
+             console.error("Telegram Reply Error:", JSON.stringify(replyData));
+          }
+        } catch (err) {
+          console.error("Fetch Error:", err.message);
+        }
       }
 
       return new Response("OK", { status: 200 });
     } catch (error) {
+      console.error("Main error:", error.message);
       return new Response("Error: " + error.message, { status: 200 });
     }
   },
