@@ -186,46 +186,35 @@ export default {
       // ============================================
       if (env.TELEGRAM_BOT_TOKEN && message.chat?.id) {
         
-        // Wait 2 seconds so Telegram doesn't think it's spam
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        // Wait 3 seconds so Telegram doesn't think it's spam
+        await new Promise(resolve => setTimeout(resolve, 3000));
 
         // Build the clean message text
-        let newPostText = `✅ Official Ad Posted!\n\n`;
+        let newPostText = `✅ Clean Ad Posted!\n\n`;
         newPostText += `📂 Category: ${category}${subcategory ? " > " + subcategory : ""}\n`;
         newPostText += `📝 Title: ${title}\n`;
         if (price) newPostText += `💰 Price: ${price} ETB\n`;
         if (city) newPostText += `📍 City: ${city}\n`;
         newPostText += `\n📞 Contact: 0911680790\n`; 
-        
-        // Add the cleaned description (removes the seller's number)
         newPostText += `\n📄 Details:\n${cleanText}`;
 
         try {
-          // Replies directly to the user's ad
-          if (imageUrl && message.photo && message.photo.length > 0) {
-            await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ 
-                chat_id: message.chat.id, 
-                photo: imageUrl, 
-                caption: newPostText.substring(0, 1024),
-                reply_to_message_id: message.message_id 
-              }),
-            });
-          } else {
-            await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ 
-                chat_id: message.chat.id, 
-                text: newPostText.substring(0, 4096),
-                reply_to_message_id: message.message_id
-              }),
-            });
+          // Send as plain text to avoid Telegram anti-spam limits
+          const tgRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ 
+              chat_id: message.chat.id, 
+              text: newPostText.substring(0, 4096)
+            }),
+          });
+          
+          const tgData = await tgRes.json();
+          if (!tgData.ok) {
+            console.error("Telegram Repost Error:", JSON.stringify(tgData));
           }
         } catch (err) {
-          console.error("Failed to post to Telegram:", err.message);
+          console.error("Fetch Error:", err.message);
         }
       }
 
