@@ -199,7 +199,7 @@ export default {
         newPostText += `\n📄 Details:\n${cleanText}`;
 
         try {
-          // Send as plain text to avoid Telegram anti-spam limits
+          // Send the clean message
           const tgRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -210,9 +210,22 @@ export default {
           });
           
           const tgData = await tgRes.json();
-          if (!tgData.ok) {
-            console.error("Telegram Repost Error:", JSON.stringify(tgData));
+          
+          // ✅ 9. DELETE THE ORIGINAL MESSAGE
+          if (tgData.ok) {
+            // Wait 1 second before deleting to be safe
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            
+            await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ 
+                chat_id: message.chat.id, 
+                message_id: message.message_id 
+              }),
+            });
           }
+
         } catch (err) {
           console.error("Fetch Error:", err.message);
         }
