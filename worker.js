@@ -18,8 +18,15 @@ export default {
       const messageText = message.text || message.caption;
       if (!messageText) return new Response("OK", { status: 200 });
 
-      // ✅ 1. REMOVE PHONE NUMBERS FROM THE TEXT
-      const cleanText = messageText.replace(/(?:\+251|0)[\s-]?9[\d\s-]{7,}/g, "");
+      // ✅ 1. ULTIMATE CLEANUP: Remove phones, links, and @handles
+      const cleanText = messageText
+        .replace(/(?:\+251|0)[\s-]?9[\d\s-]{7,}/g, "") // Remove phone numbers
+        .replace(/https?:\/\/[^\s]+/g, "")             // Remove web links
+        .replace(/t\.me\/[^\s]+/g, "")                 // Remove Telegram links
+        .replace(/@[a-zA-Z0-9_]+/g, "")                // Remove @mentions/handles
+        .replace(/\n{3,}/g, "\n\n")                    // Clean up extra blank lines
+        .trim();
+
       const lowerText = cleanText.toLowerCase();
 
       // 2. DETECT LANGUAGE
@@ -152,7 +159,7 @@ export default {
           title: { stringValue: title },
           description: { stringValue: cleanText }, // ✅ Saves clean text
           price: { stringValue: price || "0" },
-          phone: { stringValue: "0911680790" }, // ✅ Your official number
+          phone: { stringValue: "0911680790" }, // ✅ YOUR OFFICIAL NUMBER
           city: { stringValue: city },
           category: { stringValue: category },
           subcategory: { stringValue: subcategory }, 
