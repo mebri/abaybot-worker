@@ -24,88 +24,73 @@ export default {
       const isAmharic = /[\u1200-\u137F]/.test(messageText);
       const language = isAmharic ? "am" : "en";
 
-      // 2. SMART CATEGORY & SUBCATEGORY DETECTION (Matched to Home.jsx)
+      // 2. SMART CATEGORY DETECTION (Hashtags First, Then Keywords)
       let category = "Other";
       let subcategory = "";
       let condition = "";
 
-      if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
-        category = "Cars";
+      if (/#cars/i.test(messageText) || /#መኪና/i.test(messageText)) category = "Cars";
+      else if (/#houses/i.test(messageText) || /#ቤት/i.test(messageText)) category = "Houses";
+      else if (/#apartments/i.test(messageText) || /#rentals/i.test(messageText) || /#ኪራይ/i.test(messageText)) category = "Rentals";
+      else if (/#electronics/i.test(messageText) || /#ኤሌክትሮኒክስ/i.test(messageText)) category = "Electronics";
+      else if (/#furniture/i.test(messageText) || /#እቃ/i.test(messageText)) category = "Furniture";
+      else if (/#clothes/i.test(messageText) || /#ልብስ/i.test(messageText)) category = "Clothes";
+      else if (/#labor/i.test(messageText) || /#ሰራተኛ/i.test(messageText)) category = "Labor & Services";
+      else if (/#used/i.test(messageText) || /#ምንአለሽ/i.test(messageText)) category = "ምንአለሽ ተራ";
+
+      if (category === "Other") {
+        if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
+          category = "Cars";
+        } else if (/(house|villa|condominium|condo|ቤት|ቪላ|ኮንዶሚኒየም)/i.test(lowerText)) {
+          category = "Houses";
+        } else if (/(apartment|office|shop|አፓርታማ|ቢሮ|ሱቅ|መጋዘን)/i.test(lowerText)) {
+          category = "Rentals";
+        } else if (/(iphone|samsung|tecno|infinix|phone|smartphone|laptop|computer|tv|camera|ስልክ|ሞባይል|ላፕቶፕ|ኮምፒውተር|ቲቪ|ቴሌቪዥን|ካሜራ)/i.test(lowerText)) {
+          category = "Electronics";
+        } else if (/(sofa|bed|table|chair|furniture|cabinet|ሶፋ|አልጋ|ጠረጴዛ|ጠረንጴዛ|ወንበር|ቁምሳጥን|እቃ)/i.test(lowerText)) {
+          category = "Furniture";
+        } else if (/(clothes|shoes|dress|shirt|pants|fashion|ልብስ|ጫማ|ቀሚስ|ሱሪ|ሸሚዝ)/i.test(lowerText)) {
+          category = "Clothes";
+        } else if (/(construction|electrician|plumber|painter|cleaning|worker|ግንባታ|ኤሌክትሪሺያን|ቧንቧ|ቀለም|ጽዳት|ሰራተኛ|ሠራተኛ)/i.test(lowerText)) {
+          category = "Labor & Services";
+        } else if (/(used|second-hand|ምንአለሽ ተራ|ያገለገለ)/i.test(lowerText)) {
+          category = "ምንአለሽ ተራ";
+        }
+      }
+
+      // 3. DETECT SUBCATEGORY & CONDITION
+      if (category === "Cars") {
         if (/(new|አዲስ)/i.test(lowerText)) condition = "New";
         else if (/(electric|ኤሌክትሪክ|ኢቪ)/i.test(lowerText)) condition = "Electric";
         else if (/(rent|ኪራይ)/i.test(lowerText)) condition = "Rent";
         else condition = "Used";
-
-      } else if (/(house|villa|condominium|condo|ቤት|ቪላ|ኮንዶሚኒየም)/i.test(lowerText)) {
-        category = "Houses";
-        if (/(sale|ሽያጭ|ለሽያጭ)/i.test(lowerText)) subcategory = "sale";
-        else if (/(rent|ኪራይ|ለኪራይ)/i.test(lowerText)) subcategory = "rent";
-
-      } else if (/(apartment|office|shop|አፓርታማ|ቢሮ|ሱቅ|መጋዘን)/i.test(lowerText)) {
-        category = "Rentals";
-        if (/(apartment|አፓርታማ)/i.test(lowerText)) subcategory = "apartment";
-        else if (/(shop|ሱቅ)/i.test(lowerText)) subcategory = "shop";
-        else if (/(office|ቢሮ)/i.test(lowerText)) subcategory = "office";
-
-      } else if (/(iphone|samsung|tecno|infinix|phone|smartphone|ስልክ|ሞባይል)/i.test(lowerText)) {
-        category = "Electronics";
-        subcategory = "Phones";
+      } else if (category === "Electronics") {
+        if (/(phone|smartphone|ስልክ|ሞባይል)/i.test(lowerText)) subcategory = "Phones";
+        else if (/(laptop|computer|ላፕቶፕ|ኮምፒውተር)/i.test(lowerText)) subcategory = "Computers";
+        else if (/(tv|television|ቲቪ)/i.test(lowerText)) subcategory = "TVs";
         if (/(new|አዲስ)/i.test(lowerText)) condition = "New";
         else condition = "Used";
-
-      } else if (/(laptop|computer|macbook|dell|hp|lenovo|ላፕቶፕ|ኮምፒውተር)/i.test(lowerText)) {
-        category = "Electronics";
-        subcategory = "Computers";
-        if (/(new|አዲስ)/i.test(lowerText)) condition = "New";
-        else condition = "Used";
-
-      } else if (/(tv|television|screen|ቲቪ|ቴሌቪዥን)/i.test(lowerText)) {
-        category = "Electronics";
-        subcategory = "TVs";
-        if (/(new|አዲስ)/i.test(lowerText)) condition = "New";
-        else condition = "Used";
-
-      } else if (/(headphone|speaker|audio|camera|accessory|ማጉያ|ስፒከር|ካሜራ)/i.test(lowerText)) {
-        category = "Electronics";
-        subcategory = "Audio & Accessories";
-
-      } else if (/(electronics|camera|ኤሌክትሮኒክስ)/i.test(lowerText)) {
-        category = "Electronics";
-        subcategory = "Other Electronics";
-
-      } else if (/(sofa|bed|table|chair|furniture|cabinet|ሶፋ|አልጋ|ጠረጴዛ|ጠረንጴዛ|ወንበር|ቁምሳጥን|እቃ)/i.test(lowerText)) {
-        category = "Furniture";
+      } else if (category === "Houses") {
+        if (/(sale|ሽያጭ)/i.test(lowerText)) subcategory = "sale";
+        else if (/(rent|ኪራይ)/i.test(lowerText)) subcategory = "rent";
+      } else if (category === "Furniture") {
         if (/(sofa|ሶፋ)/i.test(lowerText)) subcategory = "Sofas";
         else if (/(bed|አልጋ)/i.test(lowerText)) subcategory = "Beds";
         else if (/(chair|table|ጠረጴዛ|ወንበር)/i.test(lowerText)) subcategory = "Chairs and Tables";
-        else if (/(cabinet|ቁምሳጥን)/i.test(lowerText)) subcategory = "Cabinets";
-        else subcategory = "Other";
         if (/(new|አዲስ)/i.test(lowerText)) condition = "New";
         else condition = "Used";
-
-      } else if (/(construction|electrician|plumber|painter|cleaning|moving|worker|ግንባታ|ኤሌክትሪሺያን|ቧንቧ|ቀለም|ጽዳት|ሰራተኛ|ሠራተኛ)/i.test(lowerText)) {
-        category = "Labor & Services";
-        if (/(construction|ግንባታ)/i.test(lowerText)) subcategory = "Construction";
-        else if (/(electrician|ኤሌክትሪሺያን)/i.test(lowerText)) subcategory = "Electrician";
-        else if (/(plumber|ቧንቧ)/i.test(lowerText)) subcategory = "Plumber";
-        else if (/(painter|ቀለም)/i.test(lowerText)) subcategory = "Painter";
-        else if (/(cleaning|ጽዳት)/i.test(lowerText)) subcategory = "Cleaning";
-        else if (/(moving|transport|ማጓጓዣ)/i.test(lowerText)) subcategory = "Moving";
-        else subcategory = "Other";
-
-      } else if (/(used|second-hand|ምንአለሽ ተራ|ያገለገለ)/i.test(lowerText)) {
-        category = "ምንአለሽ ተራ";
       }
 
-      // 3. PARSE MESSAGE
+      // 4. PARSE MESSAGE
       const lines = messageText.split("\n").map((l) => l.trim()).filter(Boolean);
       let title = lines[0] || "Untitled Ad";
       title = title.replace(/[‼️✅👉👇💥🔥⚡✨📌📢]+/g, "").trim();
       if (title.length > 60) title = title.substring(0, 60) + "...";
 
       let price = "";
-      let phone = "";
       let city = "";
+
+      // ✅ Notice: We removed the phone number matching from here.
 
       for (const line of lines) {
         const priceMatch = line.match(/(?:price|peric|pris|ዋጋ|ETB|ብር)[\s:.\-]*([\d.,\s]+)\s*(MILLION|Million|BILLION|Billion|K\b|Thousand|THOUSAND|ሚሊዮን|ቢሊዮን|ሺህ)?/i);
@@ -116,11 +101,8 @@ export default {
           const thousandPattern = /^\d{1,3}([.,]\d{3})+$/;
 
           let numVal;
-          if (thousandPattern.test(cleaned)) {
-            numVal = parseFloat(cleaned.replace(/[.,]/g, ""));
-          } else {
-            numVal = parseFloat(cleaned.replace(/,/g, ""));
-          }
+          if (thousandPattern.test(cleaned)) numVal = parseFloat(cleaned.replace(/[.,]/g, ""));
+          else numVal = parseFloat(cleaned.replace(/,/g, ""));
 
           if (unit.includes("MILLION") || unit.includes("ሚሊዮን")) {
             if (numVal < 100000) numVal *= 1000000;
@@ -130,34 +112,21 @@ export default {
             if (numVal < 1000) numVal *= 1000;
           }
 
-          if (!isNaN(numVal) && numVal > 0) {
-            price = Math.round(numVal).toLocaleString("en-US");
-          }
-        }
-
-        const phoneMatch = line.match(/(?:\+251|0)[\s-]?9[\d\s-]{7,}/);
-        if (phoneMatch && !phone) {
-          phone = phoneMatch[0].replace(/[\s-]/g, "");
+          if (!isNaN(numVal) && numVal > 0) price = Math.round(numVal).toLocaleString("en-US");
         }
 
         const cityMatch = line.match(/(?:city|location|ከተማ)[\s:]+(.+)/i);
-        if (cityMatch && !city) {
-          city = cityMatch[1].trim();
-        } else if (/addis|ababa|adama|hawassa|bahir dar|mekelle|gondar|jimma|dire dawa|bishoftu/i.test(line) && !city) {
-          city = line.trim();
-        }
+        if (cityMatch && !city) city = cityMatch[1].trim();
+        else if (/addis|ababa|adama|hawassa|bahir dar|mekelle|gondar|jimma|dire dawa|bishoftu/i.test(line) && !city) city = line.trim();
       }
 
-      // 4. UPLOAD IMAGE
+      // 5. UPLOAD IMAGE
       let imageUrl = "";
-      let imageDebug = "";
-
       if (message.photo && message.photo.length > 0) {
         try {
           const largest = message.photo[message.photo.length - 1];
           const fileRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${largest.file_id}`);
           const fileInfo = await fileRes.json();
-          imageDebug += "getFile=" + (fileInfo.ok ? "ok" : "fail") + ". ";
 
           if (fileInfo.ok) {
             const imgRes = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`);
@@ -168,25 +137,14 @@ export default {
 
             const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/image/upload`, { method: "POST", body: formData });
             const cloudData = await cloudRes.json();
-
-            if (cloudData.secure_url) {
-              imageUrl = cloudData.secure_url;
-              imageDebug += "uploaded";
-            } else {
-              imageDebug += "cloud_error: " + (cloudData.error?.message || "unknown");
-            }
+            if (cloudData.secure_url) imageUrl = cloudData.secure_url;
           }
-        } catch (e) {
-          imageDebug += "exception: " + e.message;
-        }
-      } else {
-        imageDebug = "no photo";
+        } catch (e) {}
       }
 
-      // 5. SAVE TO FIREBASE
+      // 6. SAVE TO FIREBASE
       const token = await getFirebaseToken(env);
       const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
-
       const adOwnerId = env.ADMIN_UID || "admin_bot"; 
 
       const adData = {
@@ -194,7 +152,7 @@ export default {
           title: { stringValue: title },
           description: { stringValue: messageText },
           price: { stringValue: price || "0" },
-          phone: { stringValue: phone },
+          phone: { stringValue: "0911680790" }, // ✅ YOUR OFFICIAL NUMBER
           city: { stringValue: city },
           category: { stringValue: category },
           subcategory: { stringValue: subcategory }, 
@@ -217,14 +175,14 @@ export default {
         body: JSON.stringify(adData),
       });
 
-      // 6. REPLY TO TELEGRAM
+      // 7. REPLY TO TELEGRAM
       if (env.TELEGRAM_BOT_TOKEN && message.chat?.id) {
         const replyText =
           (saveRes.ok ? "Ad saved successfully.\n\n" : "Save failed.\n\n") +
           "Category: " + category + (subcategory ? " > " + subcategory : "") + "\n" +
-          "Condition: " + (condition || "Not specified") + "\n" +
           "Title: " + title + "\n" +
-          "Price: " + (price || "not found") + " ETB\n";
+          "Price: " + (price || "not found") + " ETB\n" +
+          "Phone: 0911680790\n"; // ✅ Shows in the Telegram reply
 
         try {
           await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -232,22 +190,15 @@ export default {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ chat_id: message.chat.id, text: replyText }),
           });
-        } catch (err) {
-          console.error("Fetch Error:", err.message);
-        }
+        } catch (err) {}
       }
 
       return new Response("OK", { status: 200 });
     } catch (error) {
-      console.error("Main error:", error.message);
       return new Response("Error: " + error.message, { status: 200 });
     }
   },
 };
-
-function jsonResponse(obj) {
-  return new Response(JSON.stringify(obj, null, 2), { status: 200, headers: { "Content-Type": "application/json" } });
-}
 
 async function getFirebaseToken(env) {
   const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
