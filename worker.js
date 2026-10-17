@@ -20,17 +20,12 @@ export default {
 
       const lowerText = messageText.toLowerCase();
 
-      // ============================================
       // 1. DETECT LANGUAGE
-      // ============================================
       const isAmharic = /[\u1200-\u137F]/.test(messageText);
       const language = isAmharic ? "am" : "en";
 
-      // ============================================
-      // 2. SMART CATEGORY DETECTION (English + Amharic)
-      // ============================================
+      // 2. SMART CATEGORY DETECTION
       let category = "Other";
-
       if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
         category = "Cars";
       } else if (/(house|apartment|condo|rent|real estate|ቤት|ኪራይ|አፓርታማ|መኖሪያ|ሪል እስቴት|መሬት)/i.test(lowerText)) {
@@ -45,12 +40,8 @@ export default {
         category = "ምንአለሽ ተራ";
       }
 
-      // ============================================
-      // 3. PARSE MESSAGE (Title, Price, Phone, City)
-      // ============================================
+      // 3. PARSE MESSAGE
       const lines = messageText.split("\n").map((l) => l.trim()).filter(Boolean);
-      
-      // Clean up the title
       let title = lines[0] || "Untitled Ad";
       title = title.replace(/[‼️✅👉👇💥🔥⚡✨📌📢]+/g, "").trim();
       if (title.length > 60) title = title.substring(0, 60) + "...";
@@ -60,10 +51,7 @@ export default {
       let city = "";
 
       for (const line of lines) {
-        // Price Parser
-        const priceMatch = line.match(
-          /(?:price|peric|pris|ዋጋ|ETB|ብር)[\s:.\-]*([\d.,\s]+)\s*(MILLION|Million|BILLION|Billion|K\b|Thousand|THOUSAND|ሚሊዮን|ቢሊዮን|ሺህ)?/i
-        );
+        const priceMatch = line.match(/(?:price|peric|pris|ዋጋ|ETB|ብር)[\s:.\-]*([\d.,\s]+)\s*(MILLION|Million|BILLION|Billion|K\b|Thousand|THOUSAND|ሚሊዮን|ቢሊዮን|ሺህ)?/i);
         if (priceMatch && !price) {
           const rawNum = priceMatch[1].trim();
           const unit = (priceMatch[2] || "").toUpperCase();
@@ -90,13 +78,11 @@ export default {
           }
         }
 
-        // Phone Parser
         const phoneMatch = line.match(/(?:\+251|0)[\s-]?9[\d\s-]{7,}/);
         if (phoneMatch && !phone) {
           phone = phoneMatch[0].replace(/[\s-]/g, "");
         }
 
-        // City Parser
         const cityMatch = line.match(/(?:city|location|ከተማ)[\s:]+(.+)/i);
         if (cityMatch && !city) {
           city = cityMatch[1].trim();
@@ -105,9 +91,7 @@ export default {
         }
       }
 
-      // ============================================
       // 4. UPLOAD IMAGE
-      // ============================================
       let imageUrl = "";
       let imageDebug = "";
 
@@ -121,7 +105,6 @@ export default {
           if (fileInfo.ok) {
             const imgRes = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`);
             const blob = await imgRes.blob();
-            
             const formData = new FormData();
             formData.append("file", blob);
             formData.append("upload_preset", env.CLOUDINARY_UPLOAD_PRESET);
@@ -143,11 +126,12 @@ export default {
         imageDebug = "❌ no photo";
       }
 
-      // ============================================
-      // 5. SAVE TO FIREBASE
-      // ============================================
+      // 5. SAVE TO FIREBASE (Now assigned to Admin!)
       const token = await getFirebaseToken(env);
       const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
+
+      // ✅ DEFAULT TO ADMIN UID IF NOT SET
+      const adOwnerId = env.ADMIN_UID || "admin_bot"; 
 
       const adData = {
         fields: {
@@ -160,8 +144,9 @@ export default {
           language: { stringValue: language },
           image: { stringValue: imageUrl },
           images: { arrayValue: imageUrl ? { values: [{ stringValue: imageUrl }] } : { values: [] } },
-          status: { stringValue: "draft" },
+          status: { stringValue: "available" }, // ✅ Posts directly to live website
           source: { stringValue: "telegram" },
+          userId: { stringValue: adOwnerId }, // ✅ Assigns ad to YOU
           views: { integerValue: "0" },
           createdAt: { timestampValue: new Date().toISOString() },
         },
@@ -174,14 +159,12 @@ export default {
         body: JSON.stringify(adData),
       });
 
-      // Reply to Telegram
       if (env.TELEGRAM_BOT_TOKEN && message.chat?.id) {
         const replyText =
           (saveRes.ok ? "✅ Ad saved!\n" : "⚠️ Save failed.\n") +
           "📂 Category: " + category + "\n" +
           "📝 Title: " + title + "\n" +
           "💰 Price: " + (price || "not found") + " ETB\n" +
-          "🌐 Language: " + (language === "am" ? "Amharic" : "English") + "\n" +
           "📸 Image: " + imageDebug;
 
         await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
