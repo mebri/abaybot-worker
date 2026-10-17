@@ -24,19 +24,45 @@ export default {
       const isAmharic = /[\u1200-\u137F]/.test(messageText);
       const language = isAmharic ? "am" : "en";
 
-      // 2. SMART CATEGORY DETECTION
+      // 2. SMART CATEGORY & SUBCATEGORY DETECTION
       let category = "Other";
+      let subcategory = "";
+
       if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
         category = "Cars";
-      } else if (/(house|apartment|condo|rent|real estate|ቤት|ኪራይ|አፓርታማ|መኖሪያ|ሪል እስቴት|መሬት)/i.test(lowerText)) {
+      } 
+      else if (/(house|apartment|condo|rent|real estate|ቤት|ኪራይ|አፓርታማ|መኖሪያ|ሪል እስቴት|መሬት)/i.test(lowerText)) {
         category = "Houses";
-      } else if (/(iphone|samsung|phone|laptop|tv|computer|electronics|camera|ስልክ|ላፕቶፕ|ቴሌቪዥን|ካሜራ|ኮምፒውተር|ኤሌክትሮኒክስ)/i.test(lowerText)) {
+      } 
+      else if (/(iphone|samsung|tecno|infinix|phone|smartphone|ስልክ|ሞባይል)/i.test(lowerText)) {
         category = "Electronics";
-      } else if (/(sofa|bed|table|chair|furniture|cabinet|ሶፋ|አልጋ|ጠረጴዛ|ጠረንጴዛ|ወንበር|ቁምሳጥን|እቃ)/i.test(lowerText)) {
+        subcategory = "Phones";
+      } else if (/(laptop|computer|macbook|dell|hp|lenovo|ላፕቶፕ|ኮምፒውተር)/i.test(lowerText)) {
+        category = "Electronics";
+        subcategory = "Computers";
+      } else if (/(tv|television|screen|ሳምሰንግ ቲቪ|ቲቪ|ቴሌቪዥን)/i.test(lowerText)) {
+        category = "Electronics";
+        subcategory = "TVs";
+      } else if (/(fridge|refrigerator|stove|microwave|washing machine|ማቀዝቀዣ|ምድጃ|ማይክሮዌቭ|ልብስ ማጠቢያ)/i.test(lowerText)) {
+        category = "Electronics";
+        subcategory = "Appliances"; // Home Appliances
+      } else if (/(playstation|ps4|ps5|xbox|nintendo|gaming|ጌም)/i.test(lowerText)) {
+        category = "Electronics";
+        subcategory = "Gaming";
+      } else if (/(headphone|speaker|audio|camera|accessory|ማጉያ|ስፒከር|ካሜራ)/i.test(lowerText)) {
+        category = "Electronics";
+        subcategory = "Audio & Accessories";
+      } else if (/(electronics|camera|ኤሌክትሮኒክስ)/i.test(lowerText)) {
+        category = "Electronics";
+        subcategory = "Other Electronics";
+      }
+      else if (/(sofa|bed|table|chair|furniture|cabinet|ሶፋ|አልጋ|ጠረጴዛ|ጠረንጴዛ|ወንበር|ቁምሳጥን|እቃ)/i.test(lowerText)) {
         category = "Furniture";
-      } else if (/(job|hiring|service|plumber|electrician|worker|ሰራተኛ|ሠራተኛ|ግንባታ|ቧንቧ|ኤሌክትሪሺያን|አገልግሎት)/i.test(lowerText)) {
+      } 
+      else if (/(job|hiring|service|plumber|electrician|worker|ሰራተኛ|ሠራተኛ|ግንባታ|ቧንቧ|ኤሌክትሪሺያን|አገልግሎት)/i.test(lowerText)) {
         category = "Labor & Services";
-      } else if (/(used|second-hand|ምንአለሽ ተራ|ያገለገለ)/i.test(lowerText)) {
+      } 
+      else if (/(used|second-hand|ምንአለሽ ተራ|ያገለገለ)/i.test(lowerText)) {
         category = "ምንአለሽ ተራ";
       }
 
@@ -140,6 +166,7 @@ export default {
           phone: { stringValue: phone },
           city: { stringValue: city },
           category: { stringValue: category },
+          subcategory: { stringValue: subcategory }, // ✅ NEW: Saves the specific type (e.g., "Phones")
           language: { stringValue: language },
           image: { stringValue: imageUrl },
           images: { arrayValue: imageUrl ? { values: [{ stringValue: imageUrl }] } : { values: [] } },
@@ -158,27 +185,20 @@ export default {
         body: JSON.stringify(adData),
       });
 
-      // ✅ 6. REPLY TO TELEGRAM (PLAIN TEXT, NO EMOJIS)
+      // 6. REPLY TO TELEGRAM
       if (env.TELEGRAM_BOT_TOKEN && message.chat?.id) {
         const replyText =
           (saveRes.ok ? "Ad saved successfully.\n\n" : "Save failed.\n\n") +
-          "Category: " + category + "\n" +
+          "Category: " + category + (subcategory ? " > " + subcategory : "") + "\n" +
           "Title: " + title + "\n" +
-          "Price: " + (price || "not found") + " ETB\n" +
-          "Language: " + (language === "am" ? "Amharic" : "English") + "\n" +
-          "Image: " + imageDebug;
+          "Price: " + (price || "not found") + " ETB\n";
 
         try {
-          const replyRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+          await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ chat_id: message.chat.id, text: replyText }),
           });
-          
-          const replyData = await replyRes.json();
-          if (!replyData.ok) {
-             console.error("Telegram Reply Error:", JSON.stringify(replyData));
-          }
         } catch (err) {
           console.error("Fetch Error:", err.message);
         }
