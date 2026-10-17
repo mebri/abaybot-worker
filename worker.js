@@ -23,20 +23,16 @@ export default {
       // ============================================
       let cleanText = messageText;
 
-      // Remove Telegram links (t.me/...)
+      // Remove Telegram links
       cleanText = cleanText.replace(/https?:\/\/t\.me\/[^\s]+/gi, "");
-      
-      // Remove general web links (http:// or www.)
+      // Remove general web links
       cleanText = cleanText.replace(/(https?:\/\/[^\s]+|www\.[^\s]+)/gi, "");
-
-      // Remove any @username handles
+      // Remove @username handles
       cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
-
-      // Remove ALL phone numbers (handles +251, 09, 07, and any spaces or dots)
-      cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?9[\d\s.-]{7,}/g, "[Contact Hidden]");
-      cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?7[\d\s.-]{7,}/g, "[Contact Hidden]");
-
-      // Clean up extra blank lines left behind
+      // Remove phone numbers
+      cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?9[\d\s.-]{7,}/g, "");
+      cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?7[\d\s.-]{7,}/g, "");
+      // Clean up extra blank lines
       cleanText = cleanText.replace(/\n{3,}/g, "\n\n").trim();
 
       const lowerText = cleanText.toLowerCase();
@@ -93,7 +89,7 @@ export default {
         else condition = "Used";
       }
 
-      // 5. PARSE MESSAGE (Using cleanText)
+      // 5. PARSE MESSAGE
       const lines = cleanText.split("\n").map((l) => l.trim()).filter(Boolean);
       let title = lines[0] || "Untitled Ad";
       title = title.replace(/[‼️✅👉👇💥🔥⚡✨📌📢]+/g, "").trim();
@@ -160,9 +156,9 @@ export default {
       const adData = {
         fields: {
           title: { stringValue: title },
-          description: { stringValue: cleanText }, // ✅ Saves clean text
+          description: { stringValue: cleanText },
           price: { stringValue: price || "0" },
-          phone: { stringValue: "0911680790" }, // ✅ Forces your phone number
+          phone: { stringValue: "0911680790" }, 
           city: { stringValue: city },
           category: { stringValue: category },
           subcategory: { stringValue: subcategory }, 
@@ -179,28 +175,55 @@ export default {
       };
 
       const fbUrl = `https://firestore.googleapis.com/v1/projects/${sa.project_id}/databases/(default)/documents/ads`;
-      const saveRes = await fetch(fbUrl, {
+      await fetch(fbUrl, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify(adData),
       });
 
-      // 8. REPLY TO TELEGRAM
+      // ============================================
+      // ✅ 8. POST THE CLEAN AD BACK TO TELEGRAM CHANNEL
+      // ============================================
       if (env.TELEGRAM_BOT_TOKEN && message.chat?.id) {
-        const replyText =
-          (saveRes.ok ? "Ad saved successfully.\n\n" : "Save failed.\n\n") +
-          "Category: " + category + (subcategory ? " > " + subcategory : "") + "\n" +
-          "Title: " + title + "\n" +
-          "Price: " + (price || "not found") + " ETB\n" +
-          "Phone: 0911680790\n";
+        
+        // Build the clean message text
+        let newPostText = `✅ Official Ad Posted!\n\n`;
+        newPostText += `📂 Category: ${category}${subcategory ? " > " + subcategory : ""}\n`;
+        newPostText += `📝 Title: ${title}\n`;
+        if (price) newPostText += `💰 Price: ${price} ETB\n`;
+        if (city) newPostText += `📍 City: ${city}\n`;
+        newPostText += `\n📞 Contact: 0911680790\n`;
+        newPostText += `🌐 View on website: https://mebri.yegna.workers.dev\n`;
+        
+        // Optional: Add the cleaned description (without contacts)
+        newPostText += `\n📄 Details:\n${cleanText}`;
 
         try {
-          await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ chat_id: message.chat.id, text: replyText }),
-          });
-        } catch (err) {}
+          // If the original message had a photo, send the photo with the new caption
+          if (imageUrl && message.photo && message.photo.length > 0) {
+            await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ 
+                chat_id: message.chat.id, 
+                photo: imageUrl, 
+                caption: newPostText.substring(0, 1024) // Telegram caption limit
+              }),
+            });
+          } else {
+            // Send text only
+            await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ 
+                chat_id: message.chat.id, 
+                text: newPostText.substring(0, 4096) // Telegram text limit
+              }),
+            });
+          }
+        } catch (err) {
+          console.error("Failed to post to Telegram:", err.message);
+        }
       }
 
       return new Response("OK", { status: 200 });
