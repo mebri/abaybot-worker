@@ -24,45 +24,76 @@ export default {
       const isAmharic = /[\u1200-\u137F]/.test(messageText);
       const language = isAmharic ? "am" : "en";
 
-      // 2. SMART CATEGORY & SUBCATEGORY DETECTION
+      // 2. SMART CATEGORY & SUBCATEGORY DETECTION (Matched to Home.jsx)
       let category = "Other";
       let subcategory = "";
+      let condition = "";
 
       if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
         category = "Cars";
-      } 
-      else if (/(house|apartment|condo|rent|real estate|ቤት|ኪራይ|አፓርታማ|መኖሪያ|ሪል እስቴት|መሬት)/i.test(lowerText)) {
+        if (/(new|አዲስ)/i.test(lowerText)) condition = "New";
+        else if (/(electric|ኤሌክትሪክ|ኢቪ)/i.test(lowerText)) condition = "Electric";
+        else if (/(rent|ኪራይ)/i.test(lowerText)) condition = "Rent";
+        else condition = "Used";
+
+      } else if (/(house|villa|condominium|condo|ቤት|ቪላ|ኮንዶሚኒየም)/i.test(lowerText)) {
         category = "Houses";
-      } 
-      else if (/(iphone|samsung|tecno|infinix|phone|smartphone|ስልክ|ሞባይል)/i.test(lowerText)) {
+        if (/(sale|ሽያጭ|ለሽያጭ)/i.test(lowerText)) subcategory = "sale";
+        else if (/(rent|ኪራይ|ለኪራይ)/i.test(lowerText)) subcategory = "rent";
+
+      } else if (/(apartment|office|shop|አፓርታማ|ቢሮ|ሱቅ|መጋዘን)/i.test(lowerText)) {
+        category = "Rentals";
+        if (/(apartment|አፓርታማ)/i.test(lowerText)) subcategory = "apartment";
+        else if (/(shop|ሱቅ)/i.test(lowerText)) subcategory = "shop";
+        else if (/(office|ቢሮ)/i.test(lowerText)) subcategory = "office";
+
+      } else if (/(iphone|samsung|tecno|infinix|phone|smartphone|ስልክ|ሞባይል)/i.test(lowerText)) {
         category = "Electronics";
         subcategory = "Phones";
+        if (/(new|አዲስ)/i.test(lowerText)) condition = "New";
+        else condition = "Used";
+
       } else if (/(laptop|computer|macbook|dell|hp|lenovo|ላፕቶፕ|ኮምፒውተር)/i.test(lowerText)) {
         category = "Electronics";
         subcategory = "Computers";
-      } else if (/(tv|television|screen|ሳምሰንግ ቲቪ|ቲቪ|ቴሌቪዥን)/i.test(lowerText)) {
+        if (/(new|አዲስ)/i.test(lowerText)) condition = "New";
+        else condition = "Used";
+
+      } else if (/(tv|television|screen|ቲቪ|ቴሌቪዥን)/i.test(lowerText)) {
         category = "Electronics";
         subcategory = "TVs";
-      } else if (/(fridge|refrigerator|stove|microwave|washing machine|ማቀዝቀዣ|ምድጃ|ማይክሮዌቭ|ልብስ ማጠቢያ)/i.test(lowerText)) {
-        category = "Electronics";
-        subcategory = "Appliances"; // Home Appliances
-      } else if (/(playstation|ps4|ps5|xbox|nintendo|gaming|ጌም)/i.test(lowerText)) {
-        category = "Electronics";
-        subcategory = "Gaming";
+        if (/(new|አዲስ)/i.test(lowerText)) condition = "New";
+        else condition = "Used";
+
       } else if (/(headphone|speaker|audio|camera|accessory|ማጉያ|ስፒከር|ካሜራ)/i.test(lowerText)) {
         category = "Electronics";
         subcategory = "Audio & Accessories";
+
       } else if (/(electronics|camera|ኤሌክትሮኒክስ)/i.test(lowerText)) {
         category = "Electronics";
         subcategory = "Other Electronics";
-      }
-      else if (/(sofa|bed|table|chair|furniture|cabinet|ሶፋ|አልጋ|ጠረጴዛ|ጠረንጴዛ|ወንበር|ቁምሳጥን|እቃ)/i.test(lowerText)) {
+
+      } else if (/(sofa|bed|table|chair|furniture|cabinet|ሶፋ|አልጋ|ጠረጴዛ|ጠረንጴዛ|ወንበር|ቁምሳጥን|እቃ)/i.test(lowerText)) {
         category = "Furniture";
-      } 
-      else if (/(job|hiring|service|plumber|electrician|worker|ሰራተኛ|ሠራተኛ|ግንባታ|ቧንቧ|ኤሌክትሪሺያን|አገልግሎት)/i.test(lowerText)) {
+        if (/(sofa|ሶፋ)/i.test(lowerText)) subcategory = "Sofas";
+        else if (/(bed|አልጋ)/i.test(lowerText)) subcategory = "Beds";
+        else if (/(chair|table|ጠረጴዛ|ወንበር)/i.test(lowerText)) subcategory = "Chairs and Tables";
+        else if (/(cabinet|ቁምሳጥን)/i.test(lowerText)) subcategory = "Cabinets";
+        else subcategory = "Other";
+        if (/(new|አዲስ)/i.test(lowerText)) condition = "New";
+        else condition = "Used";
+
+      } else if (/(construction|electrician|plumber|painter|cleaning|moving|worker|ግንባታ|ኤሌክትሪሺያን|ቧንቧ|ቀለም|ጽዳት|ሰራተኛ|ሠራተኛ)/i.test(lowerText)) {
         category = "Labor & Services";
-      } 
-      else if (/(used|second-hand|ምንአለሽ ተራ|ያገለገለ)/i.test(lowerText)) {
+        if (/(construction|ግንባታ)/i.test(lowerText)) subcategory = "Construction";
+        else if (/(electrician|ኤሌክትሪሺያን)/i.test(lowerText)) subcategory = "Electrician";
+        else if (/(plumber|ቧንቧ)/i.test(lowerText)) subcategory = "Plumber";
+        else if (/(painter|ቀለም)/i.test(lowerText)) subcategory = "Painter";
+        else if (/(cleaning|ጽዳት)/i.test(lowerText)) subcategory = "Cleaning";
+        else if (/(moving|transport|ማጓጓዣ)/i.test(lowerText)) subcategory = "Moving";
+        else subcategory = "Other";
+
+      } else if (/(used|second-hand|ምንአለሽ ተራ|ያገለገለ)/i.test(lowerText)) {
         category = "ምንአለሽ ተራ";
       }
 
@@ -166,7 +197,8 @@ export default {
           phone: { stringValue: phone },
           city: { stringValue: city },
           category: { stringValue: category },
-          subcategory: { stringValue: subcategory }, // ✅ NEW: Saves the specific type (e.g., "Phones")
+          subcategory: { stringValue: subcategory }, 
+          condition: { stringValue: condition }, 
           language: { stringValue: language },
           image: { stringValue: imageUrl },
           images: { arrayValue: imageUrl ? { values: [{ stringValue: imageUrl }] } : { values: [] } },
@@ -190,6 +222,7 @@ export default {
         const replyText =
           (saveRes.ok ? "Ad saved successfully.\n\n" : "Save failed.\n\n") +
           "Category: " + category + (subcategory ? " > " + subcategory : "") + "\n" +
+          "Condition: " + (condition || "Not specified") + "\n" +
           "Title: " + title + "\n" +
           "Price: " + (price || "not found") + " ETB\n";
 
