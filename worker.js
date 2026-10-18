@@ -24,25 +24,14 @@ export default {
       // ============================================
       let cleanText = messageText;
 
-      // Remove hidden variation selectors and zero-width joiners
       cleanText = cleanText.replace(/[\uFE00-\uFE0F\u200D]/g, "");
-
-      // Remove all emojis
       cleanText = cleanText.replace(/[\u{1F1E6}-\u{1F1FF}\u{1F300}-\u{1F5FF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F780}-\u{1F7FF}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, "");
-
-      // Remove Links
       cleanText = cleanText.replace(/https?:\/\/[^\s]+/gi, "");
       cleanText = cleanText.replace(/www\.[^\s]+/gi, "");
       cleanText = cleanText.replace(/t\.me\/[^\s]+/gi, "");
-
-      // Remove @handles
       cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
-
-      // Remove Phone numbers
       cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?9[\d\s.-]{7,}/g, "[Phone Hidden]");
       cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?7[\d\s.-]{7,}/g, "[Phone Hidden]");
-
-      // Clean up extra blank lines
       cleanText = cleanText.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
 
       // ============================================
@@ -51,39 +40,41 @@ export default {
       let brand = "";
       let model = "";
       let year = "";
-      let title = "";
 
-      // Look for specific labels like "Make: Nissan", "Brand: Toyota"
+      // Look for specific labels
       const brandMatch = cleanText.match(/(?:make|brand)[\s:-]+([a-zA-Z\s]+)/i);
       if (brandMatch) brand = brandMatch[1].trim();
 
-      // Look for "Model: Juke"
       const modelMatch = cleanText.match(/model[\s:-]+([a-zA-Z0-9\s.-]+)/i);
       if (modelMatch) model = modelMatch[1].trim();
 
-      // Look for "Year: 2013" or a standalone 4-digit year (19xx or 20xx)
+      // Look for year specifically
       const yearMatch = cleanText.match(/(?:year|ዓመት)[\s:-]+((?:19|20)\d{2})/i);
       if (yearMatch) {
         year = yearMatch[1];
       } else {
-        // Fallback: look for any 4-digit year in the text
         const fallbackYear = cleanText.match(/\b(19|20)\d{2}\b/);
         if (fallbackYear) year = fallbackYear[0];
       }
 
-      // Construct the final title
+      // Build the title. If we have Brand + Model + Year, use that!
+      let title = "";
       if (brand || model || year) {
         title = `${brand} ${model} ${year}`.replace(/\s+/g, " ").trim();
-      } else {
-        // Fallback if no labels are found: use the first line
+      } 
+      
+      // Fallback: If it's a car but no Make/Model labels, check the first line.
+      if (!title) {
         const lines = cleanText.split("\n").map((l) => l.trim()).filter(Boolean);
         title = lines[0] || "Untitled Ad";
+        
+        // If the first line is just marketing fluff like "Very Urgent", use the second line.
+        if (/(urgent|አስቸኳይ|sale|ሽያጭ)/i.test(title) && lines.length > 1) {
+          title = lines[1];
+        }
       }
 
-      // Limit title length
       if (title.length > 60) title = title.substring(0, 60) + "...";
-
-      // Capitalize first letter of each word in the title
       title = title.replace(/\b\w/g, (char) => char.toUpperCase());
 
       // ============================================
@@ -213,9 +204,7 @@ export default {
         body: JSON.stringify(adData),
       });
 
-      // ============================================
       // 9. POST TO TELEGRAM
-      // ============================================
       if (env.TELEGRAM_BOT_TOKEN && message.chat?.id) {
         await new Promise(resolve => setTimeout(resolve, 3000));
 
