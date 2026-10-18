@@ -13,7 +13,6 @@ export default {
     try {
       const update = await request.json();
       
-      // Catch both new messages and edited messages!
       const message = update.message || update.channel_post || update.edited_message || update.edited_channel_post;
       if (!message) return new Response("OK", { status: 200 });
 
@@ -21,34 +20,74 @@ export default {
       if (!messageText) return new Response("OK", { status: 200 });
 
       // ============================================
-      // ✅ 1. ULTIMATE CLEANUP (Destroys every emoji/symbol)
+      // ✅ 1. ULTIMATE CLEANUP
       // ============================================
       let cleanText = messageText;
 
-      // 1. Remove all emojis, symbols, and hidden variation selectors
-      // This regex grabs everything from Dingbats, Emojis, and invisible joiners.
-      cleanText = cleanText.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}]/gu, "");
+      // Remove hidden variation selectors and zero-width joiners
+      cleanText = cleanText.replace(/[\uFE00-\uFE0F\u200D]/g, "");
 
-      // 2. Remove any weird "AI" text artifacts if present
-      cleanText = cleanText.replace(/I think this message edited with AI/gi, "");
+      // Remove all emojis
+      cleanText = cleanText.replace(/[\u{1F1E6}-\u{1F1FF}\u{1F300}-\u{1F5FF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F780}-\u{1F7FF}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, "");
 
-      // 3. Remove Telegram and Web Links
+      // Remove Links
       cleanText = cleanText.replace(/https?:\/\/[^\s]+/gi, "");
       cleanText = cleanText.replace(/www\.[^\s]+/gi, "");
       cleanText = cleanText.replace(/t\.me\/[^\s]+/gi, "");
 
-      // 4. Remove @handles
+      // Remove @handles
       cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
 
-      // 5. Remove Phone numbers (Aggressive)
+      // Remove Phone numbers
       cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?9[\d\s.-]{7,}/g, "[Phone Hidden]");
       cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?7[\d\s.-]{7,}/g, "[Phone Hidden]");
 
-      // 6. Clean up extra blank lines and weird spacing
+      // Clean up extra blank lines
       cleanText = cleanText.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
 
       // ============================================
-      // 2. PRICE EXTRACTION
+      // ✅ 2. SMART TITLE EXTRACTION (Brand Model Year)
+      // ============================================
+      let brand = "";
+      let model = "";
+      let year = "";
+      let title = "";
+
+      // Look for specific labels like "Make: Nissan", "Brand: Toyota"
+      const brandMatch = cleanText.match(/(?:make|brand)[\s:-]+([a-zA-Z\s]+)/i);
+      if (brandMatch) brand = brandMatch[1].trim();
+
+      // Look for "Model: Juke"
+      const modelMatch = cleanText.match(/model[\s:-]+([a-zA-Z0-9\s.-]+)/i);
+      if (modelMatch) model = modelMatch[1].trim();
+
+      // Look for "Year: 2013" or a standalone 4-digit year (19xx or 20xx)
+      const yearMatch = cleanText.match(/(?:year|ዓመት)[\s:-]+((?:19|20)\d{2})/i);
+      if (yearMatch) {
+        year = yearMatch[1];
+      } else {
+        // Fallback: look for any 4-digit year in the text
+        const fallbackYear = cleanText.match(/\b(19|20)\d{2}\b/);
+        if (fallbackYear) year = fallbackYear[0];
+      }
+
+      // Construct the final title
+      if (brand || model || year) {
+        title = `${brand} ${model} ${year}`.replace(/\s+/g, " ").trim();
+      } else {
+        // Fallback if no labels are found: use the first line
+        const lines = cleanText.split("\n").map((l) => l.trim()).filter(Boolean);
+        title = lines[0] || "Untitled Ad";
+      }
+
+      // Limit title length
+      if (title.length > 60) title = title.substring(0, 60) + "...";
+
+      // Capitalize first letter of each word in the title
+      title = title.replace(/\b\w/g, (char) => char.toUpperCase());
+
+      // ============================================
+      // 3. PRICE EXTRACTION
       // ============================================
       let price = "";
       const priceMatch = cleanText.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
@@ -70,11 +109,9 @@ export default {
 
       const lowerText = cleanText.toLowerCase();
 
-      // 3. DETECT LANGUAGE
-      const isAmharic = /[\u1200-\u137F]/.test(cleanText);
-      const language = isAmharic ? "am" : "en";
-
-      // 4. SMART CATEGORY DETECTION
+      // ============================================
+      // 4. CATEGORY DETECTION
+      // ============================================
       let category = "Other";
       let subcategory = "";
       let condition = "";
@@ -88,7 +125,7 @@ export default {
       else if (/(construction|electrician|plumber|painter|cleaning|worker|ግንባታ|ኤሌክትሪሺያን|ቧንቧ|ቀለም|ጽዳት|ሰራተኛ|ሠራተኛ)/i.test(lowerText)) category = "Labor & Services";
       else if (/(used|second-hand|ምንአለሽ ተራ|ያገለገለ)/i.test(lowerText)) category = "ምንአለሽ ተራ";
 
-      // 5. DETECT SUBCATEGORY & CONDITION
+      // 5. SUBCATEGORY & CONDITION
       if (category === "Cars") {
         if (/(new|አዲስ)/i.test(lowerText)) condition = "New";
         else if (/(electric|ኤሌክትሪክ|ኢቪ)/i.test(lowerText)) condition = "Electric";
@@ -111,10 +148,8 @@ export default {
         else condition = "Used";
       }
 
-      // 6. PARSE TITLE AND CITY
+      // 6. PARSE CITY
       const lines = cleanText.split("\n").map((l) => l.trim()).filter(Boolean);
-      let title = lines[0] || "Untitled Ad";
-      if (title.length > 60) title = title.substring(0, 60) + "...";
       let city = "";
 
       for (const line of lines) {
@@ -172,14 +207,6 @@ export default {
       };
 
       const fbUrl = `https://firestore.googleapis.com/v1/projects/${sa.project_id}/databases/(default)/documents/ads`;
-      
-      // We use PATCH if it's an edited message, POST if it's new
-      const isEdit = update.edited_message || update.edited_channel_post;
-      if (isEdit) {
-         // If it's an edit, we don't save a new ad, we just want to update the channel post.
-         // But to keep it simple, we will just process it as a new ad for now.
-      }
-      
       await fetch(fbUrl, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
@@ -187,11 +214,9 @@ export default {
       });
 
       // ============================================
-      // ✅ 9. POST THE CLEAN AD BACK TO TELEGRAM
+      // 9. POST TO TELEGRAM
       // ============================================
       if (env.TELEGRAM_BOT_TOKEN && message.chat?.id) {
-        
-        // Wait 3 seconds so Telegram doesn't think it's spam
         await new Promise(resolve => setTimeout(resolve, 3000));
 
         let newPostText = `✅ Clean Ad Posted!\n\n`;
@@ -206,30 +231,20 @@ export default {
           const tgRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ 
-              chat_id: message.chat.id, 
-              text: newPostText.substring(0, 4096)
-            }),
+            body: JSON.stringify({ chat_id: message.chat.id, text: newPostText.substring(0, 4096) }),
           });
           
           const tgData = await tgRes.json();
           
-          // ✅ 10. DELETE THE ORIGINAL MESSAGE (Only if it's a brand new post, not an edit)
           if (tgData.ok && !isEdit) {
             await new Promise(resolve => setTimeout(resolve, 1000));
             await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ 
-                chat_id: message.chat.id, 
-                message_id: message.message_id 
-              }),
+              body: JSON.stringify({ chat_id: message.chat.id, message_id: message.message_id }),
             });
           }
-
-        } catch (err) {
-          console.error("Fetch Error:", err.message);
-        }
+        } catch (err) {}
       }
 
       return new Response("OK", { status: 200 });
