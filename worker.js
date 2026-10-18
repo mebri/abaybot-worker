@@ -19,12 +19,15 @@ export default {
       if (!messageText) return new Response("OK", { status: 200 });
 
       // ============================================
-      // ✅ 1. SUPER AGGRESSIVE CLEANUP
+      // ✅ 1. ULTIMATE CLEANUP (Emojis, Phones, Links)
       // ============================================
       let cleanText = messageText;
 
-      // Remove all emojis (Unicode ranges)
-      cleanText = cleanText.replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F780}-\u{1F7FF}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{1F1E6}-\u{1F1FF}\u{FE0F}\u{200D}\u{20E3}]/gu, "");
+      // Remove hidden variation selectors and zero-width joiners
+      cleanText = cleanText.replace(/[\uFE00-\uFE0F\u200D]/g, "");
+
+      // Remove all emojis (Extended ranges)
+      cleanText = cleanText.replace(/[\u{1F1E6}-\u{1F1FF}\u{1F300}-\u{1F5FF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F780}-\u{1F7FF}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, "");
 
       // Remove Telegram and Web Links
       cleanText = cleanText.replace(/https?:\/\/[^\s]+/gi, "");
@@ -34,31 +37,27 @@ export default {
       // Remove @handles
       cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
 
-      // Remove Phone numbers (Even without the word "Phone" next to them)
+      // Remove Phone numbers
       cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?9[\d\s.-]{7,}/g, "[Phone Hidden]");
       cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?7[\d\s.-]{7,}/g, "[Phone Hidden]");
 
-      // Clean up extra blank lines and weird spacing left behind
+      // Clean up extra blank lines and spaces
       cleanText = cleanText.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
 
       // ============================================
-      // 2. PRICE EXTRACTION (Fixed for "2,500,000..Birr")
+      // 2. PRICE EXTRACTION
       // ============================================
       let price = "";
-      // This looks specifically for Price/ዋጋ/Birr/ETB followed by numbers, ignoring dots
       const priceMatch = cleanText.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
       
       if (priceMatch) {
         let rawNum = priceMatch[1];
-        // Clean the number (remove all commas and dots)
         let cleanedNum = rawNum.replace(/[.,]/g, "");
-        // If it ends up being a valid number, format it
         if (cleanedNum && !isNaN(cleanedNum)) {
           price = Number(cleanedNum).toLocaleString("en-US");
         }
       }
 
-      // Fallback if no explicit price word is found
       if (!price) {
         const fallbackMatch = cleanText.match(/(\d{1,3}(?:[.,]\d{3})+)/);
         if (fallbackMatch) {
