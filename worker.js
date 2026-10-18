@@ -19,58 +19,74 @@ export default {
       if (!messageText) return new Response("OK", { status: 200 });
 
       // ============================================
-      // ✅ 1. BULLETPROOF CLEANUP (Phones, Links, Handles, Emojis)
+      // ✅ 1. SUPER AGGRESSIVE CLEANUP
       // ============================================
       let cleanText = messageText;
 
-      // Remove Telegram links
-      cleanText = cleanText.replace(/https?:\/\/t\.me\/[^\s]+/gi, "");
-      // Remove general web links
-      cleanText = cleanText.replace(/(https?:\/\/[^\s]+|www\.[^\s]+)/gi, "");
-      // Remove @username handles
-      cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
-      // Remove phone numbers (handles +251, 09, 07, and spaces/dots)
-      cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?9[\d\s.-]{7,}/g, "");
-      cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?7[\d\s.-]{7,}/g, "");
-      
-      // ✅ REMOVE ALL EMOJIS
+      // Remove all emojis (Unicode ranges)
       cleanText = cleanText.replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F780}-\u{1F7FF}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{1F1E6}-\u{1F1FF}\u{FE0F}\u{200D}\u{20E3}]/gu, "");
 
-      // Clean up extra blank lines and spaces
+      // Remove Telegram and Web Links
+      cleanText = cleanText.replace(/https?:\/\/[^\s]+/gi, "");
+      cleanText = cleanText.replace(/www\.[^\s]+/gi, "");
+      cleanText = cleanText.replace(/t\.me\/[^\s]+/gi, "");
+
+      // Remove @handles
+      cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
+
+      // Remove Phone numbers (Even without the word "Phone" next to them)
+      cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?9[\d\s.-]{7,}/g, "[Phone Hidden]");
+      cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?7[\d\s.-]{7,}/g, "[Phone Hidden]");
+
+      // Clean up extra blank lines and weird spacing left behind
       cleanText = cleanText.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
+
+      // ============================================
+      // 2. PRICE EXTRACTION (Fixed for "2,500,000..Birr")
+      // ============================================
+      let price = "";
+      // This looks specifically for Price/ዋጋ/Birr/ETB followed by numbers, ignoring dots
+      const priceMatch = cleanText.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
+      
+      if (priceMatch) {
+        let rawNum = priceMatch[1];
+        // Clean the number (remove all commas and dots)
+        let cleanedNum = rawNum.replace(/[.,]/g, "");
+        // If it ends up being a valid number, format it
+        if (cleanedNum && !isNaN(cleanedNum)) {
+          price = Number(cleanedNum).toLocaleString("en-US");
+        }
+      }
+
+      // Fallback if no explicit price word is found
+      if (!price) {
+        const fallbackMatch = cleanText.match(/(\d{1,3}(?:[.,]\d{3})+)/);
+        if (fallbackMatch) {
+          price = fallbackMatch[1];
+        }
+      }
 
       const lowerText = cleanText.toLowerCase();
 
-      // 2. DETECT LANGUAGE
+      // 3. DETECT LANGUAGE
       const isAmharic = /[\u1200-\u137F]/.test(cleanText);
       const language = isAmharic ? "am" : "en";
 
-      // 3. SMART CATEGORY DETECTION
+      // 4. SMART CATEGORY DETECTION
       let category = "Other";
       let subcategory = "";
       let condition = "";
 
-      if (/#cars/i.test(cleanText) || /#መኪና/i.test(cleanText)) category = "Cars";
-      else if (/#houses/i.test(cleanText) || /#ቤት/i.test(cleanText)) category = "Houses";
-      else if (/#apartments/i.test(cleanText) || /#rentals/i.test(cleanText) || /#ኪራይ/i.test(cleanText)) category = "Rentals";
-      else if (/#electronics/i.test(cleanText) || /#ኤሌክትሮኒክስ/i.test(cleanText)) category = "Electronics";
-      else if (/#furniture/i.test(cleanText) || /#እቃ/i.test(cleanText)) category = "Furniture";
-      else if (/#clothes/i.test(cleanText) || /#ልብስ/i.test(cleanText)) category = "Clothes";
-      else if (/#labor/i.test(cleanText) || /#ሰራተኛ/i.test(cleanText)) category = "Labor & Services";
-      else if (/#used/i.test(cleanText) || /#ምንአለሽ/i.test(cleanText)) category = "ምንአለሽ ተራ";
+      if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) category = "Cars";
+      else if (/(house|villa|condominium|condo|ቤት|ቪላ|ኮንዶሚኒየም)/i.test(lowerText)) category = "Houses";
+      else if (/(apartment|office|shop|አፓርታማ|ቢሮ|ሱቅ|መጋዘን)/i.test(lowerText)) category = "Rentals";
+      else if (/(iphone|samsung|tecno|infinix|phone|smartphone|laptop|computer|tv|camera|ስልክ|ሞባይል|ላፕቶፕ|ኮምፒውተር|ቲቪ|ቴሌቪዥን|ካሜራ)/i.test(lowerText)) category = "Electronics";
+      else if (/(sofa|bed|table|chair|furniture|cabinet|ሶፋ|አልጋ|ጠረጴዛ|ጠረንጴዛ|ወንበር|ቁምሳጥን|እቃ)/i.test(lowerText)) category = "Furniture";
+      else if (/(clothes|shoes|dress|shirt|pants|fashion|ልብስ|ጫማ|ቀሚስ|ሱሪ|ሸሚዝ)/i.test(lowerText)) category = "Clothes";
+      else if (/(construction|electrician|plumber|painter|cleaning|worker|ግንባታ|ኤሌክትሪሺያን|ቧንቧ|ቀለም|ጽዳት|ሰራተኛ|ሠራተኛ)/i.test(lowerText)) category = "Labor & Services";
+      else if (/(used|second-hand|ምንአለሽ ተራ|ያገለገለ)/i.test(lowerText)) category = "ምንአለሽ ተራ";
 
-      if (category === "Other") {
-        if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) category = "Cars";
-        else if (/(house|villa|condominium|condo|ቤት|ቪላ|ኮንዶሚኒየም)/i.test(lowerText)) category = "Houses";
-        else if (/(apartment|office|shop|አፓርታማ|ቢሮ|ሱቅ|መጋዘን)/i.test(lowerText)) category = "Rentals";
-        else if (/(iphone|samsung|tecno|infinix|phone|smartphone|laptop|computer|tv|camera|ስልክ|ሞባይል|ላፕቶፕ|ኮምፒውተር|ቲቪ|ቴሌቪዥን|ካሜራ)/i.test(lowerText)) category = "Electronics";
-        else if (/(sofa|bed|table|chair|furniture|cabinet|ሶፋ|አልጋ|ጠረጴዛ|ጠረንጴዛ|ወንበር|ቁምሳጥን|እቃ)/i.test(lowerText)) category = "Furniture";
-        else if (/(clothes|shoes|dress|shirt|pants|fashion|ልብስ|ጫማ|ቀሚስ|ሱሪ|ሸሚዝ)/i.test(lowerText)) category = "Clothes";
-        else if (/(construction|electrician|plumber|painter|cleaning|worker|ግንባታ|ኤሌክትሪሺያን|ቧንቧ|ቀለም|ጽዳት|ሰራተኛ|ሠራተኛ)/i.test(lowerText)) category = "Labor & Services";
-        else if (/(used|second-hand|ምንአለሽ ተራ|ያገለገለ)/i.test(lowerText)) category = "ምንአለሽ ተራ";
-      }
-
-      // 4. DETECT SUBCATEGORY & CONDITION
+      // 5. DETECT SUBCATEGORY & CONDITION
       if (category === "Cars") {
         if (/(new|አዲስ)/i.test(lowerText)) condition = "New";
         else if (/(electric|ኤሌክትሪክ|ኢቪ)/i.test(lowerText)) condition = "Electric";
@@ -93,43 +109,19 @@ export default {
         else condition = "Used";
       }
 
-      // 5. PARSE MESSAGE
+      // 6. PARSE TITLE AND CITY
       const lines = cleanText.split("\n").map((l) => l.trim()).filter(Boolean);
       let title = lines[0] || "Untitled Ad";
       if (title.length > 60) title = title.substring(0, 60) + "...";
-
-      let price = "";
       let city = "";
 
       for (const line of lines) {
-        const priceMatch = line.match(/(?:price|peric|pris|ዋጋ|ETB|ብር)[\s:.\-]*([\d.,\s]+)\s*(MILLION|Million|BILLION|Billion|K\b|Thousand|THOUSAND|ሚሊዮን|ቢሊዮን|ሺህ)?/i);
-        if (priceMatch && !price) {
-          const rawNum = priceMatch[1].trim();
-          const unit = (priceMatch[2] || "").toUpperCase();
-          const cleaned = rawNum.replace(/\s/g, "");
-          const thousandPattern = /^\d{1,3}([.,]\d{3})+$/;
-
-          let numVal;
-          if (thousandPattern.test(cleaned)) numVal = parseFloat(cleaned.replace(/[.,]/g, ""));
-          else numVal = parseFloat(cleaned.replace(/,/g, ""));
-
-          if (unit.includes("MILLION") || unit.includes("ሚሊዮን")) {
-            if (numVal < 100000) numVal *= 1000000;
-          } else if (unit.includes("BILLION") || unit.includes("ቢሊዮን")) {
-            if (numVal < 100000) numVal *= 1000000000;
-          } else if (unit.includes("THOUSAND") || unit === "K" || unit.includes("ሺህ")) {
-            if (numVal < 1000) numVal *= 1000;
-          }
-
-          if (!isNaN(numVal) && numVal > 0) price = Math.round(numVal).toLocaleString("en-US");
-        }
-
         const cityMatch = line.match(/(?:city|location|ከተማ)[\s:]+(.+)/i);
         if (cityMatch && !city) city = cityMatch[1].trim();
         else if (/addis|ababa|adama|hawassa|bahir dar|mekelle|gondar|jimma|dire dawa|bishoftu/i.test(line) && !city) city = line.trim();
       }
 
-      // 6. UPLOAD IMAGE
+      // 7. UPLOAD IMAGE
       let imageUrl = "";
       if (message.photo && message.photo.length > 0) {
         try {
@@ -151,7 +143,7 @@ export default {
         } catch (e) {}
       }
 
-      // 7. SAVE TO FIREBASE
+      // 8. SAVE TO FIREBASE
       const token = await getFirebaseToken(env);
       const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
       const adOwnerId = env.ADMIN_UID || "admin_bot"; 
@@ -185,14 +177,13 @@ export default {
       });
 
       // ============================================
-      // ✅ 8. POST THE CLEAN AD BACK TO TELEGRAM CHANNEL
+      // ✅ 9. POST THE CLEAN AD BACK TO TELEGRAM
       // ============================================
       if (env.TELEGRAM_BOT_TOKEN && message.chat?.id) {
         
         // Wait 3 seconds so Telegram doesn't think it's spam
         await new Promise(resolve => setTimeout(resolve, 3000));
 
-        // Build the clean message text
         let newPostText = `✅ Clean Ad Posted!\n\n`;
         newPostText += `📂 Category: ${category}${subcategory ? " > " + subcategory : ""}\n`;
         newPostText += `📝 Title: ${title}\n`;
@@ -202,7 +193,6 @@ export default {
         newPostText += `\n📄 Details:\n${cleanText}`;
 
         try {
-          // Send the clean message
           const tgRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -214,11 +204,9 @@ export default {
           
           const tgData = await tgRes.json();
           
-          // ✅ 9. DELETE THE ORIGINAL MESSAGE
+          // ✅ 10. DELETE THE ORIGINAL MESSAGE
           if (tgData.ok) {
-            // Wait 1 second before deleting to be safe
             await new Promise(resolve => setTimeout(resolve, 1000));
-            
             await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
