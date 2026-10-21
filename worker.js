@@ -17,28 +17,42 @@ export default {
 
       try {
         // ============================================
-        // 1. CLEANUP
+        // 1. ULTIMATE CLEANUP
         // ============================================
         let cleanText = messageText;
+
+        // Remove Emojis
         cleanText = cleanText.replace(/[\uFE00-\uFE0F\u200D]/g, "");
         cleanText = cleanText.replace(/[\u{1F1E6}-\u{1F1FF}\u{1F300}-\u{1F5FF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F780}-\u{1F7FF}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, "");
+
+        // Remove Telegram and Web Links
         cleanText = cleanText.replace(/https?:\/\/[^\s]+/gi, "");
         cleanText = cleanText.replace(/www\.[^\s]+/gi, "");
         cleanText = cleanText.replace(/t\.me\/[^\s]+/gi, "");
+
+        // Remove @handles
         cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
-        cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?9[\d\s.-]{7,}/g, "[Phone Hidden]");
-        cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?7[\d\s.-]{7,}/g, "[Phone Hidden]");
+
+        // ✅ BULLETPROOF PHONE REMOVER (Catches 09, 07, +251, with spaces, dashes, dots)
+        // Matches 0 or 251 or +251, followed by 9 or 7, followed by 8 digits
+        cleanText = cleanText.replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "[Phone Hidden]");
+
+        // Clean up extra blank lines and spaces
         cleanText = cleanText.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
 
         // ============================================
         // 2. EXTRACT DETAILS
         // ============================================
         let brand = ""; let model = ""; let year = "";
-        const brandMatch = cleanText.match(/(?:make|brand)[\s:-]+([a-zA-Z\s]+)/i);
+        
+        const brandMatch = cleanText.match(/(?:make|brand)[\s:.-]+([a-zA-Z\s]+)/i);
         if (brandMatch) brand = brandMatch[1].trim();
-        const modelMatch = cleanText.match(/model[\s:-]+([a-zA-Z0-9\s.-]+)/i);
+        
+        const modelMatch = cleanText.match(/model[\s:.-]+([a-zA-Z0-9\s.-]+)/i);
         if (modelMatch) model = modelMatch[1].trim();
-        const yearMatch = cleanText.match(/(?:year|ዓመት)[\s:-]+((?:19|20)\d{2})/i);
+        
+        // ✅ Fixed to allow dots, spaces, colons, dashes
+        const yearMatch = cleanText.match(/(?:year|ዓመት)[\s:.-]+((?:19|20)\d{2})/i);
         if (yearMatch) year = yearMatch[1];
         else {
           const fallbackYear = cleanText.match(/\b(19|20)\d{2}\b/);
@@ -86,7 +100,7 @@ export default {
         else if (/addis|ababa|adama|hawassa/i.test(cleanText)) city = "Addis Ababa";
 
         // ============================================
-        // 3. UPLOAD IMAGE (with safety check)
+        // 3. UPLOAD IMAGE
         // ============================================
         let imageUrl = "";
         if (message.photo && message.photo.length > 0) {
@@ -107,12 +121,12 @@ export default {
               if (cloudData.secure_url) imageUrl = cloudData.secure_url;
             }
           } catch (e) {
-             statusMessage += "⚠️ Image upload failed, but ad was saved.\n";
+             statusMessage += "⚠️ Image upload failed.\n";
           }
         }
 
         // ============================================
-        // 4. SAVE TO FIREBASE (with safety check)
+        // 4. SAVE TO FIREBASE
         // ============================================
         try {
           const token = await getFirebaseToken(env);
@@ -122,7 +136,7 @@ export default {
           const adData = {
             fields: {
               title: { stringValue: title },
-              description: { stringValue: cleanText },
+              description: { stringValue: cleanText }, 
               price: { stringValue: price || "0" },
               phone: { stringValue: "0911680790" }, 
               city: { stringValue: city },
@@ -145,22 +159,21 @@ export default {
             body: JSON.stringify(adData),
           });
           
-          if (!fbRes.ok) {
-             statusMessage += "❌ Firebase save failed.\n";
-          }
+          if (!fbRes.ok) statusMessage += "❌ Firebase save failed.\n";
         } catch (fbErr) {
            statusMessage += "❌ Firebase connection failed.\n";
         }
 
-        // Build final reply text
+        // ✅ 5. SHOW THE CLEANED DESCRIPTION IN THE TELEGRAM REPLY
         statusMessage += `📂 Category: ${category}\n📝 Title: ${title}\n💰 Price: ${price || "Not found"} ETB\n`;
-        
+        statusMessage += `\n📄 Cleaned Description:\n${cleanText.substring(0, 300)}...`; // Shows what was saved!
+
       } catch (error) {
         statusMessage = "⚠️ Ad processed, but an error occurred: " + error.message;
       }
 
       // ============================================
-      // 5. REPLY TO TELEGRAM
+      // 6. REPLY TO TELEGRAM
       // ============================================
       await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
         method: "POST",
