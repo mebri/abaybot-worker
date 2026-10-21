@@ -13,7 +13,7 @@ export default {
       }
 
       const messageText = message.text || message.caption;
-      let statusMessage = "✅ Clean Ad Posted!\n\n";
+      let statusMessage = "✅ Ad Processed!\n\n";
 
       try {
         // ============================================
@@ -25,33 +25,26 @@ export default {
         cleanText = cleanText.replace(/[\uFE00-\uFE0F\u200D]/g, "");
         cleanText = cleanText.replace(/[\u{1F1E6}-\u{1F1FF}\u{1F300}-\u{1F5FF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F780}-\u{1F7FF}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, "");
 
-        // Remove Telegram and Web Links
+        // Remove Links and @handles
         cleanText = cleanText.replace(/https?:\/\/[^\s]+/gi, "");
         cleanText = cleanText.replace(/www\.[^\s]+/gi, "");
         cleanText = cleanText.replace(/t\.me\/[^\s]+/gi, "");
-
-        // Remove @handles
         cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
 
-        // ✅ BULLETPROOF PHONE REMOVER (Catches 09, 07, +251, with spaces, dashes, dots)
-        // Matches 0 or 251 or +251, followed by 9 or 7, followed by 8 digits
+        // Remove Phone Numbers
         cleanText = cleanText.replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "[Phone Hidden]");
 
-        // Clean up extra blank lines and spaces
+        // Clean up extra blank lines
         cleanText = cleanText.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
 
         // ============================================
         // 2. EXTRACT DETAILS
         // ============================================
         let brand = ""; let model = ""; let year = "";
-        
         const brandMatch = cleanText.match(/(?:make|brand)[\s:.-]+([a-zA-Z\s]+)/i);
         if (brandMatch) brand = brandMatch[1].trim();
-        
         const modelMatch = cleanText.match(/model[\s:.-]+([a-zA-Z0-9\s.-]+)/i);
         if (modelMatch) model = modelMatch[1].trim();
-        
-        // ✅ Fixed to allow dots, spaces, colons, dashes
         const yearMatch = cleanText.match(/(?:year|ዓመት)[\s:.-]+((?:19|20)\d{2})/i);
         if (yearMatch) year = yearMatch[1];
         else {
@@ -81,7 +74,7 @@ export default {
         }
 
         const lowerText = cleanText.toLowerCase();
-        let category = "Other"; let subcategory = ""; let condition = "";
+        let category = "Other"; let condition = "";
         if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
           category = "Cars";
           if (/(new|አዲስ)/i.test(lowerText)) condition = "New";
@@ -120,69 +113,102 @@ export default {
               const cloudData = await cloudRes.json();
               if (cloudData.secure_url) imageUrl = cloudData.secure_url;
             }
-          } catch (e) {
-             statusMessage += "⚠️ Image upload failed.\n";
-          }
+          } catch (e) {}
         }
 
         // ============================================
         // 4. SAVE TO FIREBASE
         // ============================================
+        const token = await getFirebaseToken(env);
+        const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
+        const adOwnerId = env.ADMIN_UID || "admin_bot"; 
+
+        const adData = {
+          fields: {
+            title: { stringValue: title },
+            description: { stringValue: cleanText }, 
+            price: { stringValue: price || "0" },
+            phone: { stringValue: "0911680790" }, 
+            city: { stringValue: city },
+            category: { stringValue: category },
+            condition: { stringValue: condition }, 
+            image: { stringValue: imageUrl },
+            images: { arrayValue: imageUrl ? { values: [{ stringValue: imageUrl }] } : { values: [] } },
+            status: { stringValue: "available" }, 
+            source: { stringValue: "telegram" },
+            userId: { stringValue: adOwnerId }, 
+            views: { integerValue: "0" },
+            createdAt: { timestampValue: new Date().toISOString() },
+          },
+        };
+
+        const fbUrl = `https://firestore.googleapis.com/v1/projects/${sa.project_id}/databases/(default)/documents/ads`;
+        await fetch(fbUrl, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+          body: JSON.stringify(adData),
+        });
+
+        // ============================================
+        // 5. REPOST CLEAN AD & DELETE ORIGINAL
+        // ============================================
+        
+        // Build the clean post text
+        let newPostText = `✅ Official Ad Posted!\n\n`;
+        newPostText += `📂 Category: ${category}\n`;
+        newPostText += `📝 Title: ${title}\n`;
+        if (price) newPostText += `💰 Price: ${price} ETB\n`;
+        if (city) newPostText += `📍 City: ${city}\n`;
+        newPostText += `\n📞 Contact: 0911680790\n`; 
+        newPostText += `\n📄 Details:\n${cleanText}`;
+
         try {
-          const token = await getFirebaseToken(env);
-          const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
-          const adOwnerId = env.ADMIN_UID || "admin_bot"; 
+          // If the original message had a photo, send the photo with the clean text
+          if (imageUrl && message.photo && message.photo.length > 0) {
+            await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ 
+                chat_id: message.chat.id, 
+                photo: imageUrl, 
+                caption: newPostText.substring(0, 1024)
+              }),
+            });
+          } else {
+            // Send text only
+            await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ 
+                chat_id: message.chat.id, 
+                text: newPostText.substring(0, 4096)
+              }),
+            });
+          }
 
-          const adData = {
-            fields: {
-              title: { stringValue: title },
-              description: { stringValue: cleanText }, 
-              price: { stringValue: price || "0" },
-              phone: { stringValue: "0911680790" }, 
-              city: { stringValue: city },
-              category: { stringValue: category },
-              condition: { stringValue: condition }, 
-              image: { stringValue: imageUrl },
-              images: { arrayValue: imageUrl ? { values: [{ stringValue: imageUrl }] } : { values: [] } },
-              status: { stringValue: "available" }, 
-              source: { stringValue: "telegram" },
-              userId: { stringValue: adOwnerId }, 
-              views: { integerValue: "0" },
-              createdAt: { timestampValue: new Date().toISOString() },
-            },
-          };
-
-          const fbUrl = `https://firestore.googleapis.com/v1/projects/${sa.project_id}/databases/(default)/documents/ads`;
-          const fbRes = await fetch(fbUrl, {
-            method: "POST",
-            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-            body: JSON.stringify(adData),
-          });
+          // Wait 2 seconds, then delete the original messy message
+          await new Promise(resolve => setTimeout(resolve, 2000));
           
-          if (!fbRes.ok) statusMessage += "❌ Firebase save failed.\n";
-        } catch (fbErr) {
-           statusMessage += "❌ Firebase connection failed.\n";
+          await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ 
+              chat_id: message.chat.id, 
+              message_id: message.message_id 
+            }),
+          });
+
+          statusMessage += "✅ Original message deleted.";
+        } catch (tgErr) {
+          statusMessage += "⚠️ Could not delete original message. Check bot permissions.\n";
         }
 
-        // ✅ 5. SHOW THE CLEANED DESCRIPTION IN THE TELEGRAM REPLY
-        statusMessage += `📂 Category: ${category}\n📝 Title: ${title}\n💰 Price: ${price || "Not found"} ETB\n`;
-        statusMessage += `\n📄 Cleaned Description:\n${cleanText.substring(0, 300)}...`; // Shows what was saved!
-
       } catch (error) {
-        statusMessage = "⚠️ Ad processed, but an error occurred: " + error.message;
+        statusMessage = "⚠️ Error: " + error.message;
       }
 
-      // ============================================
-      // 6. REPLY TO TELEGRAM
-      // ============================================
-      await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: message.chat.id,
-          text: statusMessage
-        }),
-      });
+      // We don't need a reply message anymore since the bot is posting the clean ad directly.
+      // But we can send a silent log to a private admin chat if you want later.
 
       return new Response("OK", { status: 200 });
     } catch (error) {
