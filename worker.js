@@ -13,17 +13,16 @@ export default {
       }
 
       const messageText = message.text || message.caption;
-      let statusMessage = "✅ Ad Processed!\n\n";
 
       try {
         // ============================================
-        // 1. ULTIMATE CLEANUP
+        // 1. ULTIMATE CLEANUP (No errors allowed)
         // ============================================
         let cleanText = messageText;
 
-        // Remove Emojis
-        cleanText = cleanText.replace(/[\uFE00-\uFE0F\u200D]/g, "");
-        cleanText = cleanText.replace(/[\u{1F1E6}-\u{1F1FF}\u{1F300}-\u{1F5FF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F780}-\u{1F7FF}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, "");
+        // Remove all emojis, symbols, and hidden characters
+        cleanText = cleanText.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}]/gu, "");
+        cleanText = cleanText.replace(/[\u0000-\u001F\u007F-\u009F]/g, ""); // Remove control chars
 
         // Remove Links and @handles
         cleanText = cleanText.replace(/https?:\/\/[^\s]+/gi, "");
@@ -31,7 +30,7 @@ export default {
         cleanText = cleanText.replace(/t\.me\/[^\s]+/gi, "");
         cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
 
-        // Remove Phone Numbers
+        // Remove Phone Numbers (Telegram often blocks numbers in new messages)
         cleanText = cleanText.replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "[Phone Hidden]");
 
         // Clean up extra blank lines
@@ -152,8 +151,6 @@ export default {
         // ============================================
         // 5. REPOST CLEAN AD & DELETE ORIGINAL
         // ============================================
-        
-        // Build the clean post text
         let newPostText = `✅ Official Ad Posted!\n\n`;
         newPostText += `📂 Category: ${category}\n`;
         newPostText += `📝 Title: ${title}\n`;
@@ -162,21 +159,23 @@ export default {
         newPostText += `\n📞 Contact: 0911680790\n`; 
         newPostText += `\n📄 Details:\n${cleanText}`;
 
+        let postSuccess = false;
+        let errorMsg = "";
+
         try {
-          // If the original message had a photo, send the photo with the clean text
+          let tgRes;
           if (imageUrl && message.photo && message.photo.length > 0) {
-            await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
+            tgRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ 
                 chat_id: message.chat.id, 
                 photo: imageUrl, 
-                caption: newPostText.substring(0, 1024)
+                caption: newPostText.substring(0, 1024) // Telegram caption limit
               }),
             });
           } else {
-            // Send text only
-            await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            tgRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ 
@@ -186,29 +185,48 @@ export default {
             });
           }
 
-          // Wait 2 seconds, then delete the original messy message
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          
+          const tgData = await tgRes.json();
+          if (tgData.ok) {
+            postSuccess = true;
+          } else {
+            errorMsg = tgData.description; // Capture exact Telegram error
+          }
+
+        } catch (tgErr) {
+          errorMsg = tgErr.message;
+        }
+
+        // If successfully posted, wait 3 seconds and delete the original message
+        if (postSuccess) {
+          await new Promise(resolve => setTimeout(resolve, 3000));
           await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat_id: message.chat.id, message_id: message.message_id }),
+          });
+        } else {
+          // If posting failed, send an error message to the channel so you know why
+          await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ 
               chat_id: message.chat.id, 
-              message_id: message.message_id 
+              text: `⚠️ Bot could not repost clean ad. Error: ${errorMsg}`
             }),
           });
-
-          statusMessage += "✅ Original message deleted.";
-        } catch (tgErr) {
-          statusMessage += "⚠️ Could not delete original message. Check bot permissions.\n";
         }
 
       } catch (error) {
-        statusMessage = "⚠️ Error: " + error.message;
+        // If the whole process fails, send a message to the channel
+        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ 
+            chat_id: message.chat.id, 
+            text: `⚠️ Bot Error: ${error.message}`
+          }),
+        });
       }
-
-      // We don't need a reply message anymore since the bot is posting the clean ad directly.
-      // But we can send a silent log to a private admin chat if you want later.
 
       return new Response("OK", { status: 200 });
     } catch (error) {
