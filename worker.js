@@ -13,43 +13,32 @@ export default {
       }
 
       const messageText = message.text || message.caption;
+      let statusMessage = "✅ Clean Ad Posted!\n\n";
 
       try {
         // ============================================
-        // 1. ULTIMATE CLEANUP (No emojis, no symbols)
+        // 1. CLEANUP
         // ============================================
         let cleanText = messageText;
-
-        // Remove ALL emojis and symbols
-        cleanText = cleanText.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{2700}-\u{27BF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu, "");
-        
-        // Remove Markdown formatting characters that break Telegram API
-        cleanText = cleanText.replace(/[*_~`|]/g, "");
-        
-        // Remove weird block characters (▬, ▌, etc.)
-        cleanText = cleanText.replace(/[\u2580-\u259F]/g, "");
-
-        // Remove Links and @handles
+        cleanText = cleanText.replace(/[\uFE00-\uFE0F\u200D]/g, "");
+        cleanText = cleanText.replace(/[\u{1F1E6}-\u{1F1FF}\u{1F300}-\u{1F5FF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F780}-\u{1F7FF}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, "");
         cleanText = cleanText.replace(/https?:\/\/[^\s]+/gi, "");
         cleanText = cleanText.replace(/www\.[^\s]+/gi, "");
         cleanText = cleanText.replace(/t\.me\/[^\s]+/gi, "");
         cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
-
-        // ✅ Remove Phone Numbers (Replace with parentheses, not brackets)
-        cleanText = cleanText.replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "(Phone Hidden)");
-
-        // Clean up extra blank lines and spaces
+        cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?9[\d\s.-]{7,}/g, "[Phone Hidden]");
+        cleanText = cleanText.replace(/(?:\+251|251|0)[\s.-]?7[\d\s.-]{7,}/g, "[Phone Hidden]");
         cleanText = cleanText.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
 
         // ============================================
         // 2. EXTRACT DETAILS
         // ============================================
         let brand = ""; let model = ""; let year = "";
-        const brandMatch = cleanText.match(/(?:make|brand)[\s:.-]+([a-zA-Z\s]+)/i);
+        const brandMatch = cleanText.match(/(?:make|brand)[\s:-]+([a-zA-Z\s]+)/i);
         if (brandMatch) brand = brandMatch[1].trim();
-        const modelMatch = cleanText.match(/model[\s:.-]+([a-zA-Z0-9\s.-]+)/i);
+        const modelMatch = cleanText.match(/model[\s:-]+([a-zA-Z0-9\s.-]+)/i);
         if (modelMatch) model = modelMatch[1].trim();
-        const yearMatch = cleanText.match(/(?:year|ዓመት|yeras)[\s:.-]+((?:19|20)\d{2})/i);
+        const yearMatch = cleanText.match(/(?:year|ዓመት)[\s:-]+((?:19|20)\d{2})/i);
         if (yearMatch) year = yearMatch[1];
         else {
           const fallbackYear = cleanText.match(/\b(19|20)\d{2}\b/);
@@ -78,7 +67,7 @@ export default {
         }
 
         const lowerText = cleanText.toLowerCase();
-        let category = "Other"; let condition = "";
+        let category = "Other"; let subcategory = ""; let condition = "";
         if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
           category = "Cars";
           if (/(new|አዲስ)/i.test(lowerText)) condition = "New";
@@ -97,7 +86,7 @@ export default {
         else if (/addis|ababa|adama|hawassa/i.test(cleanText)) city = "Addis Ababa";
 
         // ============================================
-        // 3. UPLOAD IMAGE
+        // 3. UPLOAD IMAGE (with safety check)
         // ============================================
         let imageUrl = "";
         if (message.photo && message.photo.length > 0) {
@@ -117,129 +106,70 @@ export default {
               const cloudData = await cloudRes.json();
               if (cloudData.secure_url) imageUrl = cloudData.secure_url;
             }
-          } catch (e) {}
+          } catch (e) {
+             statusMessage += "⚠️ Image upload failed, but ad was saved.\n";
+          }
         }
 
         // ============================================
-        // 4. SAVE TO FIREBASE
+        // 4. SAVE TO FIREBASE (with safety check)
         // ============================================
-        const token = await getFirebaseToken(env);
-        const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
-        const adOwnerId = env.ADMIN_UID || "admin_bot"; 
-
-        const adData = {
-          fields: {
-            title: { stringValue: title },
-            description: { stringValue: cleanText }, 
-            price: { stringValue: price || "0" },
-            phone: { stringValue: "0911680790" }, 
-            city: { stringValue: city },
-            category: { stringValue: category },
-            condition: { stringValue: condition }, 
-            image: { stringValue: imageUrl },
-            images: { arrayValue: imageUrl ? { values: [{ stringValue: imageUrl }] } : { values: [] } },
-            status: { stringValue: "available" }, 
-            source: { stringValue: "telegram" },
-            userId: { stringValue: adOwnerId }, 
-            views: { integerValue: "0" },
-            createdAt: { timestampValue: new Date().toISOString() },
-          },
-        };
-
-        const fbUrl = `https://firestore.googleapis.com/v1/projects/${sa.project_id}/databases/(default)/documents/ads`;
-        await fetch(fbUrl, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-          body: JSON.stringify(adData),
-        });
-
-        // ============================================
-        // 5. REPOST CLEAN AD & DELETE ORIGINAL
-        // ============================================
-        let safeDetails = cleanText.substring(0, 800); 
-
-        let newPostText = `✅ Official Ad Posted!\n\n`;
-        newPostText += `📂 Category: ${category}\n`;
-        newPostText += `📝 Title: ${title}\n`;
-        if (price) newPostText += `💰 Price: ${price} ETB\n`;
-        if (city) newPostText += `📍 City: ${city}\n`;
-        newPostText += `\n📞 Contact: 0911680790\n`; 
-        newPostText += `\n📄 Details:\n${safeDetails}`;
-
-        let postSuccess = false;
-        let errorMsg = "";
-
         try {
-          let tgRes;
-          // Try sending as photo first
-          if (imageUrl && message.photo && message.photo.length > 0) {
-            tgRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ 
-                chat_id: message.chat.id, 
-                photo: imageUrl, 
-                caption: newPostText.substring(0, 1024),
-                parse_mode: "" // ✅ Disable parsing
-              }),
-            });
-          } 
+          const token = await getFirebaseToken(env);
+          const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
+          const adOwnerId = env.ADMIN_UID || "admin_bot"; 
+
+          const adData = {
+            fields: {
+              title: { stringValue: title },
+              description: { stringValue: cleanText },
+              price: { stringValue: price || "0" },
+              phone: { stringValue: "0911680790" }, 
+              city: { stringValue: city },
+              category: { stringValue: category },
+              condition: { stringValue: condition }, 
+              image: { stringValue: imageUrl },
+              images: { arrayValue: imageUrl ? { values: [{ stringValue: imageUrl }] } : { values: [] } },
+              status: { stringValue: "available" }, 
+              source: { stringValue: "telegram" },
+              userId: { stringValue: adOwnerId }, 
+              views: { integerValue: "0" },
+              createdAt: { timestampValue: new Date().toISOString() },
+            },
+          };
+
+          const fbUrl = `https://firestore.googleapis.com/v1/projects/${sa.project_id}/databases/(default)/documents/ads`;
+          const fbRes = await fetch(fbUrl, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+            body: JSON.stringify(adData),
+          });
           
-          // If no photo, or if photo failed, send as text
-          if (!tgRes || !(await tgRes.clone().json()).ok) {
-            tgRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ 
-                chat_id: message.chat.id, 
-                text: newPostText.substring(0, 4096),
-                parse_mode: "" // ✅ Disable parsing
-              }),
-            });
+          if (!fbRes.ok) {
+             statusMessage += "❌ Firebase save failed.\n";
           }
-
-          const tgData = await tgRes.json();
-          if (tgData.ok) {
-            postSuccess = true;
-          } else {
-            errorMsg = tgData.description; 
-          }
-
-        } catch (tgErr) {
-          errorMsg = tgErr.message;
+        } catch (fbErr) {
+           statusMessage += "❌ Firebase connection failed.\n";
         }
 
-        // If successfully posted, wait 3 seconds and delete the original message
-        if (postSuccess) {
-          await new Promise(resolve => setTimeout(resolve, 3000));
-          await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ chat_id: message.chat.id, message_id: message.message_id }),
-          });
-        } else {
-          // If posting failed, send an error message to the channel so you know why
-          await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ 
-              chat_id: message.chat.id, 
-              text: `⚠️ Bot could not repost clean ad. Error: ${errorMsg}`
-            }),
-          });
-        }
-
+        // Build final reply text
+        statusMessage += `📂 Category: ${category}\n📝 Title: ${title}\n💰 Price: ${price || "Not found"} ETB\n`;
+        
       } catch (error) {
-        // If the whole process fails, send a message to the channel
-        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ 
-            chat_id: message.chat.id, 
-            text: `⚠️ Bot Error: ${error.message}`
-          }),
-        });
+        statusMessage = "⚠️ Ad processed, but an error occurred: " + error.message;
       }
+
+      // ============================================
+      // 5. REPLY TO TELEGRAM
+      // ============================================
+      await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: message.chat.id,
+          text: statusMessage
+        }),
+      });
 
       return new Response("OK", { status: 200 });
     } catch (error) {
