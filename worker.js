@@ -20,7 +20,7 @@ export default {
         // ============================================
         let cleanText = messageText;
 
-        // Remove ALL emojis and symbols (Extremely aggressive)
+        // Remove ALL emojis and symbols
         cleanText = cleanText.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{2700}-\u{27BF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu, "");
         
         // Remove Markdown formatting characters that break Telegram API
@@ -35,8 +35,8 @@ export default {
         cleanText = cleanText.replace(/t\.me\/[^\s]+/gi, "");
         cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
 
-        // Remove Phone Numbers
-        cleanText = cleanText.replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "[Phone Hidden]");
+        // ✅ Remove Phone Numbers (Replace with parentheses, not brackets)
+        cleanText = cleanText.replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "(Phone Hidden)");
 
         // Clean up extra blank lines and spaces
         cleanText = cleanText.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
@@ -156,7 +156,6 @@ export default {
         // ============================================
         // 5. REPOST CLEAN AD & DELETE ORIGINAL
         // ============================================
-        // Truncate cleanText to ensure it fits in Telegram's caption limit
         let safeDetails = cleanText.substring(0, 800); 
 
         let newPostText = `✅ Official Ad Posted!\n\n`;
@@ -180,7 +179,8 @@ export default {
               body: JSON.stringify({ 
                 chat_id: message.chat.id, 
                 photo: imageUrl, 
-                caption: newPostText.substring(0, 1024) 
+                caption: newPostText.substring(0, 1024),
+                parse_mode: "" // ✅ Disable parsing
               }),
             });
           } 
@@ -192,7 +192,8 @@ export default {
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ 
                 chat_id: message.chat.id, 
-                text: newPostText.substring(0, 4096)
+                text: newPostText.substring(0, 4096),
+                parse_mode: "" // ✅ Disable parsing
               }),
             });
           }
