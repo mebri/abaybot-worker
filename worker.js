@@ -4,54 +4,39 @@ export default {
       return new Response("Bot is running", { status: 200 });
     }
 
+    // 1. Check if the token exists in Cloudflare Secrets
+    if (!env.TELEGRAM_BOT_TOKEN) {
+      return new Response("ERROR: TELEGRAM_BOT_TOKEN is missing in Cloudflare settings.", { status: 500 });
+    }
+
     try {
       const update = await request.json();
       const message = update.message || update.channel_post;
       
       if (!message) {
-        return new Response("OK", { status: 200 });
+        return new Response("No message found", { status: 200 });
       }
 
-      // 1. SEND A SUCCESS MESSAGE
-      await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      // 2. Try to send a message
+      const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ 
           chat_id: message.chat.id, 
-          text: "🤖 TEST: I received your message. Waiting 2 seconds to delete it..."
+          text: "🤖 TEST: The code is finally running!" 
         }),
       });
 
-      // 2. WAIT 2 SECONDS
-      await new Promise(resolve => setTimeout(resolve, 2000));
-
-      // 3. TRY TO DELETE THE ORIGINAL MESSAGE
-      const delRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-          chat_id: message.chat.id, 
-          message_id: message.message_id 
-        }),
-      });
-
-      const delData = await delRes.json();
+      const data = await res.json();
       
-      // 4. IF DELETE FAILED, TELL US WHY
-      if (!delData.ok) {
-        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ 
-            chat_id: message.chat.id, 
-            text: `❌ DELETE FAILED. Reason: ${delData.description}`
-          }),
-        });
+      // 3. If Telegram rejects the message, return a 500 error so it shows up in the webhook info
+      if (!data.ok) {
+         return new Response("Telegram Error: " + JSON.stringify(data), { status: 500 });
       }
 
       return new Response("OK", { status: 200 });
     } catch (error) {
-      return new Response("Error: " + error.message, { status: 200 });
+      return new Response("Worker Error: " + error.message, { status: 500 });
     }
   }
 };
