@@ -16,13 +16,18 @@ export default {
 
       try {
         // ============================================
-        // 1. ULTIMATE CLEANUP (No errors allowed)
+        // 1. ULTIMATE CLEANUP (No emojis, no symbols)
         // ============================================
         let cleanText = messageText;
 
-        // Remove all emojis, symbols, and hidden characters
-        cleanText = cleanText.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}]/gu, "");
-        cleanText = cleanText.replace(/[\u0000-\u001F\u007F-\u009F]/g, ""); // Remove control chars
+        // Remove ALL emojis and symbols (Extremely aggressive)
+        cleanText = cleanText.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{2700}-\u{27BF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu, "");
+        
+        // Remove Markdown formatting characters that break Telegram API
+        cleanText = cleanText.replace(/[*_~`|]/g, "");
+        
+        // Remove weird block characters (▬, ▌, etc.)
+        cleanText = cleanText.replace(/[\u2580-\u259F]/g, "");
 
         // Remove Links and @handles
         cleanText = cleanText.replace(/https?:\/\/[^\s]+/gi, "");
@@ -30,10 +35,10 @@ export default {
         cleanText = cleanText.replace(/t\.me\/[^\s]+/gi, "");
         cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
 
-        // Remove Phone Numbers (Telegram often blocks numbers in new messages)
+        // Remove Phone Numbers
         cleanText = cleanText.replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "[Phone Hidden]");
 
-        // Clean up extra blank lines
+        // Clean up extra blank lines and spaces
         cleanText = cleanText.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
 
         // ============================================
@@ -44,7 +49,7 @@ export default {
         if (brandMatch) brand = brandMatch[1].trim();
         const modelMatch = cleanText.match(/model[\s:.-]+([a-zA-Z0-9\s.-]+)/i);
         if (modelMatch) model = modelMatch[1].trim();
-        const yearMatch = cleanText.match(/(?:year|ዓመት)[\s:.-]+((?:19|20)\d{2})/i);
+        const yearMatch = cleanText.match(/(?:year|ዓመት|yeras)[\s:.-]+((?:19|20)\d{2})/i);
         if (yearMatch) year = yearMatch[1];
         else {
           const fallbackYear = cleanText.match(/\b(19|20)\d{2}\b/);
@@ -151,19 +156,23 @@ export default {
         // ============================================
         // 5. REPOST CLEAN AD & DELETE ORIGINAL
         // ============================================
+        // Truncate cleanText to ensure it fits in Telegram's caption limit
+        let safeDetails = cleanText.substring(0, 800); 
+
         let newPostText = `✅ Official Ad Posted!\n\n`;
         newPostText += `📂 Category: ${category}\n`;
         newPostText += `📝 Title: ${title}\n`;
         if (price) newPostText += `💰 Price: ${price} ETB\n`;
         if (city) newPostText += `📍 City: ${city}\n`;
         newPostText += `\n📞 Contact: 0911680790\n`; 
-        newPostText += `\n📄 Details:\n${cleanText}`;
+        newPostText += `\n📄 Details:\n${safeDetails}`;
 
         let postSuccess = false;
         let errorMsg = "";
 
         try {
           let tgRes;
+          // Try sending as photo first
           if (imageUrl && message.photo && message.photo.length > 0) {
             tgRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
               method: "POST",
@@ -171,10 +180,13 @@ export default {
               body: JSON.stringify({ 
                 chat_id: message.chat.id, 
                 photo: imageUrl, 
-                caption: newPostText.substring(0, 1024) // Telegram caption limit
+                caption: newPostText.substring(0, 1024) 
               }),
             });
-          } else {
+          } 
+          
+          // If no photo, or if photo failed, send as text
+          if (!tgRes || !(await tgRes.clone().json()).ok) {
             tgRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -189,7 +201,7 @@ export default {
           if (tgData.ok) {
             postSuccess = true;
           } else {
-            errorMsg = tgData.description; // Capture exact Telegram error
+            errorMsg = tgData.description; 
           }
 
         } catch (tgErr) {
