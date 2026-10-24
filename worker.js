@@ -7,7 +7,7 @@ export default {
     try {
       const update = await request.json();
       
-      // Process in background so Telegram doesn't timeout
+      // Process in background so Telegram doesn't timeout or duplicate
       ctx.waitUntil(processUpdate(update, env));
       
       return new Response("OK", { status: 200 });
@@ -18,48 +18,32 @@ export default {
 };
 
 async function processUpdate(update, env) {
-  // Only process NEW messages. Ignore edited messages.
   const message = update.message || update.channel_post;
-  
-  if (!message) return;
+  if (!message || (!message.text && !message.caption)) return;
 
-  const messageText = message.text || message.caption || "";
+  const messageText = message.text || message.caption;
   const targetChatId = "-1001674587108"; 
 
-  // ============================================
-  // 🚨 ULTIMATE ANTI-LOOP PROTECTION 🚨
-  // ============================================
-  // 1. Ignore messages sent by ANY Bot
+  // 🚨 ULTIMATE ANTI-LOOP PROTECTION
   if (message.from && message.from.is_bot) return;
-  
-  // 2. Ignore our own generated messages (using includes to bypass formatting)
-  if (
-    messageText.includes("Official Ad Posted!") || 
-    messageText.includes("Failed to repost clean ad") ||
-    messageText.includes("Could not delete original message")
-  ) {
-    return;
-  }
+  if (messageText.includes("Official Ad Posted!") || messageText.includes("Failed to repost")) return;
 
   try {
     // ============================================
-    // IMMEDIATELY DELETE THE ORIGINAL MESSAGE
+    // 1. DELETE ORIGINAL MESSAGE INSTANTLY
     // ============================================
     try {
       await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-          chat_id: message.chat.id, 
-          message_id: message.message_id 
-        }),
+        body: JSON.stringify({ chat_id: message.chat.id, message_id: message.message_id }),
       });
     } catch (err) {
-      console.error("Failed to delete original message:", err);
+      console.error("Delete failed:", err);
     }
 
     // ============================================
-    // 1. CLEAN TEXT
+    // 2. CLEAN TEXT
     // ============================================
     let cleanText = messageText;
     cleanText = cleanText.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{2700}-\u{27BF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu, "");
@@ -79,7 +63,7 @@ async function processUpdate(update, env) {
     let city = "";
 
     // ============================================
-    // 2. CATEGORY DETECTION
+    // 3. CATEGORY DETECTION
     // ============================================
     if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
       category = "Cars";
@@ -100,7 +84,7 @@ async function processUpdate(update, env) {
     }
 
     // ============================================
-    // 3. CONDITION DETECTION
+    // 4. CONDITION DETECTION
     // ============================================
     if (category === "Cars") {
       if (/(brand new|new|አዲስ|አዲስ መኪና)/i.test(lowerText)) condition = "New";
@@ -116,7 +100,7 @@ async function processUpdate(update, env) {
     }
 
     // ============================================
-    // 4. EXTRACT TITLE, PRICE, CITY
+    // 5. EXTRACT TITLE, PRICE, CITY
     // ============================================
     const makeMatch = cleanText.match(/(?:make|brand)[\s:.-]+([a-zA-Z\s]+)/i);
     if (makeMatch && !brand) brand = makeMatch[1].trim();
@@ -150,7 +134,7 @@ async function processUpdate(update, env) {
     else if (/addis|ababa|adama|hawassa/i.test(cleanText)) city = "Addis Ababa";
 
     // ============================================
-    // 5. UPLOAD IMAGE
+    // 6. UPLOAD IMAGE
     // ============================================
     let imageUrl = "";
     if (message.photo && message.photo.length > 0) {
@@ -174,7 +158,7 @@ async function processUpdate(update, env) {
     }
 
     // ============================================
-    // 6. SAVE TO FIREBASE
+    // 7. SAVE TO FIREBASE
     // ============================================
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
@@ -209,7 +193,7 @@ async function processUpdate(update, env) {
     });
 
     // ============================================
-    // 7. REPOST CLEAN AD
+    // 8. REPOST CLEAN AD
     // ============================================
     let safeDetails = cleanText.substring(0, 800); 
 
