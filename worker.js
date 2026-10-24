@@ -18,27 +18,24 @@ export default {
 };
 
 async function processUpdate(update, env) {
-  // Only process NEW messages. Ignore edits to prevent loops.
+  // Only process NEW messages.
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 🚨 1. IGNORE ALBUM IMAGES THAT HAVE NO TEXT (Only process the first image)
-  if (message.media_group_id && !message.caption && !message.text) {
+  // 🚨 1. STRICT EMPTY CHECK (This fixes the Album issue)
+  // If the image has no caption/text at all, completely ignore it.
+  const messageText = message.text || message.caption;
+  if (!messageText || messageText.trim().length === 0) {
     return; 
   }
 
-  const messageText = (message.text || message.caption || "").trim();
-  
-  // 🚨 2. STRICTLY IGNORE EMPTY MESSAGES
-  if (messageText.length === 0) return;
-
-  // 🚨 3. ANTI-LOOP PROTECTION (Ignore bot messages and already cleaned messages)
+  // 🚨 2. ANTI-LOOP PROTECTION
   if (message.from && message.from.is_bot) return;
-  if (messageText.includes("Official Ad Posted!") || messageText.includes("Failed to repost")) return;
+  if (messageText.includes("📂 Category:") || messageText.includes("Failed to repost")) return;
 
   try {
     // ============================================
-    // 1. CLEAN TEXT
+    // 3. CLEAN TEXT
     // ============================================
     let cleanText = messageText;
     cleanText = cleanText.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{2700}-\u{27BF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu, "");
@@ -58,7 +55,7 @@ async function processUpdate(update, env) {
     let city = "";
 
     // ============================================
-    // 2. CATEGORY & CONDITION DETECTION
+    // 4. CATEGORY & CONDITION DETECTION
     // ============================================
     if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
       category = "Cars";
@@ -87,7 +84,7 @@ async function processUpdate(update, env) {
     }
 
     // ============================================
-    // 3. EXTRACT TITLE, PRICE, CITY
+    // 5. EXTRACT TITLE, PRICE, CITY
     // ============================================
     const makeMatch = cleanText.match(/(?:make|brand)[\s:.-]+([a-zA-Z\s]+)/i);
     if (makeMatch && !brand) brand = makeMatch[1].trim();
@@ -97,11 +94,14 @@ async function processUpdate(update, env) {
 
     let title = `${brand} ${itemName}`.replace(/\s+/g, " ").trim();
     
-    // Fallback if AI/Regex fails
     if (!title || title.length < 3) {
       const lines = cleanText.split("\n").map((l) => l.trim()).filter(Boolean);
-      title = lines[0] || "Untitled Ad";
+      title = lines[0] || "";
       if (/(urgent|አስቸኳይ|sale|ሽያጭ)/i.test(title) && lines.length > 1) title = lines[1];
+    }
+    
+    if (!title) {
+      title = cleanText.substring(0, 40);
     }
     
     if (title.length > 60) title = title.substring(0, 60) + "...";
@@ -123,14 +123,8 @@ async function processUpdate(update, env) {
     else if (/addis|ababa|adama|hawassa/i.test(cleanText)) city = "Addis Ababa";
 
     // ============================================
-    // 4. SAVE TO FIREBASE
+    // 6. UPLOAD IMAGE & SAVE TO FIREBASE
     // ============================================
-    const token = await getFirebaseToken(env);
-    const projectId = env.FIREBASE_PROJECT_ID;
-    const adOwnerId = env.ADMIN_UID || "admin_bot"; 
-
-    // For Firebase, we still need an image URL. We upload the image to Cloudinary for the website, 
-    // even though we don't repost it to Telegram.
     let imageUrl = "";
     if (message.photo && message.photo.length > 0) {
       try {
@@ -151,6 +145,10 @@ async function processUpdate(update, env) {
         }
       } catch (e) {}
     }
+
+    const token = await getFirebaseToken(env);
+    const projectId = env.FIREBASE_PROJECT_ID;
+    const adOwnerId = env.ADMIN_UID || "admin_bot"; 
 
     const adData = {
       fields: {
@@ -181,7 +179,7 @@ async function processUpdate(update, env) {
     });
 
     // ============================================
-    // 5. EDIT THE ORIGINAL MESSAGE (KEEPING THE IMAGE)
+    // 7. EDIT THE ORIGINAL MESSAGE (KEEPING THE IMAGE)
     // ============================================
     let safeDetails = cleanText.substring(0, 800); 
 
@@ -198,8 +196,8 @@ async function processUpdate(update, env) {
     let categoryDisplay = category;
     if (condition) categoryDisplay += ` > ${condition}`;
 
-    let newPostText = `✅ Official Ad Posted!\n\n`;
-    newPostText += `📂 Category: ${categoryDisplay}\n`; 
+    // ✅ CLEAN MESSAGE FORMAT (No "Official Ad Posted" header)
+    let newPostText = `📂 Category: ${categoryDisplay}\n`; 
     newPostText += `📝 Title: ${title}\n`;
     if (price) newPostText += `💰 Price: ${price} ETB\n`;
     if (city) newPostText += `📍 City: ${city}\n`;
