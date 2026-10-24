@@ -13,7 +13,7 @@ export default {
       }
 
       const messageText = message.text || message.caption;
-      const targetChatId = "-1001674587108"; 
+      const targetChatId = "-1001674587108"; // Your Channel ID
 
       try {
         // ============================================
@@ -30,7 +30,6 @@ export default {
 
         const lowerText = cleanText.toLowerCase();
         let category = "Other";
-        let subcategory = "";
         let condition = "";
         let brand = "";
         let itemName = "";
@@ -58,6 +57,8 @@ export default {
           category = "Clothes";
         } else if (/(construction|electrician|plumber|painter|cleaning|worker|ግንባታ|ኤሌክትሪሺያን|ቧንቧ|ቀለም|ጽዳት|ሰራተኛ|ሠራተኛ)/i.test(lowerText)) {
           category = "Labor & Services";
+        } else if (/(used|second-hand|ምንአለሽ ተራ|ያገለገለ)/i.test(lowerText)) {
+          category = "ምንአለሽ ተራ";
         }
 
         // ============================================
@@ -99,7 +100,6 @@ export default {
         // ============================================
         // 4. EXTRACT TITLE, PRICE, CITY
         // ============================================
-        // Extract Brand & Model for title
         const makeMatch = cleanText.match(/(?:make|brand)[\s:.-]+([a-zA-Z\s]+)/i);
         if (makeMatch && !brand) brand = makeMatch[1].trim();
         
@@ -116,7 +116,6 @@ export default {
         if (title.length > 60) title = title.substring(0, 60) + "...";
         title = title.replace(/\b\w/g, (char) => char.toUpperCase());
 
-        // Extract Price
         const priceMatch = cleanText.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
         if (priceMatch) {
           let rawNum = priceMatch[1];
@@ -128,7 +127,6 @@ export default {
           if (fallbackMatch) price = fallbackMatch[1];
         }
 
-        // Extract City
         const cityMatch = cleanText.match(/(?:city|location|ከተማ)[\s:]+(.+)/i);
         if (cityMatch) city = cityMatch[1].trim();
         else if (/addis|ababa|adama|hawassa/i.test(cleanText)) city = "Addis Ababa";
@@ -197,13 +195,27 @@ export default {
         // ============================================
         let safeDetails = cleanText.substring(0, 800); 
 
+        // ✅ AUTOMATIC HASHTAGS FOR CATEGORIZATION
+        let hashtag = "#Other";
+        if (category === "Cars") hashtag = "#Cars";
+        else if (category === "Houses") hashtag = "#Houses";
+        else if (category === "Rentals") hashtag = "#Rentals";
+        else if (category === "Electronics") hashtag = "#Electronics";
+        else if (category === "Furniture") hashtag = "#Furniture";
+        else if (category === "Clothes") hashtag = "#Clothes";
+        else if (category === "Labor & Services") hashtag = "#Labor";
+        else if (category === "ምንአለሽ ተራ") hashtag = "#ምንአለሽ_ተራ";
+
         let newPostText = `✅ Official Ad Posted!\n\n`;
         newPostText += `📂 Category: ${category}\n`;
         newPostText += `📝 Title: ${title}\n`;
         if (price) newPostText += `💰 Price: ${price} ETB\n`;
         if (city) newPostText += `📍 City: ${city}\n`;
         newPostText += `\n📞 Contact: 0911680790\n`; 
-        newPostText += `\n📄 Details:\n${safeDetails}`;
+        newPostText += `\n📄 Details:\n${safeDetails}\n\n`;
+
+        // ✅ This adds the hashtag at the very bottom
+        newPostText += `${hashtag}`; 
 
         let postSuccess = false;
         let errorMsg = "";
