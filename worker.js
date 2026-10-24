@@ -12,9 +12,10 @@ export default {
         return new Response("OK", { status: 200 });
       }
 
-      // ✅ Use the Chat ID from Cloudflare (falls back to incoming message chat id)
-      const chatId = env.TELEGRAM_CHAT_ID || message.chat.id;
       const messageText = message.text || message.caption;
+      
+      // ✅ HARDCODED CHAT ID (You don't need the Cloudflare secret anymore)
+      const targetChatId = "-1001674587108"; 
 
       try {
         // ============================================
@@ -33,7 +34,7 @@ export default {
         cleanText = cleanText.replace(/t\.me\/[^\s]+/gi, "");
         cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
 
-        // Remove Phone Numbers (Replace with text, no brackets)
+        // Remove Phone Numbers
         cleanText = cleanText.replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "(Phone Hidden)");
 
         // Clean up extra blank lines and spaces
@@ -119,10 +120,10 @@ export default {
         }
 
         // ============================================
-        // 4. SAVE TO FIREBASE
+        // 4. SAVE TO FIREBASE (Using Individual Keys)
         // ============================================
         const token = await getFirebaseToken(env);
-        const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
+        const projectId = env.FIREBASE_PROJECT_ID;
         const adOwnerId = env.ADMIN_UID || "admin_bot"; 
 
         const adData = {
@@ -144,7 +145,7 @@ export default {
           },
         };
 
-        const fbUrl = `https://firestore.googleapis.com/v1/projects/${sa.project_id}/databases/(default)/documents/ads`;
+        const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads`;
         await fetch(fbUrl, {
           method: "POST",
           headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
@@ -165,6 +166,7 @@ export default {
         newPostText += `\n📄 Details:\n${safeDetails}`;
 
         let postSuccess = false;
+        let errorMsg = "";
 
         try {
           let tgRes;
@@ -173,10 +175,9 @@ export default {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ 
-                chat_id: chatId, // ✅ Uses the exact Chat ID
+                chat_id: targetChatId, 
                 photo: imageUrl, 
-                caption: newPostText.substring(0, 1024),
-                parse_mode: "" 
+                caption: newPostText.substring(0, 1024)
               }),
             });
           } else {
@@ -184,17 +185,19 @@ export default {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ 
-                chat_id: chatId, // ✅ Uses the exact Chat ID
-                text: newPostText.substring(0, 4096),
-                parse_mode: "" 
+                chat_id: targetChatId, 
+                text: newPostText.substring(0, 4096)
               }),
             });
           }
 
           const tgData = await tgRes.json();
           if (tgData.ok) postSuccess = true;
+          else errorMsg = tgData.description;
 
-        } catch (tgErr) {}
+        } catch (tgErr) {
+          errorMsg = tgErr.message;
+        }
 
         // Delete original message after posting
         if (postSuccess) {
@@ -203,6 +206,16 @@ export default {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ chat_id: message.chat.id, message_id: message.message_id }),
+          });
+        } else {
+          // If it fails, tell the channel why
+          await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ 
+              chat_id: targetChatId, 
+              text: `⚠️ Failed to repost clean ad. Reason: ${errorMsg}`
+            }),
           });
         }
 
@@ -217,25 +230,59 @@ export default {
   }
 };
 
+// ✅ NEW: Uses individual env variables to prevent Cloudflare deletion issues
 async function getFirebaseToken(env) {
-  const sa = JSON.parse(atob(env.FIREBASE_SERVICE_ACCOUNT));
+  const clientEmail = env.FIREBASE_CLIENT_EMAIL;
+  const privateKey = env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n");
+
   const now = Math.floor(Date.now() / 1000);
   const header = { alg: "RS256", typ: "JWT" };
-  const payload = { iss: sa.client_email, scope: "https://www.googleapis.com/auth/datastore", aud: "https://oauth2.googleapis.com/token", iat: now, exp: now + 3600 };
+  const payload = {
+    iss: clientEmail,
+    scope: "https://www.googleapis.com/auth/datastore",
+    aud: "https://oauth2.googleapis.com/token",
+    iat: now,
+    exp: now + 3600,
+  };
 
   const h = base64UrlEncodeString(JSON.stringify(header));
   const p = base64UrlEncodeString(JSON.stringify(payload));
   const signingInput = `${h}.${p}`;
 
-  const pem = sa.private_key.replace("-----BEGIN PRIVATE KEY-----", "").replace("-----END PRIVATE KEY-----", "").replace(/\s/g, "");
-  const der = Uint8Array.from(atob(pem), (c) => c.charCodeAt(0));
-  const key = await crypto.subtle.importKey("pkcs8", der, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
-  const sigBuffer = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, new TextEncoder().encode(signingInput));
+  const pemContents = privateKey
+    .replace("-----BEGIN PRIVATE KEY-----", "")
+    .replace("-----END PRIVATE KEY-----", "")
+    .replace(/\s/g, "");
+  const binaryDer = Uint8Array.from(atob(pemContents), (c) => c.charCodeAt(0));
 
-  const signature = base64UrlEncodeBytes(new Uint8Array(sigBuffer));
+  const cryptoKey = await crypto.subtle.importKey(
+    "pkcs8",
+    binaryDer,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const sigBuffer = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    cryptoKey,
+    new TextEncoder().encode(signingInput)
+  );
+
+  let binary = "";
+  const bytes = new Uint8Array(sigBuffer);
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  const signature = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   const jwt = `${signingInput}.${signature}`;
 
-  const tokRes = await fetch("https://oauth2.googleapis.com/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}` });
+  const tokRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
+  });
+
   const tokData = await tokRes.json();
   if (!tokData.access_token) throw new Error(JSON.stringify(tokData));
   return tokData.access_token;
@@ -244,10 +291,4 @@ async function getFirebaseToken(env) {
 function base64UrlEncodeString(str) {
   const base64 = btoa(unescape(encodeURIComponent(str)));
   return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function base64UrlEncodeBytes(bytes) {
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
