@@ -15,6 +15,14 @@ export default {
       const messageText = message.text || message.caption;
       const targetChatId = "-1001674587108"; 
 
+      // ============================================
+      // 🚨 ANTI-LOOP PROTECTION 🚨
+      // If the message was sent by the bot, ignore it!
+      // ============================================
+      if (messageText.startsWith("✅ Official Ad Posted!")) {
+        return new Response("OK", { status: 200 });
+      }
+
       try {
         // ============================================
         // 1. CLEAN TEXT
@@ -54,20 +62,20 @@ export default {
         } else if (/(construction|electrician|plumber|painter|cleaning|worker|ግንባታ|ኤሌክትሪሺያን|ቧንቧ|ቀለም|ጽዳት|ሰራተኛ|ሠራተኛ)/i.test(lowerText)) {
           category = "Labor & Services";
         } else if (/(used|second-hand|ምንአለሽ ተራ|ያገለገለ)/i.test(lowerText)) {
-          category = "ምንአለም ተራ";
+          category = "ምንአለሽ ተራ";
         }
 
         // ============================================
-        // 3. CONDITION DETECTION (New, Used, Rent, Electric)
+        // 3. CONDITION DETECTION
         // ============================================
         if (category === "Cars") {
           if (/(brand new|new|አዲስ|አዲስ መኪና)/i.test(lowerText)) condition = "New";
           else if (/(electric|ኤሌክትሪክ|ኢቪ|ev)/i.test(lowerText)) condition = "Electric";
           else if (/(rent|ኪራይ|for rent)/i.test(lowerText)) condition = "Rent";
-          else condition = "Used"; // Defaults to Used if nothing else is found
+          else condition = "Used";
         } else if (category === "Electronics" || category === "Furniture" || category === "Clothes") {
           if (/(brand new|new|አዲስ)/i.test(lowerText)) condition = "New";
-          else condition = "Used"; // Defaults to Used
+          else condition = "Used";
         } else if (category === "Houses" || category === "Rentals") {
           if (/(sale|ሽያጭ|ለሽያጭ)/i.test(lowerText)) condition = "Sale";
           else if (/(rent|ኪራይ|ለኪራይ)/i.test(lowerText)) condition = "Rent";
@@ -182,7 +190,7 @@ export default {
             phone: { stringValue: "0911680790" }, 
             city: { stringValue: city },
             category: { stringValue: category },
-            condition: { stringValue: condition }, // ✅ Saves "New" or "Used" correctly
+            condition: { stringValue: condition }, 
             brand: { stringValue: brand },
             itemName: { stringValue: itemName },
             image: { stringValue: imageUrl },
@@ -217,7 +225,6 @@ export default {
         else if (category === "Labor & Services") hashtag = "#Labor";
         else if (category === "ምንአለሽ ተራ") hashtag = "#ምንአለሽ_ተራ";
 
-        // ✅ Adds the condition to the reply (e.g., Cars > Used)
         let categoryDisplay = category;
         if (condition) categoryDisplay += ` > ${condition}`;
 
