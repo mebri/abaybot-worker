@@ -7,7 +7,7 @@ export default {
     try {
       const update = await request.json();
       
-      // ✅ IMPORTANT: Process in background so Telegram doesn't timeout and resend!
+      // ✅ Process in background so Telegram doesn't timeout
       ctx.waitUntil(processUpdate(update, env));
       
       return new Response("OK", { status: 200 });
@@ -18,7 +18,7 @@ export default {
 };
 
 async function processUpdate(update, env) {
-  // Only process NEW messages. Ignore edited messages to prevent duplicate posts.
+  // Only process NEW messages. Ignore edited messages.
   const message = update.message || update.channel_post;
   
   if (!message || (!message.text && !message.caption)) return;
@@ -31,6 +31,22 @@ async function processUpdate(update, env) {
   if (messageText.startsWith("✅ Official Ad Posted!") || messageText.startsWith("⚠️")) return;
 
   try {
+    // ============================================
+    // 🚨 IMMEDIATELY DELETE THE ORIGINAL MESSAGE
+    // ============================================
+    try {
+      await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+          chat_id: message.chat.id, 
+          message_id: message.message_id 
+        }),
+      });
+    } catch (err) {
+      console.error("Failed to delete original message:", err);
+    }
+
     // ============================================
     // 1. CLEAN TEXT
     // ============================================
@@ -182,7 +198,7 @@ async function processUpdate(update, env) {
     });
 
     // ============================================
-    // 7. REPOST CLEAN AD & DELETE ORIGINAL
+    // 7. REPOST CLEAN AD
     // ============================================
     let safeDetails = cleanText.substring(0, 800); 
 
@@ -208,13 +224,9 @@ async function processUpdate(update, env) {
     newPostText += `\n📄 Details:\n${safeDetails}\n\n`;
     newPostText += `${hashtag}`; 
 
-    let postSuccess = false;
-    let errorMsg = "";
-
     try {
-      let tgRes;
       if (imageUrl && message.photo && message.photo.length > 0) {
-        tgRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
+        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ 
@@ -224,7 +236,7 @@ async function processUpdate(update, env) {
           }),
         });
       } else {
-        tgRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ 
@@ -233,32 +245,10 @@ async function processUpdate(update, env) {
           }),
         });
       }
-
-      const tgData = await tgRes.json();
-      if (tgData.ok) postSuccess = true;
-      else errorMsg = tgData.description;
-
-    } catch (tgErr) {
-      errorMsg = tgErr.message;
+    } catch (err) {
+       console.error("Failed to post clean ad", err);
     }
 
-    if (postSuccess) {
-      await new Promise(resolve => setTimeout(resolve, 3000));
-      await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: message.chat.id, message_id: message.message_id }),
-      });
-    } else {
-      await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
-          chat_id: targetChatId, 
-          text: `⚠️ Failed to repost clean ad. Reason: ${errorMsg}`
-        }),
-      });
-    }
   } catch (error) {
     console.error("Main Error:", error);
   }
