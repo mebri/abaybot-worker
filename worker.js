@@ -18,6 +18,7 @@ export default {
 };
 
 async function processUpdate(update, env) {
+  // Only process NEW messages. Ignore edits to prevent loops.
   const message = update.message || update.channel_post;
   if (!message) return;
 
@@ -31,28 +32,13 @@ async function processUpdate(update, env) {
   // 🚨 2. STRICTLY IGNORE EMPTY MESSAGES
   if (messageText.length === 0) return;
 
-  const targetChatId = "-1001674587108"; 
-
-  // 🚨 3. ANTI-LOOP PROTECTION
+  // 🚨 3. ANTI-LOOP PROTECTION (Ignore bot messages and already cleaned messages)
   if (message.from && message.from.is_bot) return;
   if (messageText.includes("Official Ad Posted!") || messageText.includes("Failed to repost")) return;
 
   try {
     // ============================================
-    // 4. DELETE ORIGINAL MESSAGE INSTANTLY
-    // ============================================
-    try {
-      await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: message.chat.id, message_id: message.message_id }),
-      });
-    } catch (err) {
-      console.error("Delete failed:", err);
-    }
-
-    // ============================================
-    // 5. CLEAN TEXT
+    // 1. CLEAN TEXT
     // ============================================
     let cleanText = messageText;
     cleanText = cleanText.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{2700}-\u{27BF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu, "");
@@ -72,7 +58,7 @@ async function processUpdate(update, env) {
     let city = "";
 
     // ============================================
-    // 6. CATEGORY & CONDITION DETECTION
+    // 2. CATEGORY & CONDITION DETECTION
     // ============================================
     if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
       category = "Cars";
@@ -101,7 +87,7 @@ async function processUpdate(update, env) {
     }
 
     // ============================================
-    // 7. EXTRACT TITLE, PRICE, CITY
+    // 3. EXTRACT TITLE, PRICE, CITY
     // ============================================
     const makeMatch = cleanText.match(/(?:make|brand)[\s:.-]+([a-zA-Z\s]+)/i);
     if (makeMatch && !brand) brand = makeMatch[1].trim();
@@ -137,8 +123,14 @@ async function processUpdate(update, env) {
     else if (/addis|ababa|adama|hawassa/i.test(cleanText)) city = "Addis Ababa";
 
     // ============================================
-    // 8. UPLOAD IMAGE
+    // 4. SAVE TO FIREBASE
     // ============================================
+    const token = await getFirebaseToken(env);
+    const projectId = env.FIREBASE_PROJECT_ID;
+    const adOwnerId = env.ADMIN_UID || "admin_bot"; 
+
+    // For Firebase, we still need an image URL. We upload the image to Cloudinary for the website, 
+    // even though we don't repost it to Telegram.
     let imageUrl = "";
     if (message.photo && message.photo.length > 0) {
       try {
@@ -159,13 +151,6 @@ async function processUpdate(update, env) {
         }
       } catch (e) {}
     }
-
-    // ============================================
-    // 9. SAVE TO FIREBASE
-    // ============================================
-    const token = await getFirebaseToken(env);
-    const projectId = env.FIREBASE_PROJECT_ID;
-    const adOwnerId = env.ADMIN_UID || "admin_bot"; 
 
     const adData = {
       fields: {
@@ -196,7 +181,7 @@ async function processUpdate(update, env) {
     });
 
     // ============================================
-    // 10. REPOST CLEAN AD
+    // 5. EDIT THE ORIGINAL MESSAGE (KEEPING THE IMAGE)
     // ============================================
     let safeDetails = cleanText.substring(0, 800); 
 
@@ -223,28 +208,31 @@ async function processUpdate(update, env) {
     newPostText += `${hashtag}`; 
 
     try {
-      if (imageUrl && message.photo && message.photo.length > 0) {
-        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
+      if (message.photo && message.photo.length > 0) {
+        // EDIT CAPTION OF THE IMAGE MESSAGE
+        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageCaption`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ 
-            chat_id: targetChatId, 
-            photo: imageUrl, 
+            chat_id: message.chat.id, 
+            message_id: message.message_id,
             caption: newPostText.substring(0, 1024)
           }),
         });
       } else {
-        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        // EDIT TEXT MESSAGE
+        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageText`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ 
-            chat_id: targetChatId, 
+            chat_id: message.chat.id, 
+            message_id: message.message_id,
             text: newPostText.substring(0, 4096)
           }),
         });
       }
     } catch (err) {
-       console.error("Failed to post clean ad", err);
+       console.error("Failed to edit message", err);
     }
 
   } catch (error) {
