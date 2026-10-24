@@ -28,52 +28,87 @@ export default {
         cleanText = cleanText.replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "(Phone Hidden)");
         cleanText = cleanText.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
 
-        // ============================================
-        // 2. AI TEXT ANALYSIS (Llama 3)
-        // ============================================
-        let title = "Untitled Ad";
-        let price = "";
+        const lowerText = cleanText.toLowerCase();
         let category = "Other";
+        let subcategory = "";
         let condition = "";
         let brand = "";
         let itemName = "";
+        let price = "";
+        let city = "";
 
-        try {
-          const aiPrompt = `
-            You are an expert marketplace categorizer for an Ethiopian marketplace.
-            Analyze this ad text and return ONLY a JSON object with these keys:
-            "category" (choose exactly one: Cars, Houses, Rentals, Electronics, Furniture, Clothes, Labor & Services, ምንአለሽ ተራ, Other),
-            "brand" (e.g., Toyota, Samsung, Nike),
-            "itemName" (e.g., Corolla, Galaxy S21, Sofa),
-            "condition" (e.g., New, Used),
-            "price" (number only).
-            
-            Text: "${cleanText}"
-            
-            ONLY return the JSON. Do not include any other text.
-          `;
-
-          const aiResponse = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
-            messages: [{ role: "user", content: aiPrompt }]
-          });
-
-          // Parse the AI response
-          const jsonMatch = aiResponse.response.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const parsed = JSON.parse(jsonMatch[0]);
-            category = parsed.category || "Other";
-            brand = parsed.brand || "";
-            itemName = parsed.itemName || "";
-            condition = parsed.condition || "";
-            if (parsed.price) price = Number(parsed.price).toLocaleString("en-US");
-          }
-        } catch (aiError) {
-          console.error("AI Text Error:", aiError);
+        // ============================================
+        // 2. PRIMARY DETECTION (Regex - Fast & Reliable)
+        // ============================================
+        if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
+          category = "Cars";
+          if (/(new|አዲስ)/i.test(lowerText)) condition = "New";
+          else if (/(electric|ኤሌክትሪክ|ኢቪ)/i.test(lowerText)) condition = "Electric";
+          else if (/(rent|ኪራይ)/i.test(lowerText)) condition = "Rent";
+          else condition = "Used";
+        } else if (/(house|villa|condominium|condo|ቤት|ቪላ|ኮንዶሚኒየም)/i.test(lowerText)) {
+          category = "Houses";
+        } else if (/(apartment|office|shop|አፓርታማ|ቢሮ|ሱቅ|መጋዘን)/i.test(lowerText)) {
+          category = "Rentals";
+        } else if (/(iphone|samsung|tecno|infinix|phone|smartphone|laptop|computer|tv|camera|ስልክ|ሞባይል|ላፕቶፕ|ኮምፒውተር|ቲቪ|ቴሌቪዥን|ካሜራ)/i.test(lowerText)) {
+          category = "Electronics";
+        } else if (/(sofa|bed|table|chair|furniture|cabinet|ሶፋ|አልጋ|ጠረጴዛ|ጠረንጴዛ|ወንበር|ቁምሳጥን|እቃ)/i.test(lowerText)) {
+          category = "Furniture";
+        } else if (/(clothes|shoes|dress|shirt|pants|fashion|ልብስ|ጫማ|ቀሚስ|ሱሪ|ሸሚዝ)/i.test(lowerText)) {
+          category = "Clothes";
+        } else if (/(construction|electrician|plumber|painter|cleaning|worker|ግንባታ|ኤሌክትሪሺያን|ቧንቧ|ቀለም|ጽዳት|ሰራተኛ|ሠራተኛ)/i.test(lowerText)) {
+          category = "Labor & Services";
         }
 
-        // Build the Title
-        title = `${brand} ${itemName}`.replace(/\s+/g, " ").trim();
-        if (!title) {
+        // ============================================
+        // 3. SECONDARY DETECTION (AI - If Regex fails)
+        // ============================================
+        if (category === "Other") {
+          try {
+            const aiPrompt = `
+              You are an expert marketplace categorizer for an Ethiopian marketplace.
+              Analyze this ad text and return ONLY a JSON object with these keys:
+              "category" (choose exactly one: Cars, Houses, Rentals, Electronics, Furniture, Clothes, Labor & Services, ምንአለሽ ተራ, Other),
+              "brand" (e.g., Toyota, Samsung, Nike),
+              "itemName" (e.g., Corolla, Galaxy S21, Sofa),
+              "condition" (e.g., New, Used),
+              "price" (number only).
+              
+              Text: "${cleanText}"
+              
+              ONLY return the JSON. Do not include any other text or markdown formatting.
+            `;
+
+            const aiResponse = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
+              messages: [{ role: "user", content: aiPrompt }]
+            });
+
+            const jsonMatch = aiResponse.response.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+              const parsed = JSON.parse(jsonMatch[0]);
+              category = parsed.category || "Other";
+              brand = parsed.brand || "";
+              itemName = parsed.itemName || "";
+              condition = parsed.condition || "";
+            }
+          } catch (aiError) {
+            console.error("AI Text Error:", aiError);
+          }
+        }
+
+        // ============================================
+        // 4. EXTRACT TITLE, PRICE, CITY
+        // ============================================
+        // Extract Brand & Model for title
+        const makeMatch = cleanText.match(/(?:make|brand)[\s:.-]+([a-zA-Z\s]+)/i);
+        if (makeMatch && !brand) brand = makeMatch[1].trim();
+        
+        const modelMatch = cleanText.match(/(?:model)[\s:.-]+([a-zA-Z0-9\s.-]+)/i);
+        if (modelMatch && !itemName) itemName = modelMatch[1].trim();
+
+        let title = `${brand} ${itemName}`.replace(/\s+/g, " ").trim();
+        
+        if (!title || title.length < 3) {
           const lines = cleanText.split("\n").map((l) => l.trim()).filter(Boolean);
           title = lines[0] || "Untitled Ad";
           if (/(urgent|አስቸኳይ|sale|ሽያጭ)/i.test(title) && lines.length > 1) title = lines[1];
@@ -81,25 +116,27 @@ export default {
         if (title.length > 60) title = title.substring(0, 60) + "...";
         title = title.replace(/\b\w/g, (char) => char.toUpperCase());
 
-        // Fallback if AI missed the price
+        // Extract Price
+        const priceMatch = cleanText.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
+        if (priceMatch) {
+          let rawNum = priceMatch[1];
+          let cleanedNum = rawNum.replace(/[.,]/g, "");
+          if (cleanedNum && !isNaN(cleanedNum)) price = Number(cleanedNum).toLocaleString("en-US");
+        }
         if (!price) {
-          const priceMatch = cleanText.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
-          if (priceMatch) {
-            let cleanedNum = priceMatch[1].replace(/[.,]/g, "");
-            if (cleanedNum && !isNaN(cleanedNum)) price = Number(cleanedNum).toLocaleString("en-US");
-          }
+          const fallbackMatch = cleanText.match(/(\d{1,3}(?:[.,]\d{3})+)/);
+          if (fallbackMatch) price = fallbackMatch[1];
         }
 
-        let city = "";
+        // Extract City
         const cityMatch = cleanText.match(/(?:city|location|ከተማ)[\s:]+(.+)/i);
         if (cityMatch) city = cityMatch[1].trim();
         else if (/addis|ababa|adama|hawassa/i.test(cleanText)) city = "Addis Ababa";
 
         // ============================================
-        // 3. DOWNLOAD IMAGE & UPLOAD TO CLOUDINARY
+        // 5. UPLOAD IMAGE
         // ============================================
         let imageUrl = "";
-        let imageBlob = null;
         if (message.photo && message.photo.length > 0) {
           try {
             const largest = message.photo[message.photo.length - 1];
@@ -108,52 +145,20 @@ export default {
 
             if (fileInfo.ok) {
               const imgRes = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`);
-              imageBlob = await imgRes.blob();
-              
+              const blob = await imgRes.blob();
               const formData = new FormData();
-              formData.append("file", imageBlob);
+              formData.append("file", blob);
               formData.append("upload_preset", env.CLOUDINARY_UPLOAD_PRESET);
 
               const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/image/upload`, { method: "POST", body: formData });
               const cloudData = await cloudRes.json();
               if (cloudData.secure_url) imageUrl = cloudData.secure_url;
             }
-          } catch (e) {
-            console.error("Image Error:", e);
-          }
+          } catch (e) {}
         }
 
         // ============================================
-        // 4. AI VISION ANALYSIS (LLaVA) - Optional check
-        // ============================================
-        // If the AI wasn't sure about the category (e.g. Other), we look at the image
-        if (imageBlob && category === "Other") {
-          try {
-            // Convert blob to array for Cloudflare AI
-            const arrayBuffer = await imageBlob.arrayBuffer();
-            const uint8Array = new Uint8Array(arrayBuffer);
-            const imageArray = Array.from(uint8Array); // Note: LLaVA in CF Workers requires a specific format, this is a conceptual test
-
-            const visionPrompt = `Look at this image. Is it a car, phone, furniture, or clothes? Reply with ONE word.`;
-            const visionResponse = await env.AI.run('@cf/llava-hf/llava-1.5-7b-hf', {
-              image: imageArray,
-              prompt: visionPrompt,
-              max_tokens: 10
-            });
-            
-            const detectedObject = visionResponse.description.toLowerCase();
-            if (detectedObject.includes("car")) category = "Cars";
-            else if (detectedObject.includes("phone")) category = "Electronics";
-            else if (detectedObject.includes("furniture")) category = "Furniture";
-            else if (detectedObject.includes("clothes")) category = "Clothes";
-            
-          } catch (visError) {
-             console.error("Vision AI Error:", visError);
-          }
-        }
-
-        // ============================================
-        // 5. SAVE TO FIREBASE
+        // 6. SAVE TO FIREBASE
         // ============================================
         const token = await getFirebaseToken(env);
         const projectId = env.FIREBASE_PROJECT_ID;
@@ -188,7 +193,7 @@ export default {
         });
 
         // ============================================
-        // 6. REPOST CLEAN AD & DELETE ORIGINAL
+        // 7. REPOST CLEAN AD & DELETE ORIGINAL
         // ============================================
         let safeDetails = cleanText.substring(0, 800); 
 
