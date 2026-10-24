@@ -7,7 +7,7 @@ export default {
     try {
       const update = await request.json();
       
-      // ✅ Process in background so Telegram doesn't timeout
+      // Process in background so Telegram doesn't timeout
       ctx.waitUntil(processUpdate(update, env));
       
       return new Response("OK", { status: 200 });
@@ -21,18 +21,29 @@ async function processUpdate(update, env) {
   // Only process NEW messages. Ignore edited messages.
   const message = update.message || update.channel_post;
   
-  if (!message || (!message.text && !message.caption)) return;
+  if (!message) return;
 
-  const messageText = message.text || message.caption;
+  const messageText = message.text || message.caption || "";
   const targetChatId = "-1001674587108"; 
 
-  // 🚨 ANTI-LOOP PROTECTION
+  // ============================================
+  // 🚨 ULTIMATE ANTI-LOOP PROTECTION 🚨
+  // ============================================
+  // 1. Ignore messages sent by ANY Bot
   if (message.from && message.from.is_bot) return;
-  if (messageText.startsWith("✅ Official Ad Posted!") || messageText.startsWith("⚠️")) return;
+  
+  // 2. Ignore our own generated messages (using includes to bypass formatting)
+  if (
+    messageText.includes("Official Ad Posted!") || 
+    messageText.includes("Failed to repost clean ad") ||
+    messageText.includes("Could not delete original message")
+  ) {
+    return;
+  }
 
   try {
     // ============================================
-    // 🚨 IMMEDIATELY DELETE THE ORIGINAL MESSAGE
+    // IMMEDIATELY DELETE THE ORIGINAL MESSAGE
     // ============================================
     try {
       await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
