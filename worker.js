@@ -13,49 +13,66 @@ export default {
       }
 
       const messageText = message.text || message.caption;
-      
-      // ✅ HARDCODED CHAT ID (You don't need the Cloudflare secret anymore)
       const targetChatId = "-1001674587108"; 
 
       try {
         // ============================================
-        // 1. ULTIMATE CLEANUP
+        // 1. CLEAN TEXT
         // ============================================
         let cleanText = messageText;
-
-        // Remove ALL emojis and symbols
         cleanText = cleanText.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{2700}-\u{27BF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu, "");
         cleanText = cleanText.replace(/[*_~`|]/g, "");
-        cleanText = cleanText.replace(/[\u2580-\u259F]/g, "");
-
-        // Remove Links and @handles
         cleanText = cleanText.replace(/https?:\/\/[^\s]+/gi, "");
-        cleanText = cleanText.replace(/www\.[^\s]+/gi, "");
         cleanText = cleanText.replace(/t\.me\/[^\s]+/gi, "");
         cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
-
-        // Remove Phone Numbers
         cleanText = cleanText.replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "(Phone Hidden)");
-
-        // Clean up extra blank lines and spaces
         cleanText = cleanText.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
 
         // ============================================
-        // 2. EXTRACT DETAILS
+        // 2. AI TEXT ANALYSIS (Llama 3)
         // ============================================
-        let brand = ""; let model = ""; let year = "";
-        const brandMatch = cleanText.match(/(?:make|brand)[\s:.-]+([a-zA-Z\s]+)/i);
-        if (brandMatch) brand = brandMatch[1].trim();
-        const modelMatch = cleanText.match(/model[\s:.-]+([a-zA-Z0-9\s.-]+)/i);
-        if (modelMatch) model = modelMatch[1].trim();
-        const yearMatch = cleanText.match(/(?:year|ዓመት|yeras)[\s:.-]+((?:19|20)\d{2})/i);
-        if (yearMatch) year = yearMatch[1];
-        else {
-          const fallbackYear = cleanText.match(/\b(19|20)\d{2}\b/);
-          if (fallbackYear) year = fallbackYear[0];
+        let title = "Untitled Ad";
+        let price = "";
+        let category = "Other";
+        let condition = "";
+        let brand = "";
+        let itemName = "";
+
+        try {
+          const aiPrompt = `
+            You are an expert marketplace categorizer for an Ethiopian marketplace.
+            Analyze this ad text and return ONLY a JSON object with these keys:
+            "category" (choose exactly one: Cars, Houses, Rentals, Electronics, Furniture, Clothes, Labor & Services, ምንአለሽ ተራ, Other),
+            "brand" (e.g., Toyota, Samsung, Nike),
+            "itemName" (e.g., Corolla, Galaxy S21, Sofa),
+            "condition" (e.g., New, Used),
+            "price" (number only).
+            
+            Text: "${cleanText}"
+            
+            ONLY return the JSON. Do not include any other text.
+          `;
+
+          const aiResponse = await env.AI.run('@cf/meta/llama-3-8b-instruct', {
+            messages: [{ role: "user", content: aiPrompt }]
+          });
+
+          // Parse the AI response
+          const jsonMatch = aiResponse.response.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const parsed = JSON.parse(jsonMatch[0]);
+            category = parsed.category || "Other";
+            brand = parsed.brand || "";
+            itemName = parsed.itemName || "";
+            condition = parsed.condition || "";
+            if (parsed.price) price = Number(parsed.price).toLocaleString("en-US");
+          }
+        } catch (aiError) {
+          console.error("AI Text Error:", aiError);
         }
 
-        let title = `${brand} ${model} ${year}`.replace(/\s+/g, " ").trim();
+        // Build the Title
+        title = `${brand} ${itemName}`.replace(/\s+/g, " ").trim();
         if (!title) {
           const lines = cleanText.split("\n").map((l) => l.trim()).filter(Boolean);
           title = lines[0] || "Untitled Ad";
@@ -64,41 +81,25 @@ export default {
         if (title.length > 60) title = title.substring(0, 60) + "...";
         title = title.replace(/\b\w/g, (char) => char.toUpperCase());
 
-        let price = "";
-        const priceMatch = cleanText.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
-        if (priceMatch) {
-          let rawNum = priceMatch[1];
-          let cleanedNum = rawNum.replace(/[.,]/g, "");
-          if (cleanedNum && !isNaN(cleanedNum)) price = Number(cleanedNum).toLocaleString("en-US");
-        }
+        // Fallback if AI missed the price
         if (!price) {
-          const fallbackMatch = cleanText.match(/(\d{1,3}(?:[.,]\d{3})+)/);
-          if (fallbackMatch) price = fallbackMatch[1];
+          const priceMatch = cleanText.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
+          if (priceMatch) {
+            let cleanedNum = priceMatch[1].replace(/[.,]/g, "");
+            if (cleanedNum && !isNaN(cleanedNum)) price = Number(cleanedNum).toLocaleString("en-US");
+          }
         }
 
-        const lowerText = cleanText.toLowerCase();
-        let category = "Other"; let condition = "";
-        if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
-          category = "Cars";
-          if (/(new|አዲስ)/i.test(lowerText)) condition = "New";
-          else if (/(electric|ኤሌክትሪክ|ኢቪ)/i.test(lowerText)) condition = "Electric";
-          else if (/(rent|ኪራይ)/i.test(lowerText)) condition = "Rent";
-          else condition = "Used";
-        } else if (/(house|villa|condominium|condo|ቤት|ቪላ|ኮንዶሚኒየም)/i.test(lowerText)) category = "Houses";
-        else if (/(apartment|office|shop|አፓርታማ|ቢሮ|ሱቅ|መጋዘን)/i.test(lowerText)) category = "Rentals";
-        else if (/(iphone|samsung|tecno|infinix|phone|smartphone|laptop|computer|tv|camera|ስልክ|ሞባይል|ላፕቶፕ|ኮምፒውተር|ቲቪ|ቴሌቪዥን|ካሜራ)/i.test(lowerText)) category = "Electronics";
-        else if (/(sofa|bed|table|chair|furniture|cabinet|ሶፋ|አልጋ|ጠረጴዛ|ጠረንጴዛ|ወንበር|ቁምሳጥን|እቃ)/i.test(lowerText)) category = "Furniture";
-        else if (/(clothes|shoes|dress|shirt|pants|fashion|ልብስ|ጫማ|ቀሚስ|ሱሪ|ሸሚዝ)/i.test(lowerText)) category = "Clothes";
-        
         let city = "";
         const cityMatch = cleanText.match(/(?:city|location|ከተማ)[\s:]+(.+)/i);
         if (cityMatch) city = cityMatch[1].trim();
         else if (/addis|ababa|adama|hawassa/i.test(cleanText)) city = "Addis Ababa";
 
         // ============================================
-        // 3. UPLOAD IMAGE
+        // 3. DOWNLOAD IMAGE & UPLOAD TO CLOUDINARY
         // ============================================
         let imageUrl = "";
+        let imageBlob = null;
         if (message.photo && message.photo.length > 0) {
           try {
             const largest = message.photo[message.photo.length - 1];
@@ -107,20 +108,52 @@ export default {
 
             if (fileInfo.ok) {
               const imgRes = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`);
-              const blob = await imgRes.blob();
+              imageBlob = await imgRes.blob();
+              
               const formData = new FormData();
-              formData.append("file", blob);
+              formData.append("file", imageBlob);
               formData.append("upload_preset", env.CLOUDINARY_UPLOAD_PRESET);
 
               const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/image/upload`, { method: "POST", body: formData });
               const cloudData = await cloudRes.json();
               if (cloudData.secure_url) imageUrl = cloudData.secure_url;
             }
-          } catch (e) {}
+          } catch (e) {
+            console.error("Image Error:", e);
+          }
         }
 
         // ============================================
-        // 4. SAVE TO FIREBASE (Using Individual Keys)
+        // 4. AI VISION ANALYSIS (LLaVA) - Optional check
+        // ============================================
+        // If the AI wasn't sure about the category (e.g. Other), we look at the image
+        if (imageBlob && category === "Other") {
+          try {
+            // Convert blob to array for Cloudflare AI
+            const arrayBuffer = await imageBlob.arrayBuffer();
+            const uint8Array = new Uint8Array(arrayBuffer);
+            const imageArray = Array.from(uint8Array); // Note: LLaVA in CF Workers requires a specific format, this is a conceptual test
+
+            const visionPrompt = `Look at this image. Is it a car, phone, furniture, or clothes? Reply with ONE word.`;
+            const visionResponse = await env.AI.run('@cf/llava-hf/llava-1.5-7b-hf', {
+              image: imageArray,
+              prompt: visionPrompt,
+              max_tokens: 10
+            });
+            
+            const detectedObject = visionResponse.description.toLowerCase();
+            if (detectedObject.includes("car")) category = "Cars";
+            else if (detectedObject.includes("phone")) category = "Electronics";
+            else if (detectedObject.includes("furniture")) category = "Furniture";
+            else if (detectedObject.includes("clothes")) category = "Clothes";
+            
+          } catch (visError) {
+             console.error("Vision AI Error:", visError);
+          }
+        }
+
+        // ============================================
+        // 5. SAVE TO FIREBASE
         // ============================================
         const token = await getFirebaseToken(env);
         const projectId = env.FIREBASE_PROJECT_ID;
@@ -135,6 +168,8 @@ export default {
             city: { stringValue: city },
             category: { stringValue: category },
             condition: { stringValue: condition }, 
+            brand: { stringValue: brand },
+            itemName: { stringValue: itemName },
             image: { stringValue: imageUrl },
             images: { arrayValue: imageUrl ? { values: [{ stringValue: imageUrl }] } : { values: [] } },
             status: { stringValue: "available" }, 
@@ -153,7 +188,7 @@ export default {
         });
 
         // ============================================
-        // 5. REPOST CLEAN AD & DELETE ORIGINAL
+        // 6. REPOST CLEAN AD & DELETE ORIGINAL
         // ============================================
         let safeDetails = cleanText.substring(0, 800); 
 
@@ -199,7 +234,6 @@ export default {
           errorMsg = tgErr.message;
         }
 
-        // Delete original message after posting
         if (postSuccess) {
           await new Promise(resolve => setTimeout(resolve, 3000));
           await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
@@ -208,7 +242,6 @@ export default {
             body: JSON.stringify({ chat_id: message.chat.id, message_id: message.message_id }),
           });
         } else {
-          // If it fails, tell the channel why
           await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -230,7 +263,9 @@ export default {
   }
 };
 
-// ✅ NEW: Uses individual env variables to prevent Cloudflare deletion issues
+// ============================================
+// FIREBASE AUTH HELPER
+// ============================================
 async function getFirebaseToken(env) {
   const clientEmail = env.FIREBASE_CLIENT_EMAIL;
   const privateKey = env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n");
