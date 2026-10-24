@@ -7,7 +7,7 @@ export default {
     try {
       const update = await request.json();
       
-      // Process in background so Telegram doesn't timeout or duplicate
+      // Process in background so Telegram doesn't timeout
       ctx.waitUntil(processUpdate(update, env));
       
       return new Response("OK", { status: 200 });
@@ -19,18 +19,27 @@ export default {
 
 async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
-  if (!message || (!message.text && !message.caption)) return;
+  if (!message) return;
 
-  const messageText = message.text || message.caption;
+  // 🚨 1. IGNORE ALBUM IMAGES THAT HAVE NO TEXT (Only process the first image)
+  if (message.media_group_id && !message.caption && !message.text) {
+    return; 
+  }
+
+  const messageText = (message.text || message.caption || "").trim();
+  
+  // 🚨 2. STRICTLY IGNORE EMPTY MESSAGES
+  if (messageText.length === 0) return;
+
   const targetChatId = "-1001674587108"; 
 
-  // 🚨 ULTIMATE ANTI-LOOP PROTECTION
+  // 🚨 3. ANTI-LOOP PROTECTION
   if (message.from && message.from.is_bot) return;
   if (messageText.includes("Official Ad Posted!") || messageText.includes("Failed to repost")) return;
 
   try {
     // ============================================
-    // 1. DELETE ORIGINAL MESSAGE INSTANTLY
+    // 4. DELETE ORIGINAL MESSAGE INSTANTLY
     // ============================================
     try {
       await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
@@ -43,7 +52,7 @@ async function processUpdate(update, env) {
     }
 
     // ============================================
-    // 2. CLEAN TEXT
+    // 5. CLEAN TEXT
     // ============================================
     let cleanText = messageText;
     cleanText = cleanText.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{2700}-\u{27BF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu, "");
@@ -63,18 +72,26 @@ async function processUpdate(update, env) {
     let city = "";
 
     // ============================================
-    // 3. CATEGORY DETECTION
+    // 6. CATEGORY & CONDITION DETECTION
     // ============================================
     if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
       category = "Cars";
+      if (/(brand new|new|አዲስ|አዲስ መኪና)/i.test(lowerText)) condition = "New";
+      else if (/(electric|ኤሌክትሪክ|ኢቪ|ev)/i.test(lowerText)) condition = "Electric";
+      else if (/(rent|ኪራይ|for rent)/i.test(lowerText)) condition = "Rent";
+      else condition = "Used";
     } else if (/(house|villa|condominium|condo|ቤት|ቪላ|ኮንዶሚኒየም)/i.test(lowerText)) {
       category = "Houses";
     } else if (/(apartment|office|shop|አፓርታማ|ቢሮ|ሱቅ|መጋዘን)/i.test(lowerText)) {
       category = "Rentals";
     } else if (/(iphone|samsung|tecno|infinix|phone|smartphone|laptop|computer|tv|camera|ስልክ|ሞባይል|ላፕቶፕ|ኮምፒውተር|ቲቪ|ቴሌቪዥን|ካሜራ)/i.test(lowerText)) {
       category = "Electronics";
+      if (/(brand new|new|አዲስ)/i.test(lowerText)) condition = "New";
+      else condition = "Used";
     } else if (/(sofa|bed|table|chair|furniture|cabinet|ሶፋ|አልጋ|ጠረጴዛ|ጠረንጴዛ|ወንበር|ቁምሳጥን|እቃ)/i.test(lowerText)) {
       category = "Furniture";
+      if (/(brand new|new|አዲስ)/i.test(lowerText)) condition = "New";
+      else condition = "Used";
     } else if (/(clothes|shoes|dress|shirt|pants|fashion|ልብስ|ጫማ|ቀሚስ|ሱሪ|ሸሚዝ)/i.test(lowerText)) {
       category = "Clothes";
     } else if (/(construction|electrician|plumber|painter|cleaning|worker|ግንባታ|ኤሌክትሪሺያን|ቧንቧ|ቀለም|ጽዳት|ሰራተኛ|ሠራተኛ)/i.test(lowerText)) {
@@ -84,23 +101,7 @@ async function processUpdate(update, env) {
     }
 
     // ============================================
-    // 4. CONDITION DETECTION
-    // ============================================
-    if (category === "Cars") {
-      if (/(brand new|new|አዲስ|አዲስ መኪና)/i.test(lowerText)) condition = "New";
-      else if (/(electric|ኤሌክትሪክ|ኢቪ|ev)/i.test(lowerText)) condition = "Electric";
-      else if (/(rent|ኪራይ|for rent)/i.test(lowerText)) condition = "Rent";
-      else condition = "Used";
-    } else if (category === "Electronics" || category === "Furniture" || category === "Clothes") {
-      if (/(brand new|new|አዲስ)/i.test(lowerText)) condition = "New";
-      else condition = "Used";
-    } else if (category === "Houses" || category === "Rentals") {
-      if (/(sale|ሽያጭ|ለሽያጭ)/i.test(lowerText)) condition = "Sale";
-      else if (/(rent|ኪራይ|ለኪራይ)/i.test(lowerText)) condition = "Rent";
-    }
-
-    // ============================================
-    // 5. EXTRACT TITLE, PRICE, CITY
+    // 7. EXTRACT TITLE, PRICE, CITY
     // ============================================
     const makeMatch = cleanText.match(/(?:make|brand)[\s:.-]+([a-zA-Z\s]+)/i);
     if (makeMatch && !brand) brand = makeMatch[1].trim();
@@ -110,11 +111,13 @@ async function processUpdate(update, env) {
 
     let title = `${brand} ${itemName}`.replace(/\s+/g, " ").trim();
     
+    // Fallback if AI/Regex fails
     if (!title || title.length < 3) {
       const lines = cleanText.split("\n").map((l) => l.trim()).filter(Boolean);
       title = lines[0] || "Untitled Ad";
       if (/(urgent|አስቸኳይ|sale|ሽያጭ)/i.test(title) && lines.length > 1) title = lines[1];
     }
+    
     if (title.length > 60) title = title.substring(0, 60) + "...";
     title = title.replace(/\b\w/g, (char) => char.toUpperCase());
 
@@ -134,7 +137,7 @@ async function processUpdate(update, env) {
     else if (/addis|ababa|adama|hawassa/i.test(cleanText)) city = "Addis Ababa";
 
     // ============================================
-    // 6. UPLOAD IMAGE
+    // 8. UPLOAD IMAGE
     // ============================================
     let imageUrl = "";
     if (message.photo && message.photo.length > 0) {
@@ -158,7 +161,7 @@ async function processUpdate(update, env) {
     }
 
     // ============================================
-    // 7. SAVE TO FIREBASE
+    // 9. SAVE TO FIREBASE
     // ============================================
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
@@ -193,7 +196,7 @@ async function processUpdate(update, env) {
     });
 
     // ============================================
-    // 8. REPOST CLEAN AD
+    // 10. REPOST CLEAN AD
     // ============================================
     let safeDetails = cleanText.substring(0, 800); 
 
