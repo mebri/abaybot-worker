@@ -13,7 +13,7 @@ export default {
       }
 
       const messageText = message.text || message.caption;
-      const targetChatId = "-1001674587108"; // Your Channel ID
+      const targetChatId = "-1001674587108"; 
 
       try {
         // ============================================
@@ -37,14 +37,10 @@ export default {
         let city = "";
 
         // ============================================
-        // 2. PRIMARY DETECTION (Regex - Fast & Reliable)
+        // 2. CATEGORY DETECTION
         // ============================================
         if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
           category = "Cars";
-          if (/(new|አዲስ)/i.test(lowerText)) condition = "New";
-          else if (/(electric|ኤሌክትሪክ|ኢቪ)/i.test(lowerText)) condition = "Electric";
-          else if (/(rent|ኪራይ)/i.test(lowerText)) condition = "Rent";
-          else condition = "Used";
         } else if (/(house|villa|condominium|condo|ቤት|ቪላ|ኮንዶሚኒየም)/i.test(lowerText)) {
           category = "Houses";
         } else if (/(apartment|office|shop|አፓርታማ|ቢሮ|ሱቅ|መጋዘን)/i.test(lowerText)) {
@@ -58,11 +54,27 @@ export default {
         } else if (/(construction|electrician|plumber|painter|cleaning|worker|ግንባታ|ኤሌክትሪሺያን|ቧንቧ|ቀለም|ጽዳት|ሰራተኛ|ሠራተኛ)/i.test(lowerText)) {
           category = "Labor & Services";
         } else if (/(used|second-hand|ምንአለሽ ተራ|ያገለገለ)/i.test(lowerText)) {
-          category = "ምንአለሽ ተራ";
+          category = "ምንአለም ተራ";
         }
 
         // ============================================
-        // 3. SECONDARY DETECTION (AI - If Regex fails)
+        // 3. CONDITION DETECTION (New, Used, Rent, Electric)
+        // ============================================
+        if (category === "Cars") {
+          if (/(brand new|new|አዲስ|አዲስ መኪና)/i.test(lowerText)) condition = "New";
+          else if (/(electric|ኤሌክትሪክ|ኢቪ|ev)/i.test(lowerText)) condition = "Electric";
+          else if (/(rent|ኪራይ|for rent)/i.test(lowerText)) condition = "Rent";
+          else condition = "Used"; // Defaults to Used if nothing else is found
+        } else if (category === "Electronics" || category === "Furniture" || category === "Clothes") {
+          if (/(brand new|new|አዲስ)/i.test(lowerText)) condition = "New";
+          else condition = "Used"; // Defaults to Used
+        } else if (category === "Houses" || category === "Rentals") {
+          if (/(sale|ሽያጭ|ለሽያጭ)/i.test(lowerText)) condition = "Sale";
+          else if (/(rent|ኪራይ|ለኪራይ)/i.test(lowerText)) condition = "Rent";
+        }
+
+        // ============================================
+        // 4. AI SECONDARY DETECTION (If text is unclear)
         // ============================================
         if (category === "Other") {
           try {
@@ -72,7 +84,7 @@ export default {
               "category" (choose exactly one: Cars, Houses, Rentals, Electronics, Furniture, Clothes, Labor & Services, ምንአለሽ ተራ, Other),
               "brand" (e.g., Toyota, Samsung, Nike),
               "itemName" (e.g., Corolla, Galaxy S21, Sofa),
-              "condition" (e.g., New, Used),
+              "condition" (e.g., New, Used, Electric, Rent),
               "price" (number only).
               
               Text: "${cleanText}"
@@ -98,7 +110,7 @@ export default {
         }
 
         // ============================================
-        // 4. EXTRACT TITLE, PRICE, CITY
+        // 5. EXTRACT TITLE, PRICE, CITY
         // ============================================
         const makeMatch = cleanText.match(/(?:make|brand)[\s:.-]+([a-zA-Z\s]+)/i);
         if (makeMatch && !brand) brand = makeMatch[1].trim();
@@ -132,7 +144,7 @@ export default {
         else if (/addis|ababa|adama|hawassa/i.test(cleanText)) city = "Addis Ababa";
 
         // ============================================
-        // 5. UPLOAD IMAGE
+        // 6. UPLOAD IMAGE
         // ============================================
         let imageUrl = "";
         if (message.photo && message.photo.length > 0) {
@@ -156,7 +168,7 @@ export default {
         }
 
         // ============================================
-        // 6. SAVE TO FIREBASE
+        // 7. SAVE TO FIREBASE
         // ============================================
         const token = await getFirebaseToken(env);
         const projectId = env.FIREBASE_PROJECT_ID;
@@ -170,7 +182,7 @@ export default {
             phone: { stringValue: "0911680790" }, 
             city: { stringValue: city },
             category: { stringValue: category },
-            condition: { stringValue: condition }, 
+            condition: { stringValue: condition }, // ✅ Saves "New" or "Used" correctly
             brand: { stringValue: brand },
             itemName: { stringValue: itemName },
             image: { stringValue: imageUrl },
@@ -191,11 +203,10 @@ export default {
         });
 
         // ============================================
-        // 7. REPOST CLEAN AD & DELETE ORIGINAL
+        // 8. REPOST CLEAN AD & DELETE ORIGINAL
         // ============================================
         let safeDetails = cleanText.substring(0, 800); 
 
-        // ✅ AUTOMATIC HASHTAGS FOR CATEGORIZATION
         let hashtag = "#Other";
         if (category === "Cars") hashtag = "#Cars";
         else if (category === "Houses") hashtag = "#Houses";
@@ -206,15 +217,17 @@ export default {
         else if (category === "Labor & Services") hashtag = "#Labor";
         else if (category === "ምንአለሽ ተራ") hashtag = "#ምንአለሽ_ተራ";
 
+        // ✅ Adds the condition to the reply (e.g., Cars > Used)
+        let categoryDisplay = category;
+        if (condition) categoryDisplay += ` > ${condition}`;
+
         let newPostText = `✅ Official Ad Posted!\n\n`;
-        newPostText += `📂 Category: ${category}\n`;
+        newPostText += `📂 Category: ${categoryDisplay}\n`; 
         newPostText += `📝 Title: ${title}\n`;
         if (price) newPostText += `💰 Price: ${price} ETB\n`;
         if (city) newPostText += `📍 City: ${city}\n`;
         newPostText += `\n📞 Contact: 0911680790\n`; 
         newPostText += `\n📄 Details:\n${safeDetails}\n\n`;
-
-        // ✅ This adds the hashtag at the very bottom
         newPostText += `${hashtag}`; 
 
         let postSuccess = false;
