@@ -16,10 +16,13 @@ export default {
       const targetChatId = "-1001674587108"; 
 
       // ============================================
-      // 🚨 ANTI-LOOP PROTECTION 🚨
-      // If the message was sent by the bot, ignore it!
-      // ============================================
-      if (messageText.startsWith("✅ Official Ad Posted!")) {
+      // 🚨 ULTIMATE ANTI-LOOP PROTECTION 🚨
+      // 1. Ignore any message sent by a Bot
+      if (message.from && message.from.is_bot) {
+        return new Response("OK", { status: 200 });
+      }
+      // 2. Ignore our own custom strings just in case
+      if (messageText.startsWith("✅ Official Ad Posted!") || messageText.startsWith("⚠️")) {
         return new Response("OK", { status: 200 });
       }
 
@@ -82,7 +85,7 @@ export default {
         }
 
         // ============================================
-        // 4. AI SECONDARY DETECTION (If text is unclear)
+        // 4. AI SECONDARY DETECTION
         // ============================================
         if (category === "Other") {
           try {
