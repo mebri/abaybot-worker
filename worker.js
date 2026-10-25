@@ -18,7 +18,7 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 🚨 1. IGNORE EMPTY MESSAGES (Fixes Album issue)
+  // 🚨 1. IGNORE EMPTY MESSAGES (Fixes the Album issue)
   if (!message.text && !message.caption) return;
   const messageText = (message.text || message.caption || "").trim();
   if (messageText.length < 3) return; 
@@ -42,11 +42,9 @@ async function processUpdate(update, env) {
 
     const lowerText = cleanText.toLowerCase();
     let category = "Other";
-    let condition = "";
     let brand = "";
     let itemName = "";
     let price = "";
-    let city = "";
 
     // ============================================
     // 4. CATEGORY DETECTION
@@ -70,44 +68,7 @@ async function processUpdate(update, env) {
     }
 
     // ============================================
-    // 5. CONDITION DETECTION
-    // ============================================
-    if (category === "Cars") {
-      if (/(brand new|new|አዲስ|አዲስ መኪና)/i.test(lowerText)) condition = "New";
-      else if (/(electric|ኤሌክትሪክ|ኢቪ|ev)/i.test(lowerText)) condition = "Electric";
-      else if (/(rent|ኪራይ|for rent)/i.test(lowerText)) condition = "Rent";
-      else condition = "Used";
-    } else if (category === "Electronics" || category === "Furniture" || category === "Clothes") {
-      if (/(brand new|new|አዲስ)/i.test(lowerText)) condition = "New";
-      else condition = "Used";
-    }
-
-    // ============================================
-    // 6. EXTRACT TITLE, PRICE, CITY
-    // ============================================
-    const makeMatch = cleanText.match(/(?:make|brand)[\s:.-]+([a-zA-Z\s]+)/i);
-    if (makeMatch && !brand) brand = makeMatch[1].trim();
-    
-    const modelMatch = cleanText.match(/(?:model)[\s:.-]+([a-zA-Z0-9\s.-]+)/i);
-    if (modelMatch && !itemName) itemName = modelMatch[1].trim();
-
-    let title = `${brand} ${itemName}`.replace(/\s+/g, " ").trim();
-    
-    if (!title || title.length < 3) {
-      const lines = cleanText.split("\n").map((l) => l.trim()).filter(Boolean);
-      title = lines[0] || "Untitled Ad";
-      if (/(urgent|አስቸኳይ|sale|ሽያጭ)/i.test(title) && lines.length > 1) title = lines[1];
-    }
-    if (title.length > 60) title = title.substring(0, 60) + "...";
-
-    const priceMatch = cleanText.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
-    if (priceMatch) {
-      let cleanedNum = priceMatch[1].replace(/[.,]/g, "");
-      if (cleanedNum && !isNaN(cleanedNum)) price = Number(cleanedNum).toLocaleString("en-US");
-    }
-
-    // ============================================
-    // 7. UPLOAD IMAGE & SAVE TO FIREBASE
+    // 5. UPLOAD IMAGE & SAVE TO FIREBASE
     // ============================================
     let imageUrl = "";
     if (message.photo && message.photo.length > 0) {
@@ -133,6 +94,10 @@ async function processUpdate(update, env) {
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
     const adOwnerId = env.ADMIN_UID || "admin_bot"; 
+    
+    const lines = cleanText.split("\n").map((l) => l.trim()).filter(Boolean);
+    let title = lines[0] || "Untitled Ad";
+    if (title.length > 60) title = title.substring(0, 60) + "...";
 
     const adData = {
       fields: {
@@ -140,11 +105,8 @@ async function processUpdate(update, env) {
         description: { stringValue: cleanText }, 
         price: { stringValue: price || "0" },
         phone: { stringValue: "0911680790" }, 
-        city: { stringValue: city },
+        city: { stringValue: "" },
         category: { stringValue: category },
-        condition: { stringValue: condition }, 
-        brand: { stringValue: brand },
-        itemName: { stringValue: itemName },
         image: { stringValue: imageUrl },
         images: { arrayValue: imageUrl ? { values: [{ stringValue: imageUrl }] } : { values: [] } },
         status: { stringValue: "available" }, 
@@ -163,7 +125,7 @@ async function processUpdate(update, env) {
     });
 
     // ============================================
-    // 8. EDIT CAPTION (WITH ERROR CHECKING)
+    // 6. TRY TO EDIT CAPTION
     // ============================================
     let hashtag = "#Other";
     if (category === "Cars") hashtag = "#Cars";
@@ -203,20 +165,40 @@ async function processUpdate(update, env) {
       
       const editData = await editRes.json();
       
-      // ✅ If the edit fails, tell the channel why
+      // 🚨 IF EDIT FAILS (e.g., because it's an album), FALLBACK TO DELETE & REPOST
       if (!editData.ok) {
-         await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+         // 1. Delete the original messy message
+         await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ 
-              chat_id: message.chat.id, 
-              text: `⚠️ Edit failed: ${editData.description}` 
-            }),
+            body: JSON.stringify({ chat_id: message.chat.id, message_id: message.message_id }),
          });
+
+         // 2. Repost the clean version (only one photo to avoid duplicates)
+         if (imageUrl) {
+            await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ 
+                chat_id: message.chat.id, 
+                photo: imageUrl, 
+                caption: newPostText.substring(0, 1024)
+              }),
+            });
+         } else {
+            await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ 
+                chat_id: message.chat.id, 
+                text: newPostText.substring(0, 4096)
+              }),
+            });
+         }
       }
 
     } catch (err) {
-       console.error("Failed to edit message", err);
+       console.error("Failed to edit or repost", err);
     }
 
   } catch (error) {
