@@ -49,7 +49,7 @@ async function processUpdate(update, env) {
     // ============================================
     // 4. CATEGORY DETECTION
     // ============================================
-    if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
+    if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|elantra|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
       category = "Cars";
     } else if (/(house|villa|condominium|condo|ቤት|ቪላ|ኮንዶሚኒየም)/i.test(lowerText)) {
       category = "Houses";
@@ -68,7 +68,42 @@ async function processUpdate(update, env) {
     }
 
     // ============================================
-    // 5. UPLOAD IMAGE & SAVE TO FIREBASE
+    // 5. SMART PRICE & TITLE EXTRACTION
+    // ============================================
+    // Extract Title
+    const makeMatch = cleanText.match(/(?:make|brand)[\s:.-]+([a-zA-Z\s]+)/i);
+    if (makeMatch && !brand) brand = makeMatch[1].trim();
+    
+    const modelMatch = cleanText.match(/(?:model)[\s:.-]+([a-zA-Z0-9\s.-]+)/i);
+    if (modelMatch && !itemName) itemName = modelMatch[1].trim();
+
+    let title = `${brand} ${itemName}`.replace(/\s+/g, " ").trim();
+    
+    // Fallback for Title: Use the first line if no Make/Model found
+    if (!title || title.length < 3) {
+      const lines = cleanText.split("\n").map((l) => l.trim()).filter(Boolean);
+      title = lines[0] || "";
+      if (/(urgent|አስቸኳይ|sale|ሽያጭ|for sale)/i.test(title) && lines.length > 1) title = lines[1];
+    }
+    if (title.length > 60) title = title.substring(0, 60) + "...";
+
+    // Extract Price
+    const priceMatch = cleanText.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
+    if (priceMatch) {
+      let cleanedNum = priceMatch[1].replace(/[.,]/g, "");
+      if (cleanedNum && !isNaN(cleanedNum)) price = Number(cleanedNum).toLocaleString("en-US");
+    }
+    // Fallback for Price: Look for any large number like 2,500,000 or 2.500.000
+    if (!price || price === "0") {
+      const fallbackMatch = cleanText.match(/(\d{1,3}(?:[.,]\d{3})+)/);
+      if (fallbackMatch) {
+         let cleanedNum = fallbackMatch[1].replace(/[.,]/g, "");
+         if (cleanedNum && !isNaN(cleanedNum)) price = Number(cleanedNum).toLocaleString("en-US");
+      }
+    }
+
+    // ============================================
+    // 6. UPLOAD IMAGE & SAVE TO FIREBASE
     // ============================================
     let imageUrl = "";
     if (message.photo && message.photo.length > 0) {
@@ -94,14 +129,10 @@ async function processUpdate(update, env) {
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
     const adOwnerId = env.ADMIN_UID || "admin_bot"; 
-    
-    const lines = cleanText.split("\n").map((l) => l.trim()).filter(Boolean);
-    let title = lines[0] || "Untitled Ad";
-    if (title.length > 60) title = title.substring(0, 60) + "...";
 
     const adData = {
       fields: {
-        title: { stringValue: title },
+        title: { stringValue: title || "Untitled Ad" },
         description: { stringValue: cleanText }, 
         price: { stringValue: price || "0" },
         phone: { stringValue: "0911680790" }, 
@@ -125,7 +156,7 @@ async function processUpdate(update, env) {
     });
 
     // ============================================
-    // 6. CREATE THE TELEGRAM BUSINESS CARD
+    // 7. TELEGRAM POST (WITH BUSINESS CARD & SAFE LIMIT)
     // ============================================
     let hashtag = "#Other";
     if (category === "Cars") hashtag = "#Cars";
@@ -137,16 +168,24 @@ async function processUpdate(update, env) {
     else if (category === "Labor & Services") hashtag = "#Labor";
     else if (category === "ምንአለሽ_ተራ") hashtag = "#ምንአለሽ_ተራ";
 
-    // ✅ THE BUSINESS CARD FOOTER
-    let businessCard = `\n\n━━━━━━━━━━━━━━━\n`;
-    businessCard += `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
-    businessCard += `📞 Phone: 0911680790\n`;
-    businessCard += `🌐 Website: mebri.yegna.workers.dev\n`;
-    businessCard += `✈️ Telegram: @mebrigranite\n`;
-    businessCard += `━━━━━━━━━━━━━━━\n\n`;
+    // ✅ SAFE LIMIT: Telegram cuts off captions at 1024 characters.
+    // We only keep the first 500 characters of the description so the Business Card fits!
+    let safeDetails = cleanText.substring(0, 500); 
+    if (cleanText.length > 500) safeDetails += "...";
 
-    // Combine text + business card + hashtag
-    let newPostText = `${cleanText}${businessCard}${hashtag}`; 
+    let newPostText = `📝 Title: ${title}\n`;
+    if (price && price !== "0") newPostText += `💰 Price: ${price} ETB\n`;
+    newPostText += `\n📄 Details:\n${safeDetails}\n\n`;
+    
+    // ✅ BUSINESS CARD
+    newPostText += `━━━━━━━━━━━━━━━\n`;
+    newPostText += `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
+    newPostText += `📞 Phone: 0911680790\n`;
+    newPostText += `🌐 Website: mebri.yegna.workers.dev\n`;
+    newPostText += `✈️ Telegram: @mebrigranite\n`;
+    newPostText += `━━━━━━━━━━━━━━━\n\n`;
+    
+    newPostText += `${hashtag}`; 
 
     try {
       let editRes;
@@ -157,7 +196,7 @@ async function processUpdate(update, env) {
           body: JSON.stringify({ 
             chat_id: message.chat.id, 
             message_id: message.message_id,
-            caption: newPostText.substring(0, 1024) // Telegram limit
+            caption: newPostText.substring(0, 1024)
           }),
         });
       } else {
