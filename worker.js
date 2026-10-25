@@ -6,10 +6,7 @@ export default {
 
     try {
       const update = await request.json();
-      
-      // ✅ Process in background so Telegram doesn't timeout
       ctx.waitUntil(processUpdate(update, env));
-      
       return new Response("OK", { status: 200 });
     } catch (error) {
       return new Response("Error: " + error.message, { status: 200 });
@@ -18,26 +15,24 @@ export default {
 };
 
 async function processUpdate(update, env) {
-  // Only process NEW messages. Ignore edited messages.
   const message = update.message || update.channel_post;
-  
+  if (!message) return;
+
   // 🚨 1. IGNORE EMPTY MESSAGES (Fixes the Album issue)
   // If an album has multiple photos, only the first one has a caption.
   // This tells the bot to ignore the 2nd, 3rd, 4th photos.
-  if (!message || (!message.text && !message.caption)) return;
+  if (!message.text && !message.caption) return;
 
   const messageText = (message.text || message.caption || "").trim();
   if (messageText.length < 3) return; 
 
-  const targetChatId = "-1001674587108"; 
-
-  // 🚨 ANTI-LOOP PROTECTION
+  // 🚨 2. ANTI-LOOP PROTECTION
   if (message.from && message.from.is_bot) return;
-  if (messageText.includes("✅ Official Ad Posted!") || messageText.includes("📂 Category:")) return;
+  if (messageText.includes("#Cars") || messageText.includes("#Electronics")) return;
 
   try {
     // ============================================
-    // 2. CLEAN TEXT
+    // 3. CLEAN TEXT
     // ============================================
     let cleanText = messageText;
     cleanText = cleanText.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{2700}-\u{27BF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu, "");
@@ -57,7 +52,7 @@ async function processUpdate(update, env) {
     let city = "";
 
     // ============================================
-    // 3. CATEGORY DETECTION
+    // 4. CATEGORY DETECTION
     // ============================================
     if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) {
       category = "Cars";
@@ -74,11 +69,11 @@ async function processUpdate(update, env) {
     } else if (/(construction|electrician|plumber|painter|cleaning|worker|ግንባታ|ኤሌክትሪሺያን|ቧንቧ|ቀለም|ጽዳት|ሰራተኛ|ሠራተኛ)/i.test(lowerText)) {
       category = "Labor & Services";
     } else if (/(used|second-hand|ምንአለሽ ተራ|ያገለገለ)/i.test(lowerText)) {
-      category = "ምንአለሽ ተራ";
+      category = "ምንአለሽ_ተራ";
     }
 
     // ============================================
-    // 4. CONDITION DETECTION
+    // 5. CONDITION DETECTION
     // ============================================
     if (category === "Cars") {
       if (/(brand new|new|አዲስ|አዲስ መኪና)/i.test(lowerText)) condition = "New";
@@ -94,7 +89,7 @@ async function processUpdate(update, env) {
     }
 
     // ============================================
-    // 5. EXTRACT TITLE, PRICE, CITY
+    // 6. EXTRACT TITLE, PRICE, CITY
     // ============================================
     const makeMatch = cleanText.match(/(?:make|brand)[\s:.-]+([a-zA-Z\s]+)/i);
     if (makeMatch && !brand) brand = makeMatch[1].trim();
@@ -128,7 +123,7 @@ async function processUpdate(update, env) {
     else if (/addis|ababa|adama|hawassa/i.test(cleanText)) city = "Addis Ababa";
 
     // ============================================
-    // 6. UPLOAD IMAGE
+    // 7. UPLOAD IMAGE (For the website)
     // ============================================
     let imageUrl = "";
     if (message.photo && message.photo.length > 0) {
@@ -152,7 +147,7 @@ async function processUpdate(update, env) {
     }
 
     // ============================================
-    // 7. SAVE TO FIREBASE
+    // 8. SAVE TO FIREBASE
     // ============================================
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
@@ -187,7 +182,7 @@ async function processUpdate(update, env) {
     });
 
     // ============================================
-    // 8. EDIT CAPTION (KEEPING THE IMAGE & NO HEADERS)
+    // 9. EDIT THE CAPTION IN PLACE (NO HEADERS)
     // ============================================
     let hashtag = "#Other";
     if (category === "Cars") hashtag = "#Cars";
@@ -197,14 +192,14 @@ async function processUpdate(update, env) {
     else if (category === "Furniture") hashtag = "#Furniture";
     else if (category === "Clothes") hashtag = "#Clothes";
     else if (category === "Labor & Services") hashtag = "#Labor";
-    else if (category === "ምንአለሽ ተራ") hashtag = "#ምንአለሽ_ተራ";
+    else if (category === "ምንአለሽ_ተራ") hashtag = "#ምንአለሽ_ተራ";
 
-    // ✅ NO HEADERS. JUST CLEAN TEXT AND HASHTAG.
+    // ✅ JUST THE CLEAN TEXT AND HASHTAG
     let newPostText = `${cleanText}\n\n${hashtag}`; 
 
     try {
       if (message.photo && message.photo.length > 0) {
-        // Edit the image caption
+        // Edits the text under the first photo of the album
         await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageCaption`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -215,7 +210,7 @@ async function processUpdate(update, env) {
           }),
         });
       } else {
-        // Edit the text message
+        // Edits text-only messages
         await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageText`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
