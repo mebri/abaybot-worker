@@ -18,11 +18,8 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 🚨 1. IGNORE EMPTY MESSAGES (Fixes the Album issue)
-  // If an album has multiple photos, only the first one has a caption.
-  // This tells the bot to ignore the 2nd, 3rd, 4th photos.
+  // 🚨 1. IGNORE EMPTY MESSAGES (Fixes Album issue)
   if (!message.text && !message.caption) return;
-
   const messageText = (message.text || message.caption || "").trim();
   if (messageText.length < 3) return; 
 
@@ -83,9 +80,6 @@ async function processUpdate(update, env) {
     } else if (category === "Electronics" || category === "Furniture" || category === "Clothes") {
       if (/(brand new|new|አዲስ)/i.test(lowerText)) condition = "New";
       else condition = "Used";
-    } else if (category === "Houses" || category === "Rentals") {
-      if (/(sale|ሽያጭ|ለሽያጭ)/i.test(lowerText)) condition = "Sale";
-      else if (/(rent|ኪራይ|ለኪራይ)/i.test(lowerText)) condition = "Rent";
     }
 
     // ============================================
@@ -105,25 +99,15 @@ async function processUpdate(update, env) {
       if (/(urgent|አስቸኳይ|sale|ሽያጭ)/i.test(title) && lines.length > 1) title = lines[1];
     }
     if (title.length > 60) title = title.substring(0, 60) + "...";
-    title = title.replace(/\b\w/g, (char) => char.toUpperCase());
 
     const priceMatch = cleanText.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
     if (priceMatch) {
-      let rawNum = priceMatch[1];
-      let cleanedNum = rawNum.replace(/[.,]/g, "");
+      let cleanedNum = priceMatch[1].replace(/[.,]/g, "");
       if (cleanedNum && !isNaN(cleanedNum)) price = Number(cleanedNum).toLocaleString("en-US");
     }
-    if (!price) {
-      const fallbackMatch = cleanText.match(/(\d{1,3}(?:[.,]\d{3})+)/);
-      if (fallbackMatch) price = fallbackMatch[1];
-    }
-
-    const cityMatch = cleanText.match(/(?:city|location|ከተማ)[\s:]+(.+)/i);
-    if (cityMatch) city = cityMatch[1].trim();
-    else if (/addis|ababa|adama|hawassa/i.test(cleanText)) city = "Addis Ababa";
 
     // ============================================
-    // 7. UPLOAD IMAGE (For the website)
+    // 7. UPLOAD IMAGE & SAVE TO FIREBASE
     // ============================================
     let imageUrl = "";
     if (message.photo && message.photo.length > 0) {
@@ -146,9 +130,6 @@ async function processUpdate(update, env) {
       } catch (e) {}
     }
 
-    // ============================================
-    // 8. SAVE TO FIREBASE
-    // ============================================
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
     const adOwnerId = env.ADMIN_UID || "admin_bot"; 
@@ -182,7 +163,7 @@ async function processUpdate(update, env) {
     });
 
     // ============================================
-    // 9. EDIT THE CAPTION IN PLACE (NO HEADERS)
+    // 8. EDIT CAPTION (WITH ERROR CHECKING)
     // ============================================
     let hashtag = "#Other";
     if (category === "Cars") hashtag = "#Cars";
@@ -194,13 +175,12 @@ async function processUpdate(update, env) {
     else if (category === "Labor & Services") hashtag = "#Labor";
     else if (category === "ምንአለሽ_ተራ") hashtag = "#ምንአለሽ_ተራ";
 
-    // ✅ JUST THE CLEAN TEXT AND HASHTAG
     let newPostText = `${cleanText}\n\n${hashtag}`; 
 
     try {
+      let editRes;
       if (message.photo && message.photo.length > 0) {
-        // Edits the text under the first photo of the album
-        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageCaption`, {
+        editRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageCaption`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ 
@@ -210,8 +190,7 @@ async function processUpdate(update, env) {
           }),
         });
       } else {
-        // Edits text-only messages
-        await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageText`, {
+        editRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageText`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ 
@@ -221,6 +200,21 @@ async function processUpdate(update, env) {
           }),
         });
       }
+      
+      const editData = await editRes.json();
+      
+      // ✅ If the edit fails, tell the channel why
+      if (!editData.ok) {
+         await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ 
+              chat_id: message.chat.id, 
+              text: `⚠️ Edit failed: ${editData.description}` 
+            }),
+         });
+      }
+
     } catch (err) {
        console.error("Failed to edit message", err);
     }
