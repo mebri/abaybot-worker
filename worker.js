@@ -18,7 +18,7 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 🚨 1. IGNORE EMPTY MESSAGES (Fixes the Album issue)
+  // 🚨 1. IGNORE EMPTY MESSAGES
   if (!message.text && !message.caption) return;
   const messageText = (message.text || message.caption || "").trim();
   if (messageText.length < 3) return; 
@@ -125,7 +125,7 @@ async function processUpdate(update, env) {
     });
 
     // ============================================
-    // 6. TRY TO EDIT CAPTION
+    // 6. CREATE THE TELEGRAM BUSINESS CARD
     // ============================================
     let hashtag = "#Other";
     if (category === "Cars") hashtag = "#Cars";
@@ -137,10 +137,16 @@ async function processUpdate(update, env) {
     else if (category === "Labor & Services") hashtag = "#Labor";
     else if (category === "ምንአለሽ_ተራ") hashtag = "#ምንአለሽ_ተራ";
 
-    // ✅ ADDED YOUR PHONE NUMBER BACK
-    let newPostText = `${cleanText}\n\n`;
-    newPostText += `📞 Contact: 0911680790\n\n`;
-    newPostText += `${hashtag}`; 
+    // ✅ THE BUSINESS CARD FOOTER
+    let businessCard = `\n\n━━━━━━━━━━━━━━━\n`;
+    businessCard += `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
+    businessCard += `📞 Phone: 0911680790\n`;
+    businessCard += `🌐 Website: mebri.yegna.workers.dev\n`;
+    businessCard += `✈️ Telegram: @mebrigranite\n`;
+    businessCard += `━━━━━━━━━━━━━━━\n\n`;
+
+    // Combine text + business card + hashtag
+    let newPostText = `${cleanText}${businessCard}${hashtag}`; 
 
     try {
       let editRes;
@@ -151,7 +157,7 @@ async function processUpdate(update, env) {
           body: JSON.stringify({ 
             chat_id: message.chat.id, 
             message_id: message.message_id,
-            caption: newPostText.substring(0, 1024)
+            caption: newPostText.substring(0, 1024) // Telegram limit
           }),
         });
       } else {
