@@ -137,7 +137,10 @@ async function processUpdate(update, env) {
     else if (category === "Labor & Services") hashtag = "#Labor";
     else if (category === "ምንአለሽ_ተራ") hashtag = "#ምንአለሽ_ተራ";
 
-    let newPostText = `${cleanText}\n\n${hashtag}`; 
+    // ✅ ADDED YOUR PHONE NUMBER BACK
+    let newPostText = `${cleanText}\n\n`;
+    newPostText += `📞 Contact: 0911680790\n\n`;
+    newPostText += `${hashtag}`; 
 
     try {
       let editRes;
@@ -165,16 +168,14 @@ async function processUpdate(update, env) {
       
       const editData = await editRes.json();
       
-      // 🚨 IF EDIT FAILS (e.g., because it's an album), FALLBACK TO DELETE & REPOST
+      // 🚨 IF EDIT FAILS, FALLBACK TO DELETE & REPOST
       if (!editData.ok) {
-         // 1. Delete the original messy message
          await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ chat_id: message.chat.id, message_id: message.message_id }),
          });
 
-         // 2. Repost the clean version (only one photo to avoid duplicates)
          if (imageUrl) {
             await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
               method: "POST",
