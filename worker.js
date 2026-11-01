@@ -1,20 +1,21 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
- * Features:
- * - Mathematical comma-separated price rules (3500000 -> 3,500,000)
- * - Support for million/thousand shorthands (3.5M -> 3,500,000 / 500k -> 500,000)
- * - Parallel Cloudinary uploads
- * - Zero-touch Firebase Firestore sync
+ * Fixes:
+ * 1. Zero Duplicate Ads in Firestore (Deterministic Document ID via PATCH)
+ * 2. Smart Title: Automatically extracts Brand + Model + Year
+ * 3. Captures ALL Album Photos (Full gallery saved to Firestore and Telegram)
+ * 4. Mathematical Price Formatting (3500000 -> 3,500,000 ETB)
  */
 
 const albumCache = new Map();
+const processedGroups = new Set();
 let cachedFirebaseToken = null;
 let tokenExpiresAt = 0;
 
 export default {
   async fetch(request, env, ctx) {
     if (request.method !== "POST") {
-      return new Response("Bot is running ✅", { status: 200 });
+      return new Response("Bot is active & running ✅", { status: 200 });
     }
 
     try {
@@ -36,7 +37,7 @@ async function processUpdate(update, env) {
 
   const rawText = (message.text || message.caption || "").trim();
 
-  // 2. Comprehensive Anti-Loop Protection
+  // 2. Anti-Loop Protection (Ignore already processed posts)
   if (
     rawText.includes("የኛ ገበያ") ||
     rawText.includes("@mebrigranite") ||
@@ -46,46 +47,60 @@ async function processUpdate(update, env) {
   }
 
   // ============================================
-  // ALBUM HANDLING (Media Groups)
+  // ALBUM HANDLING (Collect ALL Photos)
   // ============================================
   if (message.media_group_id) {
     const groupId = message.media_group_id;
+
+    // If album was already uploaded, stop duplicate executions immediately
+    if (processedGroups.has(groupId)) return;
 
     if (!albumCache.has(groupId)) {
       albumCache.set(groupId, {
         images: [],
         firstMessage: rawText.length > 3 ? message : null,
-        timerActive: false,
+        timerStarted: false,
         timestamp: Date.now()
       });
     }
 
-    const albumData = albumCache.get(groupId);
+    const album = albumCache.get(groupId);
 
+    // Collect highest quality photo file_id from each chunk
     if (message.photo && message.photo.length > 0) {
-      albumData.images.push(message.photo[message.photo.length - 1].file_id);
+      const bestPhoto = message.photo[message.photo.length - 1].file_id;
+      if (!album.images.includes(bestPhoto)) {
+        album.images.push(bestPhoto);
+      }
     }
 
-    if (rawText.length > 3 && !albumData.firstMessage) {
-      albumData.firstMessage = message;
+    // Save message containing caption text
+    if (rawText.length > 3 && !album.firstMessage) {
+      album.firstMessage = message;
     }
 
-    if (!albumData.timerActive) {
-      albumData.timerActive = true;
-      await new Promise((resolve) => setTimeout(resolve, 2500));
+    // Wait 3.5s to ensure ALL photos in the Telegram album arrive
+    if (!album.timerStarted) {
+      album.timerStarted = true;
+      await new Promise((resolve) => setTimeout(resolve, 3500));
 
-      if (!albumCache.has(groupId)) return;
-      const finalData = albumCache.get(groupId);
+      // Mark group as processed to kill duplicate runs
+      processedGroups.add(groupId);
+
+      const finalAlbum = albumCache.get(groupId);
       albumCache.delete(groupId);
 
-      await processFinalAd(
-        finalData.firstMessage || message,
-        Array.from(new Set(finalData.images)),
-        env
-      );
+      if (finalAlbum && finalAlbum.images.length > 0) {
+        await processFinalAd(
+          finalAlbum.firstMessage || message,
+          finalAlbum.images,
+          groupId,
+          env
+        );
+      }
     }
 
-    cleanupStaleAlbums();
+    cleanupMemory();
     return;
   }
 
@@ -99,36 +114,43 @@ async function processUpdate(update, env) {
     images.push(message.photo[message.photo.length - 1].file_id);
   }
 
-  await processFinalAd(message, images, env);
+  await processFinalAd(message, images, null, env);
 }
 
 // ============================================
-// MAIN PROCESSING & CLOUDINARY UPLOAD
+// MAIN PROCESSING & DEDUPLICATED FIRESTORE SYNC
 // ============================================
-async function processFinalAd(message, imageFileIds, env) {
+async function processFinalAd(message, imageFileIds, groupId, env) {
   const messageText = (message.text || message.caption || "").trim();
   const cleanText = cleanTheText(messageText);
   const category = detectCategory(cleanText);
-  const title = extractTitle(cleanText);
-  
-  // Mathematical price extraction with comma formatting rules
+
+  // Extract Brand + Model + Year for Title
+  const title = extractSmartTitle(cleanText, category);
+
+  // Extract formatted and numeric prices (3500000 -> 3,500,000)
   const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText);
 
   // 1. Upload ALL images to Cloudinary in PARALLEL
   const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
 
-  // 2. Save directly to Firebase Firestore
+  // 2. Save directly to Firebase Firestore with Deterministic ID (PREVENTS DUPLICATION)
   try {
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
     const adOwnerId = env.ADMIN_UID || "admin_bot";
+
+    // Deterministic Document ID prevents duplicates:
+    const documentId = groupId
+      ? `tg_album_${groupId}`
+      : `tg_msg_${message.chat.id}_${message.message_id}`;
 
     const adData = {
       fields: {
         title: { stringValue: title },
         description: { stringValue: cleanText },
         price: { stringValue: formattedPrice }, // "3,500,000"
-        rawPrice: { integerValue: rawPrice },   // "3500000" for numeric sorting
+        rawPrice: { integerValue: rawPrice },   // "3500000" (numeric for sorting)
         phone: { stringValue: "0911680790" },
         city: { stringValue: extractCity(cleanText) },
         category: { stringValue: category },
@@ -146,9 +168,10 @@ async function processFinalAd(message, imageFileIds, env) {
       }
     };
 
-    const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads`;
+    // PATCH creates the document if new, or updates it if existing (NEVER DUPLICATES)
+    const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${documentId}`;
     await fetch(fbUrl, {
-      method: "POST",
+      method: "PATCH",
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json"
@@ -159,7 +182,7 @@ async function processFinalAd(message, imageFileIds, env) {
     console.error("Firestore Save Error:", fbErr);
   }
 
-  // 3. Build Formatted Telegram Message
+  // 3. Build Formatted Telegram Post
   const hashtagMap = {
     Cars: "#Cars",
     Houses: "#Houses",
@@ -219,10 +242,94 @@ async function processFinalAd(message, imageFileIds, env) {
 }
 
 // ============================================
-// MATHEMATICAL PRICE RULES (e.g. 3500000 -> 3,500,000)
+// SMART TITLE: BRAND + MODEL + YEAR
+// ============================================
+function extractSmartTitle(text, category) {
+  const yearMatch = text.match(/\b(19\d{2}|20\d{2})\b/);
+  const year = yearMatch ? yearMatch[1] : "";
+
+  // 1. CAR BRANDS & MODELS
+  if (category === "Cars") {
+    const brands = [
+      "Toyota", "Suzuki", "Hyundai", "Kia", "Honda", "Nissan", "Ford", "Mercedes-Benz", "Mercedes", "Benz",
+      "BMW", "Volkswagen", "VW", "Mitsubishi", "Isuzu", "Chery", "BYD", "Jetour", "Geely", "Mazda", 
+      "Peugeot", "Land Rover", "Range Rover", "Jeep", "Audi", "Chevrolet", "Subaru"
+    ];
+    const models = [
+      "Yaris", "Corolla", "Vitz", "Tucson", "Elantra", "Avante", "Dzire", "Swift", "Celerio", "Alto",
+      "RAV4", "Hilux", "Land Cruiser", "Prado", "Fortuner", "Creta", "Santa Fe", "Sonata", "Accent",
+      "Sportage", "Sorento", "Picanto", "Civic", "CR-V", "D-Max", "Ranger", "Tiggo", "Atto 3", "Dashing",
+      "X70", "CX-5", "E200", "C200", "X5", "Golf"
+    ];
+
+    let foundBrand = "";
+    let foundModel = "";
+
+    for (const b of brands) {
+      if (new RegExp(`\\b${b}\\b`, "i").test(text)) {
+        foundBrand = b;
+        break;
+      }
+    }
+    for (const m of models) {
+      if (new RegExp(`\\b${m}\\b`, "i").test(text)) {
+        foundModel = m;
+        break;
+      }
+    }
+
+    if (foundBrand && foundModel) {
+      return `${foundBrand} ${foundModel} ${year}`.trim();
+    }
+    if (foundBrand) {
+      return `${foundBrand} ${year ? year : "Car"}`.trim();
+    }
+  }
+
+  // 2. ELECTRONICS & PHONES
+  if (category === "Electronics") {
+    const devices = [
+      "iPhone 16 Pro Max", "iPhone 16 Pro", "iPhone 16", "iPhone 15 Pro Max", "iPhone 15 Pro", "iPhone 15",
+      "iPhone 14 Pro Max", "iPhone 14 Pro", "iPhone 14", "iPhone 13 Pro Max", "iPhone 13 Pro", "iPhone 13",
+      "iPhone 12 Pro Max", "iPhone 12 Pro", "iPhone 12", "iPhone 11",
+      "Samsung Galaxy S24 Ultra", "Samsung Galaxy S24", "Samsung Galaxy S23 Ultra", "Samsung S23",
+      "MacBook Pro", "MacBook Air", "iPad Pro", "iPad Air", "HP Victus", "HP Pavilion", "Dell XPS", "Lenovo ThinkPad"
+    ];
+
+    for (const d of devices) {
+      if (new RegExp(d.replace(/\s+/g, "\\s*"), "i").test(text)) {
+        return d;
+      }
+    }
+  }
+
+  // 3. HOUSES & REAL ESTATE
+  if (category === "Houses" || category === "Rentals") {
+    const houseTypes = ["Villa", "Condominium", "Apartment", "G+2", "G+1", "Studio", "Duplex", "ኮንዶሚኒየም", "ቪላ", "አፓርታማ"];
+    for (const h of houseTypes) {
+      if (new RegExp(`\\b${h}\\b`, "i").test(text)) {
+        const city = extractCity(text);
+        return `${h} ${city !== "Addis Ababa" ? city : ""}`.trim();
+      }
+    }
+  }
+
+  // Fallback: Clean first line without spam/promotional prefixes
+  const lines = text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 3 && !/^(urgent|አስቸኳይ|sale|ሽያጭ|for sale|የሚሸጥ|በጣም|አዲስ)/i.test(l));
+
+  let fallbackTitle = lines[0] || "New Listing";
+  if (fallbackTitle.length > 50) fallbackTitle = fallbackTitle.substring(0, 50) + "...";
+  return fallbackTitle;
+}
+
+// ============================================
+// MATHEMATICAL PRICE RULES (3500000 -> 3,500,000)
 // ============================================
 function parseMathematicalPrice(text) {
-  // Rule 1: Million shorthands (e.g. "3.5M", "3.5 million", "3.5 ሚሊዮን", "3.5mln")
+  // Million shorthands (3.5M, 3.5 million, 3.5 ሚሊዮን)
   const millionMatch = text.match(/([\d.]+)\s*(?:million|mil|mln|m|ሚሊዮን)\b/i);
   if (millionMatch) {
     const val = parseFloat(millionMatch[1]);
@@ -235,7 +342,7 @@ function parseMathematicalPrice(text) {
     }
   }
 
-  // Rule 2: Thousand shorthands (e.g. "500k", "500 ሺህ", "500 shi")
+  // Thousand shorthands (500k, 500 ሺህ)
   const thousandMatch = text.match(/([\d.]+)\s*(?:k|thousand|ሺህ|ሺ)\b/i);
   if (thousandMatch) {
     const val = parseFloat(thousandMatch[1]);
@@ -248,27 +355,27 @@ function parseMathematicalPrice(text) {
     }
   }
 
-  // Rule 3: Explicit Price labels (e.g. "Price: 3500000", "ዋጋ: 3500000", "3500000 ETB", "3500000 ብር")
+  // Explicit Price labels (Price: 3500000, ዋጋ 3500000, 3500000 ETB, 3500000 ብር)
   const explicitMatch = text.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
   if (explicitMatch) {
     const digitsOnly = explicitMatch[1].replace(/[.,]/g, "").trim();
     const num = parseInt(digitsOnly, 10);
     if (!isNaN(num) && num > 50) {
       return {
-        formattedPrice: num.toLocaleString("en-US"), // "3,500,000"
+        formattedPrice: num.toLocaleString("en-US"),
         rawPrice: num.toString()
       };
     }
   }
 
-  // Rule 4: Standalone numbers with 4 to 9 digits (e.g. "3500000" or already formatted "3,500,000")
+  // Standalone numbers
   const standaloneMatch = text.match(/\b(\d{1,3}(?:,\d{3})+|\d{4,9})\b/);
   if (standaloneMatch) {
     const digitsOnly = standaloneMatch[1].replace(/[.,]/g, "").trim();
     const num = parseInt(digitsOnly, 10);
     if (!isNaN(num) && num >= 500) {
       return {
-        formattedPrice: num.toLocaleString("en-US"), // "3,500,000"
+        formattedPrice: num.toLocaleString("en-US"),
         rawPrice: num.toString()
       };
     }
@@ -278,7 +385,7 @@ function parseMathematicalPrice(text) {
 }
 
 // ============================================
-// PARALLEL CLOUDINARY UPLOADER
+// PARALLEL CLOUDINARY UPLOADER (ALL PHOTOS)
 // ============================================
 async function uploadImagesToCloudinary(fileIds, env) {
   if (!fileIds || fileIds.length === 0) return [];
@@ -304,7 +411,7 @@ async function uploadImagesToCloudinary(fileIds, env) {
       const cloudData = await cloudRes.json();
       return cloudData.secure_url || null;
     } catch (err) {
-      console.error("Image upload failed for fileId:", fileId, err);
+      console.error("Cloudinary upload failed for fileId:", fileId, err);
       return null;
     }
   });
@@ -314,7 +421,7 @@ async function uploadImagesToCloudinary(fileIds, env) {
 }
 
 // ============================================
-// TEXT CLEANING & EXTRACTION HELPERS
+// CLEANING & HELPER FUNCTIONS
 // ============================================
 function cleanTheText(text) {
   return text
@@ -350,18 +457,6 @@ function extractCity(text) {
   if (/(bahir dar|ባህር ዳር)/i.test(lower)) return "Bahir Dar";
   if (/(dire dawa|ድሬዳዋ)/i.test(lower)) return "Dire Dawa";
   return "Addis Ababa";
-}
-
-function extractTitle(text) {
-  const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 2);
-  let title = lines[0] || "New Listing";
-  if (/(urgent|አስቸኳይ|sale|ሽያጭ|for sale|የሚሸጥ)/i.test(title) && lines.length > 1) {
-    title = lines[1];
-  }
-  if (title.length > 55) {
-    title = title.substring(0, 55) + "...";
-  }
-  return title;
 }
 
 // ============================================
@@ -440,11 +535,15 @@ function base64UrlEncode(str) {
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-function cleanupStaleAlbums() {
-  const twoMinutesAgo = Date.now() - 120000;
+function cleanupMemory() {
+  const threeMinutesAgo = Date.now() - 180000;
   for (const [key, value] of albumCache.entries()) {
-    if (value.timestamp < twoMinutesAgo) {
+    if (value.timestamp < threeMinutesAgo) {
       albumCache.delete(key);
     }
+  }
+  // Keep set memory small
+  if (processedGroups.size > 500) {
+    processedGroups.clear();
   }
 }
