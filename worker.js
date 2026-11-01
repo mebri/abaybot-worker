@@ -1,9 +1,10 @@
-// ============================================================
-// 🤖 TELEGRAM BOT CLOUDFLARE WORKER (CLEANED TEXT + BUSINESS CARD + NO DUPLICATES)
-// ============================================================
+// ========================================================
+// TELEGRAM BOT WORKER - ZERO EMOJIS & NO DUPLICATES
+// Yegna Gebeya (የኛ ገበያ) - @mebrigranite
+// ========================================================
 
 const albumCache = new Map();
-const processedIds = new Set();
+const processedPosts = new Set();
 
 export default {
   async fetch(request, env, ctx) {
@@ -22,24 +23,28 @@ export default {
 };
 
 async function processUpdate(update, env) {
-  // 🚨 1. Ignore Telegram message edits so editing captions doesn't re-trigger
-  if (update.edited_channel_post || update.edited_message) return;
+  // 1. IGNORE EDITED MESSAGES (Prevents loops when bot edits caption)
+  if (update.edited_message || update.edited_channel_post) return;
 
-  const message = update.channel_post || update.message;
+  const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 🚨 2. ANTI-DUPLICATE GUARDS: Ignore auto-forwarded posts from channel to linked discussion group!
-  if (message.is_automatic_forward) return;
-  if (message.forward_date && message.forward_from_chat) return;
+  // 2. IGNORE BOTS
   if (message.from && message.from.is_bot) return;
+
+  // 3. STOP DUPLICATES: Ignore auto-forwarded posts in linked discussion groups
+  if (message.is_automatic_forward || message.forward_from_chat || message.forward_date) {
+    return;
+  }
 
   const text = (message.text || message.caption || "").trim();
 
-  // 🚨 3. COMPLETE ANTI-LOOP: If already formatted with your business card or category, STOP!
+  // 4. ANTI-LOOP: If already has our signature or website, stop immediately!
   if (
-    text.includes("🏢 የኛ ገበያ") ||
-    text.includes("mebri.yegna.workers.dev") ||
+    text.includes("Yegna Gebeya") ||
+    text.includes("የኛ ገበያ") ||
     text.includes("0911680790") ||
+    text.includes("mebri.yegna.workers.dev") ||
     text.includes("@mebrigranite") ||
     text.includes("#Cars") ||
     text.includes("#Houses") ||
@@ -54,49 +59,54 @@ async function processUpdate(update, env) {
     return;
   }
 
-  // Prevent duplicate execution for the same message ID
-  const uniqueKey = `${message.chat.id}_${message.message_id}`;
-  if (processedIds.has(uniqueKey)) return;
-
   // ============================================
-  // ALBUM LOGIC (Multiple Images)
+  // ALBUM LOGIC (Multiple Photos in one post)
   // ============================================
   if (message.media_group_id) {
     const groupId = message.media_group_id;
+    
+    // Check if album was already completed
+    if (processedPosts.has(groupId)) return;
 
     if (!albumCache.has(groupId)) {
-      albumCache.set(groupId, {
-        images: [],
-        firstMessage: text.length > 3 ? message : null,
-        scheduled: false
+      albumCache.set(groupId, { 
+        images: [], 
+        firstMessage: text.length > 2 ? message : null,
+        timerStarted: false
       });
     }
-
+    
     const albumData = albumCache.get(groupId);
-
+    
     if (message.photo && message.photo.length > 0) {
-      const bestPhoto = message.photo[message.photo.length - 1].file_id;
-      if (!albumData.images.includes(bestPhoto)) {
-        albumData.images.push(bestPhoto);
+      const photoId = message.photo[message.photo.length - 1].file_id;
+      if (!albumData.images.includes(photoId)) {
+        albumData.images.push(photoId);
       }
     }
 
-    if (text.length > 3 && !albumData.firstMessage) {
+    if (text.length > 2 && !albumData.firstMessage) {
       albumData.firstMessage = message;
     }
 
-    if (!albumData.scheduled) {
-      albumData.scheduled = true;
+    // Start 2.5 second buffer only once per album
+    if (!albumData.timerStarted) {
+      albumData.timerStarted = true;
       await new Promise(resolve => setTimeout(resolve, 2500));
-
+      
       if (!albumCache.has(groupId)) return;
       const finalData = albumCache.get(groupId);
       albumCache.delete(groupId);
-      processedIds.add(uniqueKey);
+      processedPosts.add(groupId);
+      
+      if (processedPosts.size > 500) {
+        const first = processedPosts.values().next().value;
+        processedPosts.delete(first);
+      }
 
       await processFinalAd(
-        finalData.firstMessage || message,
-        finalData.images,
+        finalData.firstMessage || message, 
+        finalData.images, 
         env,
         groupId
       );
@@ -108,8 +118,11 @@ async function processUpdate(update, env) {
   // SINGLE IMAGE OR TEXT-ONLY LOGIC
   // ============================================
   if (text.length < 3) return;
+  
+  const singleKey = `${message.chat.id}_${message.message_id}`;
+  if (processedPosts.has(singleKey)) return;
+  processedPosts.add(singleKey);
 
-  processedIds.add(uniqueKey);
   const images = [];
   if (message.photo && message.photo.length > 0) {
     images.push(message.photo[message.photo.length - 1].file_id);
@@ -119,90 +132,74 @@ async function processUpdate(update, env) {
 }
 
 // ============================================
-// MAIN PROCESSING FUNCTION
+// MAIN PROCESSING FUNCTION (ZERO EMOJIS)
 // ============================================
 async function processFinalAd(message, imageFileIds, env, mediaGroupId) {
-  const messageText = (message.text || message.caption || "").trim();
-  const cleanText = cleanTheText(messageText);
+  const rawText = (message.text || message.caption || "").trim();
+  const cleanText = cleanTheText(rawText); // 100% emojis stripped
   const category = detectCategory(cleanText);
   const { title, price } = extractTitleAndPrice(cleanText);
 
-  // 1. Upload ALL images to Cloudinary in parallel
-  const uploadPromises = imageFileIds.map(async (fileId) => {
+  // 1. Upload ALL images to Cloudinary
+  const imageUrls = [];
+  for (const fileId of imageFileIds) {
     try {
-      const fileRes = await fetch(
-        `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`
-      );
+      const fileRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`);
       const fileInfo = await fileRes.json();
-      if (!fileInfo.ok) return null;
+      if (fileInfo.ok) {
+        const imgRes = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`);
+        const blob = await imgRes.blob();
+        const formData = new FormData();
+        formData.append("file", blob);
+        formData.append("upload_preset", env.CLOUDINARY_UPLOAD_PRESET);
+        const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/image/upload`, { 
+          method: "POST", 
+          body: formData 
+        });
+        const cloudData = await cloudRes.json();
+        if (cloudData.secure_url) {
+          imageUrls.push(cloudData.secure_url);
+        }
+      }
+    } catch (e) {}
+  }
 
-      const imgRes = await fetch(
-        `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`
-      );
-      const blob = await imgRes.blob();
-
-      const formData = new FormData();
-      formData.append("file", blob);
-      formData.append("upload_preset", env.CLOUDINARY_UPLOAD_PRESET);
-
-      const cloudRes = await fetch(
-        `https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/image/upload`,
-        { method: "POST", body: formData }
-      );
-      const cloudData = await cloudRes.json();
-      return cloudData.secure_url || null;
-    } catch {
-      return null;
-    }
-  });
-
-  const uploadResults = await Promise.all(uploadPromises);
-  const imageUrls = uploadResults.filter(Boolean);
-
-  // 2. Deterministic Document ID in Firestore:
-  // ⚡ CRITICAL FIX: Using PATCH with fixed docId guarantees NO DUPLICATE documents in Firestore!
-  const docId = mediaGroupId
-    ? `tg_album_${mediaGroupId}`
-    : `tg_post_${message.chat.id}_${message.message_id}`;
-
+  // 2. Save to Firebase (DEDUPLICATED VIA DETERMINISTIC DOCUMENT ID)
   const token = await getFirebaseToken(env);
   const projectId = env.FIREBASE_PROJECT_ID;
-  const adOwnerId = env.ADMIN_UID || "admin_bot";
+  const adOwnerId = env.ADMIN_UID || "admin_bot"; 
 
   const adData = {
     fields: {
       title: { stringValue: title },
-      description: { stringValue: cleanText },
+      description: { stringValue: cleanText }, 
       price: { stringValue: price || "0" },
-      phone: { stringValue: "0911680790" },
+      phone: { stringValue: "0911680790" }, 
       city: { stringValue: "" },
       category: { stringValue: category },
       image: { stringValue: imageUrls.length > 0 ? imageUrls[0] : "" },
-      images: {
-        arrayValue: {
-          values: imageUrls.map((url) => ({ stringValue: url }))
-        }
-      },
-      status: { stringValue: "available" },
+      images: { arrayValue: imageUrls.length > 0 ? { values: imageUrls.map(url => ({ stringValue: url })) } : { values: [] } },
+      status: { stringValue: "available" }, 
       source: { stringValue: "telegram" },
-      telegramPostId: { stringValue: String(message.message_id) },
-      userId: { stringValue: adOwnerId },
+      userId: { stringValue: adOwnerId }, 
       views: { integerValue: "0" },
-      createdAt: { timestampValue: new Date().toISOString() }
-    }
+      createdAt: { timestampValue: new Date().toISOString() },
+    },
   };
+
+  // Deterministic docId guarantees zero duplicates even if worker retries
+  const docId = mediaGroupId
+    ? `album_${mediaGroupId}`
+    : `msg_${Math.abs(message.chat.id)}_${message.message_id}`;
 
   const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
   await fetch(fbUrl, {
     method: "PATCH",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(adData)
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(adData),
   });
 
-  // 3. Build the Telegram Message (Cleaned text + Business Card + Links)
+  // 3. Build Telegram Repost (ZERO EMOJIS - PLAIN TEXT ONLY)
   let hashtag = "#Other";
   if (category === "Cars") hashtag = "#Cars";
   else if (category === "Houses") hashtag = "#Houses";
@@ -213,109 +210,105 @@ async function processFinalAd(message, imageFileIds, env, mediaGroupId) {
   else if (category === "Labor & Services") hashtag = "#Labor";
   else if (category === "ምንአለሽ ተራ") hashtag = "#ምንአለሽ_ተራ";
 
-  let safeDetails = cleanText.substring(0, 500);
+  let safeDetails = cleanText.substring(0, 500); 
   if (cleanText.length > 500) safeDetails += "...";
 
-  let newPostText = `📝 Title: ${title}\n`;
-  if (price && price !== "0") newPostText += `💰 Price: ${price} ETB\n`;
-  newPostText += `\n📄 Details:\n${safeDetails}\n\n`;
-  newPostText += `━━━━━━━━━━━━━━━\n`;
-  newPostText += `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
-  newPostText += `📞 Phone: 0911680790\n`;
-  newPostText += `🌐 Website: mebri.yegna.workers.dev\n`;
-  newPostText += `✈️ Telegram: @mebrigranite\n`;
-  newPostText += `━━━━━━━━━━━━━━━\n\n`;
-  newPostText += `${hashtag}`;
+  let newPostText = `Title: ${title}\n`;
+  if (price && price !== "0") newPostText += `Price: ${price} ETB\n`;
+  newPostText += `\nDetails:\n${safeDetails}\n\n`;
+  newPostText += `-------------------------------\n`;
+  newPostText += `Yegna Gebeya (የኛ ገበያ)\n`;
+  newPostText += `Phone: 0911680790\n`;
+  newPostText += `Website: mebri.yegna.workers.dev\n`;
+  newPostText += `Telegram: @mebrigranite\n`;
+  newPostText += `-------------------------------\n\n`;
+  newPostText += `${hashtag}`; 
 
-  // 4. Edit caption/text in Telegram
+  // 4. Edit message caption in Telegram (Zero emojis = no Telegram API errors)
   try {
     if (message.photo && message.photo.length > 0) {
-      await fetch(
-        `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageCaption`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            chat_id: message.chat.id,
-            message_id: message.message_id,
-            caption: newPostText.substring(0, 1024)
-          })
-        }
-      );
+      await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageCaption`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+          chat_id: message.chat.id, 
+          message_id: message.message_id,
+          caption: newPostText.substring(0, 1024)
+        }),
+      });
     } else {
-      await fetch(
-        `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageText`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            chat_id: message.chat.id,
-            message_id: message.message_id,
-            text: newPostText.substring(0, 4096)
-          })
-        }
-      );
+      await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageText`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+          chat_id: message.chat.id, 
+          message_id: message.message_id,
+          text: newPostText.substring(0, 4096)
+        }),
+      });
     }
-  } catch {}
+  } catch (err) {}
 }
 
 // ============================================
-// CLEAN THE TEXT (Strips spam, emojis, links)
+// HELPER: STRIP 100% OF EMOJIS & SYMBOLS
 // ============================================
 function cleanTheText(text) {
-  let cleanText = text;
-  cleanText = cleanText.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{2700}-\u{27BF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu, "");
-  cleanText = cleanText.replace(/[*_~`|]/g, "");
-  cleanText = cleanText.replace(/https?:\/\/[^\s]+/gi, "");
-  cleanText = cleanText.replace(/t\.me\/[^\s]+/gi, "");
-  cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
-  cleanText = cleanText.replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "(Phone Hidden)");
-  cleanText = cleanText.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
-  return cleanText;
+  let clean = text;
+  // Strips all emojis, symbols, and formatting
+  clean = clean.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{2700}-\u{27BF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}\u{1F300}-\u{1F5FF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{1F900}-\u{1F9FF}\u{1FA70}-\u{1FAFF}]/gu, "");
+  clean = clean.replace(/[*_~|`]/g, "");
+  clean = clean.replace(/https?:\/\/[^\s]+/gi, "");
+  clean = clean.replace(/t\.me\/[^\s]+/gi, "");
+  clean = clean.replace(/@[a-zA-Z0-9_]+/g, "");
+  clean = clean.replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "(Phone Hidden)");
+  clean = clean.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
+  return clean;
 }
 
 // ============================================
-// CATEGORY DETECTION (Matches Website)
+// CATEGORY DETECTION
 // ============================================
 function detectCategory(text) {
-  const lowerText = text.toLowerCase();
-  if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|elantra|avante|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር|byd|corolla|yaris|vitz|rav4)/i.test(lowerText)) {
-    return "Cars";
-  }
-  if (/(house|villa|condominium|condo|g\+1|g\+2|real estate|compound|ቤት|ቪላ|ኮንዶሚኒየም|ሪል እስቴት)/i.test(lowerText)) {
-    return "Houses";
-  }
-  if (/(apartment|office|shop|rent|lease|hall|warehouse|አፓርታማ|ቢሮ|ሱቅ|ኪራይ|መጋዘን)/i.test(lowerText)) {
-    return "Rentals";
-  }
-  if (/(iphone|samsung|laptop|computer|macbook|tv|camera|phone|ipad|ስልክ|ላፕቶፕ|ኮምፒውተር|ቴሌቪዥን)/i.test(lowerText)) {
-    return "Electronics";
-  }
-  if (/(sofa|bed|table|chair|cupboard|wardrobe|furniture|ሶፋ|አልጋ|ጠረጴዛ|ወንበር|ቁምሳጥን|ፈርኒቸር)/i.test(lowerText)) {
-    return "Furniture";
-  }
-  if (/(jacket|shoes|dress|suit|t-shirt|clothes|ጫማ|ጃኬት|ቀሚስ|ልብስ)/i.test(lowerText)) {
-    return "Clothes";
-  }
-  if (/(plumber|electrician|painter|mechanic|driver|cleaner|service|ቧንቧ|ኤሌክትሪክ|ቀለም|ሹፌር|ሰርቪስ)/i.test(lowerText)) {
-    return "Labor & Services";
-  }
+  const lower = text.toLowerCase();
+  if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|elantra|avante|byd|corolla|yaris|vitz|rav4|chery|tiggo|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ባይድ|ተሽከርካሪ)/i.test(lower)) return "Cars";
+  if (/(house|villa|condominium|condo|g\+1|g\+2|real estate|compound|ቤት|ቪላ|ኮንዶሚኒየም|ሪል እስቴት)/i.test(lower)) return "Houses";
+  if (/(apartment|office|shop|rent|lease|hall|warehouse|አፓርታማ|ቢሮ|ሱቅ|ኪራይ|መጋዘን)/i.test(lower)) return "Rentals";
+  if (/(iphone|samsung|laptop|computer|macbook|tv|camera|phone|ipad|ስልክ|ላፕቶፕ|ኮምፒውተር|ቴሌቪዥን)/i.test(lower)) return "Electronics";
+  if (/(sofa|bed|table|chair|cupboard|wardrobe|furniture|ሶፋ|አልጋ|ጠረጴዛ|ወንበር|ቁምሳጥን|ፈርኒቸር)/i.test(lower)) return "Furniture";
+  if (/(jacket|shoes|dress|suit|t-shirt|clothes|ጫማ|ጃኬት|ቀሚስ|ልብስ)/i.test(lower)) return "Clothes";
+  if (/(plumber|electrician|painter|mechanic|driver|cleaner|service|ቧንቧ|ኤሌክትሪክ|ቀለም|ሹፌር|ሰርቪስ)/i.test(lower)) return "Labor & Services";
   return "ምንአለሽ ተራ";
 }
 
+// ============================================
+// TITLE & PRICE (WITH COMMA FORMATTING)
+// ============================================
 function extractTitleAndPrice(text) {
   const brands = [
-    "Toyota", "Suzuki", "Hyundai", "Honda", "BYD", "Mercedes-Benz", "Benz",
-    "BMW", "Nissan", "Ford", "Kia", "Chery", "Geely", "Volkswagen", "Audi",
-    "Mitsubishi", "Mazda", "Land Rover", "Lexus", "Isuzu", "Lifan"
+    { en: "Toyota", am: "ቶዮታ" },
+    { en: "Suzuki", am: "ሱዙኪ" },
+    { en: "Hyundai", am: "ሀዩንዳይ" },
+    { en: "BYD", am: "ባይድ" },
+    { en: "Mercedes-Benz", am: "መርሰዲስ" },
+    { en: "BMW", am: "ቢኤምደብሊው" },
+    { en: "Honda", am: "ሆንዳ" },
+    { en: "Chery", am: "ቼሪ" },
+    { en: "Kia", am: "ኪያ" },
+    { en: "Nissan", am: "ኒሳን" },
+    { en: "Volkswagen", am: "ቮልስዋገን" },
+    { en: "Ford", am: "ፎርድ" },
+    { en: "Mitsubishi", am: "ሚትሱቢሺ" },
+    { en: "Mazda", am: "ማዝዳ" },
+    { en: "Lifan", am: "ሊፋን" }
   ];
   
   const models = [
-    "Corolla", "Yaris", "Vitz", "RAV4", "Prado", "Land Cruiser", "Hilux", "Camry",
-    "Swift", "Dzire", "Celerio", "Alto", "Vitara", "Tucson", "Elantra", "Avante",
-    "Santa Fe", "Sonata", "Accent", "Creta", "Atos", "Civic", "CR-V", "Fit",
-    "C-Class", "E-Class", "S-Class", "Dolphin", "Atto 3", "Song", "Qin", "Han",
-    "Tiggo", "Arrizo", "Ranger", "Explorer", "Sportage", "Sorento", "Picanto"
+    "Corolla", "ኮሮላ", "Yaris", "ያሪስ", "Vitz", "ቪትዝ", "RAV4", "ራቭ4", "Prado", "ፕራዶ",
+    "Land Cruiser", "Hilux", "ሃይሉክስ", "Swift", "ስዊፍት", "Dzire", "ዲዛይር", "Celerio",
+    "Alto", "አልቶ", "Vitara", "Tucson", "ቱክሰን", "Elantra", "ኢላንትራ", "Avante", "አቫንቴ",
+    "Santa Fe", "Sonata", "Accent", "Dolphin", "Atto 3", "Song", "Qin", "Han",
+    "Tiggo", "ቲጎ", "Camry", "ካምሪ"
   ];
 
   let detectedBrand = "";
@@ -323,16 +316,14 @@ function extractTitleAndPrice(text) {
   let detectedYear = "";
 
   for (const b of brands) {
-    const rx = new RegExp(`\\b${b}\\b`, "i");
-    if (rx.test(text)) {
-      detectedBrand = b;
+    if (new RegExp(`\\b(${b.en}|${b.am})\\b`, "i").test(text)) {
+      detectedBrand = b.en;
       break;
     }
   }
 
   for (const m of models) {
-    const rx = new RegExp(`\\b${m}\\b`, "i");
-    if (rx.test(text)) {
+    if (new RegExp(`\\b${m}\\b`, "i").test(text)) {
       detectedModel = m;
       break;
     }
@@ -345,11 +336,16 @@ function extractTitleAndPrice(text) {
   if (detectedBrand) {
     title = [detectedBrand, detectedModel, detectedYear].filter(Boolean).join(" ");
   } else {
-    const lines = text.split("\n").map(l => l.trim()).filter(l => l.length > 2 && !l.startsWith("#"));
+    // Skip hashtags and generic words like "urgent" or "አስቸኳይ"
+    const lines = text
+      .split("\n")
+      .map(l => l.trim().replace(/^#+/, "").trim())
+      .filter(l => l.length > 2 && !/^(urgent|አስቸኳይ|sale|የሚሸጥ|ቀጥታ|ቀጥታለውይበትን)$/i.test(l));
+    
     title = lines[0] ? lines[0].substring(0, 40) : "Featured Item";
   }
 
-  // Price formatting with commas (e.g. 2,850,000)
+  // Comma-formatted Price: 3500000 -> 3,500,000
   let price = "0";
   const priceMatches = text.match(/(?:ዋጋ|price|etb|ብር)?\s*[:=-]?\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{4,10})\s*(?:ብር|etb|birr)?/i);
   if (priceMatches && priceMatches[1]) {
@@ -363,6 +359,9 @@ function extractTitleAndPrice(text) {
   return { title, price };
 }
 
+// ============================================
+// GOOGLE CLOUD OAUTH2 JWT FOR FIRESTORE
+// ============================================
 async function getFirebaseToken(env) {
   const sa = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT);
   const now = Math.floor(Date.now() / 1000);
