@@ -1,5 +1,5 @@
 // ========================================================
-// TELEGRAM BOT WORKER - ZERO EMOJIS & NO DUPLICATES
+// TELEGRAM BOT WORKER - 100% ZERO EMOJI & NO DUPLICATES
 // Yegna Gebeya (የኛ ገበያ) - @mebrigranite
 // ========================================================
 
@@ -65,7 +65,6 @@ async function processUpdate(update, env) {
   if (message.media_group_id) {
     const groupId = message.media_group_id;
     
-    // Check if album was already completed
     if (processedPosts.has(groupId)) return;
 
     if (!albumCache.has(groupId)) {
@@ -254,16 +253,33 @@ async function processFinalAd(message, imageFileIds, env, mediaGroupId) {
 // HELPER: STRIP 100% OF EMOJIS & SYMBOLS
 // ============================================
 function cleanTheText(text) {
+  if (!text) return "";
   let clean = text;
-  // Strips all emojis, symbols, and formatting
-  clean = clean.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{2700}-\u{27BF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}\u{1F300}-\u{1F5FF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{1F900}-\u{1F9FF}\u{1FA70}-\u{1FAFF}]/gu, "");
-  clean = clean.replace(/[*_~|`]/g, "");
+
+  // 1. Remove all Unicode emoji categories (Extended_Pictographic)
+  clean = clean.replace(/\p{Extended_Pictographic}/gu, "");
+  clean = clean.replace(/\p{Emoji_Presentation}/gu, "");
+  clean = clean.replace(/[\uFE00-\uFE0F\u200D\u20E3]/g, "");
+
+  // 2. Remove Dingbats, Box Drawing (══, ▬▬), Geometric shapes, Arrows
+  clean = clean.replace(/[\u2190-\u21FF\u2300-\u23FF\u2460-\u24FF\u2500-\u257F\u2580-\u259F\u25A0-\u25FF\u2600-\u27BF\u2900-\u297F\u2B00-\u2BFF\u3030\u3200-\u32FF]/gu, "");
+
+  // 3. Remove Markdown & decorative divider symbols
+  clean = clean.replace(/[*_~|═▬]/g, "").replace(/\x60/g, "");
+
+  // 4. Remove external links, telegram channels & usernames
   clean = clean.replace(/https?:\/\/[^\s]+/gi, "");
   clean = clean.replace(/t\.me\/[^\s]+/gi, "");
   clean = clean.replace(/@[a-zA-Z0-9_]+/g, "");
+
+  // 5. Hide other phone numbers
   clean = clean.replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "(Phone Hidden)");
-  clean = clean.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
-  return clean;
+
+  // 6. Clean whitespace & empty lines
+  const lines = clean.split("\n")
+    .map(line => line.trim())
+    .filter(line => line.length > 0 && !/^[-=._:;!?, ]+$/.test(line));
+  return lines.join("\n").trim();
 }
 
 // ============================================
@@ -271,7 +287,7 @@ function cleanTheText(text) {
 // ============================================
 function detectCategory(text) {
   const lower = text.toLowerCase();
-  if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|elantra|avante|byd|corolla|yaris|vitz|rav4|chery|tiggo|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ባይድ|ተሽከርካሪ)/i.test(lower)) return "Cars";
+  if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|elantra|avante|byd|sealion|corolla|yaris|vitz|rav4|chery|tiggo|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ባይድ|ተሽከርካሪ)/i.test(lower)) return "Cars";
   if (/(house|villa|condominium|condo|g\+1|g\+2|real estate|compound|ቤት|ቪላ|ኮንዶሚኒየም|ሪል እስቴት)/i.test(lower)) return "Houses";
   if (/(apartment|office|shop|rent|lease|hall|warehouse|አፓርታማ|ቢሮ|ሱቅ|ኪራይ|መጋዘን)/i.test(lower)) return "Rentals";
   if (/(iphone|samsung|laptop|computer|macbook|tv|camera|phone|ipad|ስልክ|ላፕቶፕ|ኮምፒውተር|ቴሌቪዥን)/i.test(lower)) return "Electronics";
@@ -285,6 +301,20 @@ function detectCategory(text) {
 // TITLE & PRICE (WITH COMMA FORMATTING)
 // ============================================
 function extractTitleAndPrice(text) {
+  let detectedBrand = "";
+  let detectedModel = "";
+  let detectedYear = "";
+
+  // 1. Direct field matches (Make: BYD, Model: Sealion 06 Ev, Year: 2025)
+  const makeMatch = text.match(/(?:make|የመኪናው\s*ዓይነት)\s*[:=-]\s*([a-zA-Z0-9_-]+)/i);
+  if (makeMatch && makeMatch[1]) detectedBrand = makeMatch[1].trim();
+
+  const modelMatch = text.match(/(?:model|ሞዴል)\s*[:=-]\s*([a-zA-Z0-9 _-]+)/i);
+  if (modelMatch && modelMatch[1]) detectedModel = modelMatch[1].trim();
+
+  const yearMatch = text.match(/(?:year|ሞዴል\s*ዓመት)\s*[:=-]?\s*(20[0-2][0-9]|19[89][0-9])/i) || text.match(/\b(20[0-2][0-9]|19[89][0-9])\b/);
+  if (yearMatch && yearMatch[1]) detectedYear = yearMatch[1].trim();
+
   const brands = [
     { en: "Toyota", am: "ቶዮታ" },
     { en: "Suzuki", am: "ሱዙኪ" },
@@ -304,53 +334,49 @@ function extractTitleAndPrice(text) {
   ];
   
   const models = [
+    "Sealion", "Seagull", "Song", "Qin", "Han", "Tang", "Yuan", "Dolphin", "Atto 3", "Seal",
     "Corolla", "ኮሮላ", "Yaris", "ያሪስ", "Vitz", "ቪትዝ", "RAV4", "ራቭ4", "Prado", "ፕራዶ",
     "Land Cruiser", "Hilux", "ሃይሉክስ", "Swift", "ስዊፍት", "Dzire", "ዲዛይር", "Celerio",
     "Alto", "አልቶ", "Vitara", "Tucson", "ቱክሰን", "Elantra", "ኢላንትራ", "Avante", "አቫንቴ",
-    "Santa Fe", "Sonata", "Accent", "Dolphin", "Atto 3", "Song", "Qin", "Han",
-    "Tiggo", "ቲጎ", "Camry", "ካምሪ"
+    "Santa Fe", "Sonata", "Accent", "Tiggo", "ቲጎ", "Camry", "ካምሪ"
   ];
 
-  let detectedBrand = "";
-  let detectedModel = "";
-  let detectedYear = "";
-
-  for (const b of brands) {
-    if (new RegExp(`\\b(${b.en}|${b.am})\\b`, "i").test(text)) {
-      detectedBrand = b.en;
-      break;
+  if (!detectedBrand) {
+    for (const b of brands) {
+      if (new RegExp(`\\b(${b.en}|${b.am})\\b`, "i").test(text)) {
+        detectedBrand = b.en;
+        break;
+      }
     }
   }
 
-  for (const m of models) {
-    if (new RegExp(`\\b${m}\\b`, "i").test(text)) {
-      detectedModel = m;
-      break;
+  if (!detectedModel) {
+    for (const m of models) {
+      if (new RegExp(`\\b${m}\\b`, "i").test(text)) {
+        detectedModel = m;
+        break;
+      }
     }
   }
-
-  const yearMatch = text.match(/\b(199\d|200\d|201\d|202\d)\b/);
-  if (yearMatch) detectedYear = yearMatch[1];
 
   let title = "";
   if (detectedBrand) {
     title = [detectedBrand, detectedModel, detectedYear].filter(Boolean).join(" ");
   } else {
-    // Skip hashtags and generic words like "urgent" or "አስቸኳይ"
-    const lines = text
+    const cleanLines = text
       .split("\n")
       .map(l => l.trim().replace(/^#+/, "").trim())
-      .filter(l => l.length > 2 && !/^(urgent|አስቸኳይ|sale|የሚሸጥ|ቀጥታ|ቀጥታለውይበትን)$/i.test(l));
+      .filter(l => l.length > 2 && !/^(urgent|very urgent|sale|አስቸኳይ|የሚሸጥ|ቀጥታ|ቀጥታለውይበትን)$/i.test(l));
     
-    title = lines[0] ? lines[0].substring(0, 40) : "Featured Item";
+    title = cleanLines[0] ? cleanLines[0].substring(0, 40) : "Featured Item";
   }
 
-  // Comma-formatted Price: 3500000 -> 3,500,000
+  // Comma-formatted Price: 7.400,000 -> 7,400,000 ETB
   let price = "0";
-  const priceMatches = text.match(/(?:ዋጋ|price|etb|ብር)?\s*[:=-]?\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{4,10})\s*(?:ብር|etb|birr)?/i);
-  if (priceMatches && priceMatches[1]) {
-    const rawDigits = priceMatches[1].replace(/,/g, "");
-    const num = parseInt(rawDigits, 10);
+  const fullMatch = text.match(/(?:ዋጋ|price|etb|ብር)?\s*[:=-]?\s*([0-9]{1,3}(?:[.,][0-9]{3}){1,3}|[0-9]{5,10})\s*(?:ብር|etb|birr|million)?/i);
+  if (fullMatch && fullMatch[1]) {
+    const cleanDigits = fullMatch[1].replace(/[.,]/g, "");
+    const num = parseInt(cleanDigits, 10);
     if (!isNaN(num) && num > 100) {
       price = num.toLocaleString("en-US");
     }
