@@ -1,5 +1,5 @@
 // ============================================================
-// 🤖 TELEGRAM BOT CLOUDFLARE WORKER (DEDUPLICATED & CATEGORIZED)
+// 🤖 TELEGRAM BOT CLOUDFLARE WORKER (CLEANED TEXT + BUSINESS CARD + NO DUPLICATES)
 // ============================================================
 
 const albumCache = new Map();
@@ -22,23 +22,25 @@ export default {
 };
 
 async function processUpdate(update, env) {
-  // 🚨 1. ONLY LISTEN TO CHANNEL POSTS (Blocks discussion group duplicate forwards!)
-  // If you also want direct user messages to the bot, remove this line.
+  // 🚨 1. Ignore Telegram message edits so editing captions doesn't re-trigger
+  if (update.edited_channel_post || update.edited_message) return;
+
   const message = update.channel_post || update.message;
   if (!message) return;
 
-  // 🚨 2. ANTI-DUPLICATE: Ignore Telegram automatic group forwards and edits
+  // 🚨 2. ANTI-DUPLICATE GUARDS: Ignore auto-forwarded posts from channel to linked discussion group!
   if (message.is_automatic_forward) return;
   if (message.forward_date && message.forward_from_chat) return;
-  if (update.edited_channel_post || update.edited_message) return;
   if (message.from && message.from.is_bot) return;
 
   const text = (message.text || message.caption || "").trim();
 
-  // 🚨 3. COMPLETE ANTI-LOOP: If already categorized with our business card or hashtags, STOP!
+  // 🚨 3. COMPLETE ANTI-LOOP: If already formatted with your business card or category, STOP!
   if (
     text.includes("🏢 የኛ ገበያ") ||
     text.includes("mebri.yegna.workers.dev") ||
+    text.includes("0911680790") ||
+    text.includes("@mebrigranite") ||
     text.includes("#Cars") ||
     text.includes("#Houses") ||
     text.includes("#Rentals") ||
@@ -158,7 +160,7 @@ async function processFinalAd(message, imageFileIds, env, mediaGroupId) {
   const imageUrls = uploadResults.filter(Boolean);
 
   // 2. Deterministic Document ID in Firestore:
-  // ⚡ CRITICAL: Using PATCH with a fixed docId makes duplicate creation impossible!
+  // ⚡ CRITICAL FIX: Using PATCH with fixed docId guarantees NO DUPLICATE documents in Firestore!
   const docId = mediaGroupId
     ? `tg_album_${mediaGroupId}`
     : `tg_post_${message.chat.id}_${message.message_id}`;
@@ -183,6 +185,7 @@ async function processFinalAd(message, imageFileIds, env, mediaGroupId) {
       },
       status: { stringValue: "available" },
       source: { stringValue: "telegram" },
+      telegramPostId: { stringValue: String(message.message_id) },
       userId: { stringValue: adOwnerId },
       views: { integerValue: "0" },
       createdAt: { timestampValue: new Date().toISOString() }
@@ -199,7 +202,7 @@ async function processFinalAd(message, imageFileIds, env, mediaGroupId) {
     body: JSON.stringify(adData)
   });
 
-  // 3. Build the Telegram Message (With Category Hashtag)
+  // 3. Build the Telegram Message (Cleaned text + Business Card + Links)
   let hashtag = "#Other";
   if (category === "Cars") hashtag = "#Cars";
   else if (category === "Houses") hashtag = "#Houses";
@@ -224,7 +227,7 @@ async function processFinalAd(message, imageFileIds, env, mediaGroupId) {
   newPostText += `━━━━━━━━━━━━━━━\n\n`;
   newPostText += `${hashtag}`;
 
-  // 4. Edit message in Telegram
+  // 4. Edit caption/text in Telegram
   try {
     if (message.photo && message.photo.length > 0) {
       await fetch(
@@ -257,8 +260,22 @@ async function processFinalAd(message, imageFileIds, env, mediaGroupId) {
 }
 
 // ============================================
-// EXACT WEBSITE CATEGORY MATCHING
-// Matches PostAd.jsx and Cars.jsx exactly!
+// CLEAN THE TEXT (Strips spam, emojis, links)
+// ============================================
+function cleanTheText(text) {
+  let cleanText = text;
+  cleanText = cleanText.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{2700}-\u{27BF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu, "");
+  cleanText = cleanText.replace(/[*_~`|]/g, "");
+  cleanText = cleanText.replace(/https?:\/\/[^\s]+/gi, "");
+  cleanText = cleanText.replace(/t\.me\/[^\s]+/gi, "");
+  cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
+  cleanText = cleanText.replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "(Phone Hidden)");
+  cleanText = cleanText.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
+  return cleanText;
+}
+
+// ============================================
+// CATEGORY DETECTION (Matches Website)
 // ============================================
 function detectCategory(text) {
   const lowerText = text.toLowerCase();
@@ -332,7 +349,7 @@ function extractTitleAndPrice(text) {
     title = lines[0] ? lines[0].substring(0, 40) : "Featured Item";
   }
 
-  // Price with comma formatting (e.g. 2,850,000)
+  // Price formatting with commas (e.g. 2,850,000)
   let price = "0";
   const priceMatches = text.match(/(?:ዋጋ|price|etb|ብር)?\s*[:=-]?\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{4,10})\s*(?:ብር|etb|birr)?/i);
   if (priceMatches && priceMatches[1]) {
@@ -344,18 +361,6 @@ function extractTitleAndPrice(text) {
   }
 
   return { title, price };
-}
-
-function cleanTheText(text) {
-  let cleanText = text;
-  cleanText = cleanText.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{2700}-\u{27BF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu, "");
-  cleanText = cleanText.replace(/[*_~`|]/g, "");
-  cleanText = cleanText.replace(/https?:\/\/[^\s]+/gi, "");
-  cleanText = cleanText.replace(/t\.me\/[^\s]+/gi, "");
-  cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
-  cleanText = cleanText.replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "(Phone Hidden)");
-  cleanText = cleanText.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
-  return cleanText;
 }
 
 async function getFirebaseToken(env) {
