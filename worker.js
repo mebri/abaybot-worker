@@ -1,10 +1,11 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
- * Fixes:
- * 1. Zero Duplicate Ads in Firestore (Deterministic Document ID via PATCH)
- * 2. Smart Title: Automatically extracts Brand + Model + Year
- * 3. Captures ALL Album Photos (Full gallery saved to Firestore and Telegram)
- * 4. Mathematical Price Formatting (3500000 -> 3,500,000 ETB)
+ * 
+ * FIXES:
+ * 1. ZERO DUPLICATES: Uses deterministic Document IDs with Firestore PATCH
+ * 2. SMART TITLE: Automatically extracts Brand + Model + Year (No hashtags or "urgent")
+ * 3. FULL ALBUM GALLERY: Collects all album images into Firestore images array
+ * 4. MATHEMATICAL PRICES: 2380000 -> 2,380,000 ETB / 17000000 -> 17,000,000 ETB
  */
 
 const albumCache = new Map();
@@ -15,7 +16,7 @@ let tokenExpiresAt = 0;
 export default {
   async fetch(request, env, ctx) {
     if (request.method !== "POST") {
-      return new Response("Bot is active & running ✅", { status: 200 });
+      return new Response("Bot is running ✅", { status: 200 });
     }
 
     try {
@@ -37,7 +38,7 @@ async function processUpdate(update, env) {
 
   const rawText = (message.text || message.caption || "").trim();
 
-  // 2. Anti-Loop Protection (Ignore already processed posts)
+  // 2. Anti-Loop: Skip if message was already edited by bot
   if (
     rawText.includes("የኛ ገበያ") ||
     rawText.includes("@mebrigranite") ||
@@ -47,18 +48,18 @@ async function processUpdate(update, env) {
   }
 
   // ============================================
-  // ALBUM HANDLING (Collect ALL Photos)
+  // ALBUM PROCESSING (Multiple Photos)
   // ============================================
   if (message.media_group_id) {
     const groupId = message.media_group_id;
 
-    // If album was already uploaded, stop duplicate executions immediately
+    // Prevent duplicate processing of the same media group
     if (processedGroups.has(groupId)) return;
 
     if (!albumCache.has(groupId)) {
       albumCache.set(groupId, {
         images: [],
-        firstMessage: rawText.length > 3 ? message : null,
+        firstMessage: rawText.length > 2 ? message : null,
         timerStarted: false,
         timestamp: Date.now()
       });
@@ -66,7 +67,7 @@ async function processUpdate(update, env) {
 
     const album = albumCache.get(groupId);
 
-    // Collect highest quality photo file_id from each chunk
+    // Collect highest resolution photo file_id from each webhook
     if (message.photo && message.photo.length > 0) {
       const bestPhoto = message.photo[message.photo.length - 1].file_id;
       if (!album.images.includes(bestPhoto)) {
@@ -74,17 +75,16 @@ async function processUpdate(update, env) {
       }
     }
 
-    // Save message containing caption text
-    if (rawText.length > 3 && !album.firstMessage) {
+    // Save message with text caption
+    if (rawText.length > 2 && !album.firstMessage) {
       album.firstMessage = message;
     }
 
-    // Wait 3.5s to ensure ALL photos in the Telegram album arrive
+    // Wait 4 seconds so ALL photos in the Telegram album arrive
     if (!album.timerStarted) {
       album.timerStarted = true;
-      await new Promise((resolve) => setTimeout(resolve, 3500));
+      await new Promise((resolve) => setTimeout(resolve, 4000));
 
-      // Mark group as processed to kill duplicate runs
       processedGroups.add(groupId);
 
       const finalAlbum = albumCache.get(groupId);
@@ -105,7 +105,7 @@ async function processUpdate(update, env) {
   }
 
   // ============================================
-  // SINGLE IMAGE OR TEXT-ONLY POST
+  // SINGLE PHOTO OR TEXT POST
   // ============================================
   if (rawText.length < 3) return;
 
@@ -125,22 +125,23 @@ async function processFinalAd(message, imageFileIds, groupId, env) {
   const cleanText = cleanTheText(messageText);
   const category = detectCategory(cleanText);
 
-  // Extract Brand + Model + Year for Title
+  // 1. SMART TITLE: Extracts "Brand Model Year" (Never uses #hashtags or "urgent")
   const title = extractSmartTitle(cleanText, category);
 
-  // Extract formatted and numeric prices (3500000 -> 3,500,000)
+  // 2. MATHEMATICAL PRICE FORMATTING (2380000 -> 2,380,000)
   const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText);
 
-  // 1. Upload ALL images to Cloudinary in PARALLEL
+  // 3. Upload ALL images in PARALLEL to Cloudinary
   const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
 
-  // 2. Save directly to Firebase Firestore with Deterministic ID (PREVENTS DUPLICATION)
+  // 4. Save to Firebase Firestore with Deterministic Document ID (KILLS DUPLICATES)
   try {
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
     const adOwnerId = env.ADMIN_UID || "admin_bot";
 
-    // Deterministic Document ID prevents duplicates:
+    // DETERMINISTIC DOCUMENT ID:
+    // If it's an album, use tg_album_${groupId}. If single post, use tg_msg_${chatId}_${messageId}.
     const documentId = groupId
       ? `tg_album_${groupId}`
       : `tg_msg_${message.chat.id}_${message.message_id}`;
@@ -149,8 +150,8 @@ async function processFinalAd(message, imageFileIds, groupId, env) {
       fields: {
         title: { stringValue: title },
         description: { stringValue: cleanText },
-        price: { stringValue: formattedPrice }, // "3,500,000"
-        rawPrice: { integerValue: rawPrice },   // "3500000" (numeric for sorting)
+        price: { stringValue: formattedPrice }, // "2,380,000"
+        rawPrice: { integerValue: rawPrice },   // "2380000" (numeric for sorting)
         phone: { stringValue: "0911680790" },
         city: { stringValue: extractCity(cleanText) },
         category: { stringValue: category },
@@ -182,7 +183,7 @@ async function processFinalAd(message, imageFileIds, groupId, env) {
     console.error("Firestore Save Error:", fbErr);
   }
 
-  // 3. Build Formatted Telegram Post
+  // 5. Update the Telegram Post with Business Card
   const hashtagMap = {
     Cars: "#Cars",
     Houses: "#Houses",
@@ -213,7 +214,6 @@ async function processFinalAd(message, imageFileIds, groupId, env) {
   newPostText += `━━━━━━━━━━━━━━━\n\n`;
   newPostText += `${hashtag}`;
 
-  // 4. Update the Telegram Message / Caption
   try {
     if (message.photo && message.photo.length > 0) {
       await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageCaption`, {
@@ -242,41 +242,79 @@ async function processFinalAd(message, imageFileIds, groupId, env) {
 }
 
 // ============================================
-// SMART TITLE: BRAND + MODEL + YEAR
+// SMART TITLE: EXTRACT BRAND + MODEL + YEAR
 // ============================================
 function extractSmartTitle(text, category) {
-  const yearMatch = text.match(/\b(19\d{2}|20\d{2})\b/);
-  const year = yearMatch ? yearMatch[1] : "";
-
   // 1. CAR BRANDS & MODELS
   if (category === "Cars") {
     const brands = [
-      "Toyota", "Suzuki", "Hyundai", "Kia", "Honda", "Nissan", "Ford", "Mercedes-Benz", "Mercedes", "Benz",
-      "BMW", "Volkswagen", "VW", "Mitsubishi", "Isuzu", "Chery", "BYD", "Jetour", "Geely", "Mazda", 
-      "Peugeot", "Land Rover", "Range Rover", "Jeep", "Audi", "Chevrolet", "Subaru"
+      { name: "Toyota", regex: /(toyota|ቶዮታ)/i },
+      { name: "Suzuki", regex: /(suzuki|ሱዙኪ)/i },
+      { name: "Hyundai", regex: /(hyundai|ሃዩንዳይ|ሂዩንዳይ)/i },
+      { name: "Kia", regex: /(kia|ኪያ)/i },
+      { name: "Honda", regex: /(honda|ሆንዳ)/i },
+      { name: "Nissan", regex: /(nissan|ኒሳን)/i },
+      { name: "Ford", regex: /(ford|ፎርድ)/i },
+      { name: "Mercedes-Benz", regex: /(mercedes|benz|መርሴዲስ|ቤንዝ)/i },
+      { name: "BMW", regex: /(bmw|ቢኤምደብሊው)/i },
+      { name: "Volkswagen", regex: /(volkswagen|vw|ቮልስዋገን)/i },
+      { name: "Mitsubishi", regex: /(mitsubishi|ሚትሱቢሺ)/i },
+      { name: "Isuzu", regex: /(isuzu|ኢሱዙ)/i },
+      { name: "BYD", regex: /(byd|ቢዋይዲ)/i },
+      { name: "Jetour", regex: /(jetour|ጄቱር)/i },
+      { name: "Geely", regex: /(geely|ጂሊ)/i },
+      { name: "Chery", regex: /(chery|ቼሪ)/i },
+      { name: "Mazda", regex: /(mazda|ማዝዳ)/i },
+      { name: "Peugeot", regex: /(peugeot|ፔጆ)/i },
+      { name: "Land Rover", regex: /(land rover|range rover|ሬንጅ ሮቨር)/i },
+      { name: "Jeep", regex: /(jeep|ጂፕ)/i }
     ];
+
     const models = [
-      "Yaris", "Corolla", "Vitz", "Tucson", "Elantra", "Avante", "Dzire", "Swift", "Celerio", "Alto",
-      "RAV4", "Hilux", "Land Cruiser", "Prado", "Fortuner", "Creta", "Santa Fe", "Sonata", "Accent",
-      "Sportage", "Sorento", "Picanto", "Civic", "CR-V", "D-Max", "Ranger", "Tiggo", "Atto 3", "Dashing",
-      "X70", "CX-5", "E200", "C200", "X5", "Golf"
+      { name: "4Runner", regex: /(4runner|ፎርረነር|4 runner)/i },
+      { name: "Prado", regex: /(prado|ፕራዶ)/i },
+      { name: "Land Cruiser", regex: /(land cruiser|ላንድክሩዘር|ላንድ ክሩዘር)/i },
+      { name: "RAV4", regex: /(rav4|rav 4|ራቭ4|ራቭ 4)/i },
+      { name: "Hilux", regex: /(hilux|ሃይሉክስ)/i },
+      { name: "Yaris", regex: /(yaris|ያሪስ)/i },
+      { name: "Corolla", regex: /(corolla|ኮሮላ)/i },
+      { name: "Vitz", regex: /(vitz|ቪትዝ)/i },
+      { name: "Rush", regex: /(rush|ሩሽ)/i },
+      { name: "Fortuner", regex: /(fortuner|ፎርቹን)/i },
+      { name: "Dzire", regex: /(dzire|ዲዛይር|desire)/i },
+      { name: "Swift", regex: /(swift|ስዊፍት)/i },
+      { name: "Celerio", regex: /(celerio|ሴሌሪዮ)/i },
+      { name: "Alto", regex: /(alto|አልቶ)/i },
+      { name: "Tucson", regex: /(tucson|ቱክሰን)/i },
+      { name: "Creta", regex: /(creta|ክሬታ)/i },
+      { name: "Santa Fe", regex: /(santa fe|ሳንታፌ|ሳንታ ፌ)/i },
+      { name: "Elantra", regex: /(elantra|ኤላንትራ)/i },
+      { name: "Avante", regex: /(avante|አቫንቴ)/i },
+      { name: "Sonata", regex: /(sonata|ሶናታ)/i },
+      { name: "Accent", regex: /(accent|አክሰንት)/i },
+      { name: "Atto 3", regex: /(atto 3|atto3)/i },
+      { name: "Dashing", regex: /(dashing|ዳሺንግ)/i },
+      { name: "Tiggo", regex: /(tiggo|ቲጎ)/i }
     ];
 
     let foundBrand = "";
     let foundModel = "";
 
     for (const b of brands) {
-      if (new RegExp(`\\b${b}\\b`, "i").test(text)) {
-        foundBrand = b;
+      if (b.regex.test(text)) {
+        foundBrand = b.name;
         break;
       }
     }
     for (const m of models) {
-      if (new RegExp(`\\b${m}\\b`, "i").test(text)) {
-        foundModel = m;
+      if (m.regex.test(text)) {
+        foundModel = m.name;
         break;
       }
     }
+
+    const yearMatch = text.match(/\b(19\d{2}|20\d{2})\b/);
+    const year = yearMatch ? yearMatch[1] : "";
 
     if (foundBrand && foundModel) {
       return `${foundBrand} ${foundModel} ${year}`.trim();
@@ -286,7 +324,7 @@ function extractSmartTitle(text, category) {
     }
   }
 
-  // 2. ELECTRONICS & PHONES
+  // 2. PHONES & LAPTOPS
   if (category === "Electronics") {
     const devices = [
       "iPhone 16 Pro Max", "iPhone 16 Pro", "iPhone 16", "iPhone 15 Pro Max", "iPhone 15 Pro", "iPhone 15",
@@ -295,7 +333,6 @@ function extractSmartTitle(text, category) {
       "Samsung Galaxy S24 Ultra", "Samsung Galaxy S24", "Samsung Galaxy S23 Ultra", "Samsung S23",
       "MacBook Pro", "MacBook Air", "iPad Pro", "iPad Air", "HP Victus", "HP Pavilion", "Dell XPS", "Lenovo ThinkPad"
     ];
-
     for (const d of devices) {
       if (new RegExp(d.replace(/\s+/g, "\\s*"), "i").test(text)) {
         return d;
@@ -303,9 +340,9 @@ function extractSmartTitle(text, category) {
     }
   }
 
-  // 3. HOUSES & REAL ESTATE
+  // 3. HOUSES & CONDOS
   if (category === "Houses" || category === "Rentals") {
-    const houseTypes = ["Villa", "Condominium", "Apartment", "G+2", "G+1", "Studio", "Duplex", "ኮንዶሚኒየም", "ቪላ", "አፓርታማ"];
+    const houseTypes = ["Villa", "Condominium", "Apartment", "G+2", "G+1", "Studio", "ኮንዶሚኒየም", "ቪላ", "አፓርታማ"];
     for (const h of houseTypes) {
       if (new RegExp(`\\b${h}\\b`, "i").test(text)) {
         const city = extractCity(text);
@@ -314,19 +351,18 @@ function extractSmartTitle(text, category) {
     }
   }
 
-  // Fallback: Clean first line without spam/promotional prefixes
-  const lines = text
+  // Fallback: Strip hashtags and spam words like "urgent" or "#ቀጥታውይበተን"
+  const cleanLines = text
     .split("\n")
     .map((l) => l.trim())
-    .filter((l) => l.length > 3 && !/^(urgent|አስቸኳይ|sale|ሽያጭ|for sale|የሚሸጥ|በጣም|አዲስ)/i.test(l));
+    .filter((l) => l.length > 2 && !l.startsWith("#") && !/^(urgent|አስቸኳይ|sale|ሽያጭ|for sale|የሚሸጥ|ቀጥታ)/i.test(l));
 
-  let fallbackTitle = lines[0] || "New Listing";
-  if (fallbackTitle.length > 50) fallbackTitle = fallbackTitle.substring(0, 50) + "...";
-  return fallbackTitle;
+  let fallback = cleanLines[0] || "New Listing";
+  return fallback.length > 45 ? fallback.substring(0, 45) + "..." : fallback;
 }
 
 // ============================================
-// MATHEMATICAL PRICE RULES (3500000 -> 3,500,000)
+// MATHEMATICAL PRICE RULES (2380000 -> 2,380,000)
 // ============================================
 function parseMathematicalPrice(text) {
   // Million shorthands (3.5M, 3.5 million, 3.5 ሚሊዮን)
@@ -355,21 +391,21 @@ function parseMathematicalPrice(text) {
     }
   }
 
-  // Explicit Price labels (Price: 3500000, ዋጋ 3500000, 3500000 ETB, 3500000 ብር)
+  // Explicit Price labels (ዋጋ: 2380000, Price: 17000000, 2380000 ETB, 2380000 ብር)
   const explicitMatch = text.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
   if (explicitMatch) {
     const digitsOnly = explicitMatch[1].replace(/[.,]/g, "").trim();
     const num = parseInt(digitsOnly, 10);
     if (!isNaN(num) && num > 50) {
       return {
-        formattedPrice: num.toLocaleString("en-US"),
+        formattedPrice: num.toLocaleString("en-US"), // "2,380,000"
         rawPrice: num.toString()
       };
     }
   }
 
-  // Standalone numbers
-  const standaloneMatch = text.match(/\b(\d{1,3}(?:,\d{3})+|\d{4,9})\b/);
+  // Standalone numbers >= 500 (e.g. 2380000 or 17000000)
+  const standaloneMatch = text.match(/\b(\d{1,3}(?:,\d{3})+|\d{4,10})\b/);
   if (standaloneMatch) {
     const digitsOnly = standaloneMatch[1].replace(/[.,]/g, "").trim();
     const num = parseInt(digitsOnly, 10);
@@ -438,7 +474,7 @@ function cleanTheText(text) {
 
 function detectCategory(text) {
   const lowerText = text.toLowerCase();
-  if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|elantra|avante|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) return "Cars";
+  if (/(car|toyota|suzuki|hyundai|kia|honda|bmw|benz|nissan|ford|mazda|tucson|elantra|avante|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) return "Cars";
   if (/(house|villa|condominium|condo|ቤት|ቪላ|ኮንዶሚኒየም)/i.test(lowerText)) return "Houses";
   if (/(apartment|office|shop|አፓርታማ|ቢሮ|ሱቅ|መጋዘን)/i.test(lowerText)) return "Rentals";
   if (/(iphone|samsung|tecno|infinix|phone|smartphone|laptop|computer|tv|camera|ስልክ|ሞባይል|ላፕቶፕ|ኮምፒውተር|ቲቪ|ቴሌቪዥን|ካሜራ)/i.test(lowerText)) return "Electronics";
@@ -542,7 +578,6 @@ function cleanupMemory() {
       albumCache.delete(key);
     }
   }
-  // Keep set memory small
   if (processedGroups.size > 500) {
     processedGroups.clear();
   }
