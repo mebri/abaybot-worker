@@ -1,9 +1,12 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
- * Optimized for high-concurrency, fast parallel uploads, and React marketplace compatibility.
+ * Features:
+ * - Mathematical comma-separated price rules (3500000 -> 3,500,000)
+ * - Support for million/thousand shorthands (3.5M -> 3,500,000 / 500k -> 500,000)
+ * - Parallel Cloudinary uploads
+ * - Zero-touch Firebase Firestore sync
  */
 
-// Memory caches
 const albumCache = new Map();
 let cachedFirebaseToken = null;
 let tokenExpiresAt = 0;
@@ -59,7 +62,6 @@ async function processUpdate(update, env) {
 
     const albumData = albumCache.get(groupId);
 
-    // Collect highest quality photo file_id
     if (message.photo && message.photo.length > 0) {
       albumData.images.push(message.photo[message.photo.length - 1].file_id);
     }
@@ -68,7 +70,6 @@ async function processUpdate(update, env) {
       albumData.firstMessage = message;
     }
 
-    // Only start one timer per album
     if (!albumData.timerActive) {
       albumData.timerActive = true;
       await new Promise((resolve) => setTimeout(resolve, 2500));
@@ -79,12 +80,11 @@ async function processUpdate(update, env) {
 
       await processFinalAd(
         finalData.firstMessage || message,
-        Array.from(new Set(finalData.images)), // Deduplicate
+        Array.from(new Set(finalData.images)),
         env
       );
     }
 
-    // Cleanup stale albums older than 2 minutes to prevent memory leaks
     cleanupStaleAlbums();
     return;
   }
@@ -109,9 +109,12 @@ async function processFinalAd(message, imageFileIds, env) {
   const messageText = (message.text || message.caption || "").trim();
   const cleanText = cleanTheText(messageText);
   const category = detectCategory(cleanText);
-  const { title, numericPrice } = extractTitleAndPrice(cleanText);
+  const title = extractTitle(cleanText);
+  
+  // Mathematical price extraction with comma formatting rules
+  const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText);
 
-  // 1. Upload ALL images to Cloudinary in PARALLEL (Fast & non-blocking)
+  // 1. Upload ALL images to Cloudinary in PARALLEL
   const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
 
   // 2. Save directly to Firebase Firestore
@@ -124,7 +127,8 @@ async function processFinalAd(message, imageFileIds, env) {
       fields: {
         title: { stringValue: title },
         description: { stringValue: cleanText },
-        price: { stringValue: numericPrice || "0" }, // Pure numeric string for React sort compatibility
+        price: { stringValue: formattedPrice }, // "3,500,000"
+        rawPrice: { integerValue: rawPrice },   // "3500000" for numeric sorting
         phone: { stringValue: "0911680790" },
         city: { stringValue: extractCity(cleanText) },
         category: { stringValue: category },
@@ -168,15 +172,15 @@ async function processFinalAd(message, imageFileIds, env) {
   };
   const hashtag = hashtagMap[category] || "#Other";
 
-  const formattedDisplayPrice = numericPrice && numericPrice !== "0"
-    ? Number(numericPrice).toLocaleString("en-US") + " ETB"
+  const displayPriceText = formattedPrice && formattedPrice !== "0"
+    ? `${formattedPrice} ETB`
     : "Negotiable / ተደራዳሪ";
 
   let safeDetails = cleanText.substring(0, 480);
   if (cleanText.length > 480) safeDetails += "...";
 
   let newPostText = `📝 Title: ${title}\n`;
-  newPostText += `💰 Price: ${formattedDisplayPrice}\n\n`;
+  newPostText += `💰 Price: ${displayPriceText}\n\n`;
   newPostText += `📄 Details:\n${safeDetails}\n\n`;
   newPostText += `━━━━━━━━━━━━━━━\n`;
   newPostText += `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
@@ -215,6 +219,65 @@ async function processFinalAd(message, imageFileIds, env) {
 }
 
 // ============================================
+// MATHEMATICAL PRICE RULES (e.g. 3500000 -> 3,500,000)
+// ============================================
+function parseMathematicalPrice(text) {
+  // Rule 1: Million shorthands (e.g. "3.5M", "3.5 million", "3.5 ሚሊዮን", "3.5mln")
+  const millionMatch = text.match(/([\d.]+)\s*(?:million|mil|mln|m|ሚሊዮን)\b/i);
+  if (millionMatch) {
+    const val = parseFloat(millionMatch[1]);
+    if (!isNaN(val) && val > 0 && val < 1000) {
+      const calculated = Math.round(val * 1000000);
+      return {
+        formattedPrice: calculated.toLocaleString("en-US"), // "3,500,000"
+        rawPrice: calculated.toString()
+      };
+    }
+  }
+
+  // Rule 2: Thousand shorthands (e.g. "500k", "500 ሺህ", "500 shi")
+  const thousandMatch = text.match(/([\d.]+)\s*(?:k|thousand|ሺህ|ሺ)\b/i);
+  if (thousandMatch) {
+    const val = parseFloat(thousandMatch[1]);
+    if (!isNaN(val) && val > 0 && val < 10000) {
+      const calculated = Math.round(val * 1000);
+      return {
+        formattedPrice: calculated.toLocaleString("en-US"), // "500,000"
+        rawPrice: calculated.toString()
+      };
+    }
+  }
+
+  // Rule 3: Explicit Price labels (e.g. "Price: 3500000", "ዋጋ: 3500000", "3500000 ETB", "3500000 ብር")
+  const explicitMatch = text.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
+  if (explicitMatch) {
+    const digitsOnly = explicitMatch[1].replace(/[.,]/g, "").trim();
+    const num = parseInt(digitsOnly, 10);
+    if (!isNaN(num) && num > 50) {
+      return {
+        formattedPrice: num.toLocaleString("en-US"), // "3,500,000"
+        rawPrice: num.toString()
+      };
+    }
+  }
+
+  // Rule 4: Standalone numbers with 4 to 9 digits (e.g. "3500000" or already formatted "3,500,000")
+  const standaloneMatch = text.match(/\b(\d{1,3}(?:,\d{3})+|\d{4,9})\b/);
+  if (standaloneMatch) {
+    const digitsOnly = standaloneMatch[1].replace(/[.,]/g, "").trim();
+    const num = parseInt(digitsOnly, 10);
+    if (!isNaN(num) && num >= 500) {
+      return {
+        formattedPrice: num.toLocaleString("en-US"), // "3,500,000"
+        rawPrice: num.toString()
+      };
+    }
+  }
+
+  return { formattedPrice: "0", rawPrice: "0" };
+}
+
+// ============================================
 // PARALLEL CLOUDINARY UPLOADER
 // ============================================
 async function uploadImagesToCloudinary(fileIds, env) {
@@ -222,7 +285,6 @@ async function uploadImagesToCloudinary(fileIds, env) {
 
   const uploadPromises = fileIds.map(async (fileId) => {
     try {
-      // 1. Get file path from Telegram
       const fileRes = await fetch(
         `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`
       );
@@ -231,7 +293,6 @@ async function uploadImagesToCloudinary(fileIds, env) {
 
       const tgFileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`;
 
-      // 2. Upload to Cloudinary using direct URL (Saves Worker memory)
       const formData = new FormData();
       formData.append("file", tgFileUrl);
       formData.append("upload_preset", env.CLOUDINARY_UPLOAD_PRESET);
@@ -253,7 +314,7 @@ async function uploadImagesToCloudinary(fileIds, env) {
 }
 
 // ============================================
-// TEXT & METADATA EXTRACTION
+// TEXT CLEANING & EXTRACTION HELPERS
 // ============================================
 function cleanTheText(text) {
   return text
@@ -291,29 +352,7 @@ function extractCity(text) {
   return "Addis Ababa";
 }
 
-function extractTitleAndPrice(text) {
-  let numericPrice = "0";
-
-  // Match standard price tags
-  const priceMatch = text.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
-  if (priceMatch) {
-    const rawDigits = priceMatch[1].replace(/[^\d]/g, "");
-    if (rawDigits && !isNaN(rawDigits) && Number(rawDigits) > 100) {
-      numericPrice = rawDigits;
-    }
-  }
-
-  // Fallback for standalone large numbers (e.g. 2,500,000)
-  if (numericPrice === "0") {
-    const fallbackMatch = text.match(/(\d{1,3}(?:[.,]\d{3})+)/);
-    if (fallbackMatch) {
-      const rawDigits = fallbackMatch[1].replace(/[^\d]/g, "");
-      if (rawDigits && !isNaN(rawDigits) && Number(rawDigits) > 100) {
-        numericPrice = rawDigits;
-      }
-    }
-  }
-
+function extractTitle(text) {
   const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 2);
   let title = lines[0] || "New Listing";
   if (/(urgent|አስቸኳይ|sale|ሽያጭ|for sale|የሚሸጥ)/i.test(title) && lines.length > 1) {
@@ -322,8 +361,7 @@ function extractTitleAndPrice(text) {
   if (title.length > 55) {
     title = title.substring(0, 55) + "...";
   }
-
-  return { title, numericPrice };
+  return title;
 }
 
 // ============================================
@@ -332,7 +370,6 @@ function extractTitleAndPrice(text) {
 async function getFirebaseToken(env) {
   const now = Math.floor(Date.now() / 1000);
 
-  // Return cached token if valid for at least 5 more minutes
   if (cachedFirebaseToken && tokenExpiresAt > now + 300) {
     return cachedFirebaseToken;
   }
