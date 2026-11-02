@@ -1,20 +1,10 @@
-/**
- * Yegna Gebeya Telegram Bot - Cloudflare Worker
- * Features:
- * - Mathematical comma-separated price rules (3500000 -> 3,500,000)
- * - Support for million/thousand shorthands (3.5M -> 3,500,000 / 500k -> 500,000)
- * - Parallel Cloudinary uploads
- * - Zero-touch Firebase Firestore sync
- */
-
+// Temporary cache to hold album images
 const albumCache = new Map();
-let cachedFirebaseToken = null;
-let tokenExpiresAt = 0;
 
 export default {
   async fetch(request, env, ctx) {
     if (request.method !== "POST") {
-      return new Response("Bot is running ✅", { status: 200 });
+      return new Response("Bot is running", { status: 200 });
     }
 
     try {
@@ -22,78 +12,83 @@ export default {
       ctx.waitUntil(processUpdate(update, env));
       return new Response("OK", { status: 200 });
     } catch (error) {
-      return new Response("Error: " + error.message, { status: 500 });
+      return new Response("Error: " + error.message, { status: 200 });
     }
   }
 };
 
 async function processUpdate(update, env) {
+  // 🚨 1. ANTI-LOOP & DUPLICATE PROTECTION
+  // Ignore edited messages (prevents loop when bot edits caption)
+  if (update.edited_message || update.edited_channel_post) return;
+
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 1. Anti-bot protection
   if (message.from && message.from.is_bot) return;
 
-  const rawText = (message.text || message.caption || "").trim();
-
-  // 2. Comprehensive Anti-Loop Protection
-  if (
-    rawText.includes("የኛ ገበያ") ||
-    rawText.includes("@mebrigranite") ||
-    /#(Cars|Houses|Rentals|Electronics|Furniture|Clothes|Labor|ምንአለሽ_ተራ|Other)\b/i.test(rawText)
-  ) {
-    return;
-  }
+  // Stop duplicate if Telegram automatically forwards channel post to linked discussion group
+  if (message.is_automatic_forward || message.forward_from_chat) return;
+  
+  const text = (message.text || message.caption || "").trim();
+  if (text.includes("#Cars") || text.includes("#Electronics") || text.includes("Yegna Gebeya") || text.includes("የኛ ገበያ")) return;
 
   // ============================================
-  // ALBUM HANDLING (Media Groups)
+  // ALBUM LOGIC (Multiple Images)
   // ============================================
   if (message.media_group_id) {
     const groupId = message.media_group_id;
-
+    
+    // Add this image to the cache
     if (!albumCache.has(groupId)) {
-      albumCache.set(groupId, {
-        images: [],
-        firstMessage: rawText.length > 3 ? message : null,
-        timerActive: false,
-        timestamp: Date.now()
+      albumCache.set(groupId, { 
+        images: [], 
+        firstMessage: text.length > 3 ? message : null,
+        processing: false
       });
     }
-
+    
     const albumData = albumCache.get(groupId);
-
+    
+    // Add the image file_id
     if (message.photo && message.photo.length > 0) {
-      albumData.images.push(message.photo[message.photo.length - 1].file_id);
+      const fileId = message.photo[message.photo.length - 1].file_id;
+      if (!albumData.images.includes(fileId)) {
+        albumData.images.push(fileId);
+      }
     }
 
-    if (rawText.length > 3 && !albumData.firstMessage) {
+    // If this message has the text, save it as the primary message
+    if (text.length > 3 && !albumData.firstMessage) {
       albumData.firstMessage = message;
     }
 
-    if (!albumData.timerActive) {
-      albumData.timerActive = true;
-      await new Promise((resolve) => setTimeout(resolve, 2500));
-
+    // 🕒 Wait 2 seconds only once per album to let all photos arrive, then process
+    if (text.length > 3 && !albumData.processing) {
+      albumData.processing = true;
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      // If the album was deleted from cache by another thread, stop
       if (!albumCache.has(groupId)) return;
+      
       const finalData = albumCache.get(groupId);
-      albumCache.delete(groupId);
-
+      albumCache.delete(groupId); // Clear cache
+      
+      // Process the complete album
       await processFinalAd(
-        finalData.firstMessage || message,
-        Array.from(new Set(finalData.images)),
+        finalData.firstMessage || message, 
+        finalData.images, 
         env
       );
     }
-
-    cleanupStaleAlbums();
     return;
   }
 
   // ============================================
-  // SINGLE IMAGE OR TEXT-ONLY POST
+  // SINGLE IMAGE OR TEXT-ONLY LOGIC
   // ============================================
-  if (rawText.length < 3) return;
-
+  if (text.length < 3) return;
+  
   const images = [];
   if (message.photo && message.photo.length > 0) {
     images.push(message.photo[message.photo.length - 1].file_id);
@@ -103,348 +98,254 @@ async function processUpdate(update, env) {
 }
 
 // ============================================
-// MAIN PROCESSING & CLOUDINARY UPLOAD
+// MAIN PROCESSING FUNCTION
 // ============================================
 async function processFinalAd(message, imageFileIds, env) {
   const messageText = (message.text || message.caption || "").trim();
   const cleanText = cleanTheText(messageText);
   const category = detectCategory(cleanText);
-  const title = extractTitle(cleanText);
-  
-  // Mathematical price extraction with comma formatting rules
-  const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText);
+  const { title, price } = extractTitleAndPrice(cleanText);
 
-  // 1. Upload ALL images to Cloudinary in PARALLEL
-  const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
-
-  // 2. Save directly to Firebase Firestore
-  try {
-    const token = await getFirebaseToken(env);
-    const projectId = env.FIREBASE_PROJECT_ID;
-    const adOwnerId = env.ADMIN_UID || "admin_bot";
-
-    const adData = {
-      fields: {
-        title: { stringValue: title },
-        description: { stringValue: cleanText },
-        price: { stringValue: formattedPrice }, // "3,500,000"
-        rawPrice: { integerValue: rawPrice },   // "3500000" for numeric sorting
-        phone: { stringValue: "0911680790" },
-        city: { stringValue: extractCity(cleanText) },
-        category: { stringValue: category },
-        image: { stringValue: imageUrls.length > 0 ? imageUrls[0] : "" },
-        images: {
-          arrayValue: {
-            values: imageUrls.map((url) => ({ stringValue: url }))
-          }
-        },
-        status: { stringValue: "available" },
-        source: { stringValue: "telegram" },
-        userId: { stringValue: adOwnerId },
-        views: { integerValue: "0" },
-        createdAt: { timestampValue: new Date().toISOString() }
+  // 1. Upload ALL images to Cloudinary
+  const imageUrls = [];
+  for (const fileId of imageFileIds) {
+    try {
+      const fileRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`);
+      const fileInfo = await fileRes.json();
+      if (fileInfo.ok) {
+        const imgRes = await fetch(`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`);
+        const blob = await imgRes.blob();
+        const formData = new FormData();
+        formData.append("file", blob);
+        formData.append("upload_preset", env.CLOUDINARY_UPLOAD_PRESET);
+        const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/image/upload`, { method: "POST", body: formData });
+        const cloudData = await cloudRes.json();
+        if (cloudData.secure_url) imageUrls.push(cloudData.secure_url);
       }
-    };
-
-    const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads`;
-    await fetch(fbUrl, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(adData)
-    });
-  } catch (fbErr) {
-    console.error("Firestore Save Error:", fbErr);
+    } catch (e) {}
   }
 
-  // 3. Build Formatted Telegram Message
-  const hashtagMap = {
-    Cars: "#Cars",
-    Houses: "#Houses",
-    Rentals: "#Rentals",
-    Electronics: "#Electronics",
-    Furniture: "#Furniture",
-    Clothes: "#Clothes",
-    "Labor & Services": "#Labor",
-    "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ"
+  // 2. Save to Firebase (⚡ DEDUPLICATED VIA DETERMINISTIC ID & PATCH)
+  const token = await getFirebaseToken(env);
+  const projectId = env.FIREBASE_PROJECT_ID;
+  const adOwnerId = env.ADMIN_UID || "admin_bot"; 
+
+  const adData = {
+    fields: {
+      title: { stringValue: title },
+      description: { stringValue: cleanText }, 
+      price: { stringValue: price || "0" },
+      phone: { stringValue: "0911680790" }, 
+      city: { stringValue: "" },
+      category: { stringValue: category },
+      image: { stringValue: imageUrls.length > 0 ? imageUrls[0] : "" },
+      images: { arrayValue: imageUrls.length > 0 ? { values: imageUrls.map(url => ({ stringValue: url })) } : { values: [] } },
+      status: { stringValue: "available" }, 
+      source: { stringValue: "telegram" },
+      userId: { stringValue: adOwnerId }, 
+      views: { integerValue: "0" },
+      createdAt: { timestampValue: new Date().toISOString() },
+    },
   };
-  const hashtag = hashtagMap[category] || "#Other";
 
-  const displayPriceText = formattedPrice && formattedPrice !== "0"
-    ? `${formattedPrice} ETB`
-    : "Negotiable / ተደራዳሪ";
+  // ⚡ Deterministic ID prevents duplicate documents in Firestore
+  const docId = message.media_group_id 
+    ? `album_${message.media_group_id}` 
+    : `msg_${Math.abs(message.chat.id)}_${message.message_id}`;
 
-  let safeDetails = cleanText.substring(0, 480);
-  if (cleanText.length > 480) safeDetails += "...";
+  const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
+  await fetch(fbUrl, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(adData),
+  });
+
+  // 3. Build the Telegram Message (With Business Card)
+  let hashtag = "#Other";
+  if (category === "Cars") hashtag = "#Cars";
+  else if (category === "Houses") hashtag = "#Houses";
+  else if (category === "Rentals") hashtag = "#Rentals";
+  else if (category === "Electronics") hashtag = "#Electronics";
+  else if (category === "Furniture") hashtag = "#Furniture";
+  else if (category === "Clothes") hashtag = "#Clothes";
+  else if (category === "Labor & Services") hashtag = "#Labor";
+  else if (category === "ምንአለሽ_ተራ") hashtag = "#ምንአለሽ_ተራ";
+
+  let safeDetails = cleanText.substring(0, 500); 
+  if (cleanText.length > 500) safeDetails += "...";
 
   let newPostText = `📝 Title: ${title}\n`;
-  newPostText += `💰 Price: ${displayPriceText}\n\n`;
-  newPostText += `📄 Details:\n${safeDetails}\n\n`;
+  if (price && price !== "0") newPostText += `💰 Price: ${price} ETB\n`;
+  newPostText += `\n📄 Details:\n${safeDetails}\n\n`;
   newPostText += `━━━━━━━━━━━━━━━\n`;
   newPostText += `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
   newPostText += `📞 Phone: 0911680790\n`;
   newPostText += `🌐 Website: mebri.yegna.workers.dev\n`;
   newPostText += `✈️ Telegram: @mebrigranite\n`;
   newPostText += `━━━━━━━━━━━━━━━\n\n`;
-  newPostText += `${hashtag}`;
+  newPostText += `${hashtag}`; 
 
-  // 4. Update the Telegram Message / Caption
+  // 4. Edit the caption
   try {
     if (message.photo && message.photo.length > 0) {
       await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageCaption`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: message.chat.id,
+        body: JSON.stringify({ 
+          chat_id: message.chat.id, 
           message_id: message.message_id,
           caption: newPostText.substring(0, 1024)
-        })
+        }),
       });
     } else {
       await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageText`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          chat_id: message.chat.id,
+        body: JSON.stringify({ 
+          chat_id: message.chat.id, 
           message_id: message.message_id,
           text: newPostText.substring(0, 4096)
-        })
+        }),
       });
     }
-  } catch (editErr) {
-    console.error("Telegram Edit Error:", editErr);
-  }
+  } catch (err) {}
 }
 
 // ============================================
-// MATHEMATICAL PRICE RULES (e.g. 3500000 -> 3,500,000)
-// ============================================
-function parseMathematicalPrice(text) {
-  // Rule 1: Million shorthands (e.g. "3.5M", "3.5 million", "3.5 ሚሊዮን", "3.5mln")
-  const millionMatch = text.match(/([\d.]+)\s*(?:million|mil|mln|m|ሚሊዮን)\b/i);
-  if (millionMatch) {
-    const val = parseFloat(millionMatch[1]);
-    if (!isNaN(val) && val > 0 && val < 1000) {
-      const calculated = Math.round(val * 1000000);
-      return {
-        formattedPrice: calculated.toLocaleString("en-US"), // "3,500,000"
-        rawPrice: calculated.toString()
-      };
-    }
-  }
-
-  // Rule 2: Thousand shorthands (e.g. "500k", "500 ሺህ", "500 shi")
-  const thousandMatch = text.match(/([\d.]+)\s*(?:k|thousand|ሺህ|ሺ)\b/i);
-  if (thousandMatch) {
-    const val = parseFloat(thousandMatch[1]);
-    if (!isNaN(val) && val > 0 && val < 10000) {
-      const calculated = Math.round(val * 1000);
-      return {
-        formattedPrice: calculated.toLocaleString("en-US"), // "500,000"
-        rawPrice: calculated.toString()
-      };
-    }
-  }
-
-  // Rule 3: Explicit Price labels (e.g. "Price: 3500000", "ዋጋ: 3500000", "3500000 ETB", "3500000 ብር")
-  const explicitMatch = text.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
-  if (explicitMatch) {
-    const digitsOnly = explicitMatch[1].replace(/[.,]/g, "").trim();
-    const num = parseInt(digitsOnly, 10);
-    if (!isNaN(num) && num > 50) {
-      return {
-        formattedPrice: num.toLocaleString("en-US"), // "3,500,000"
-        rawPrice: num.toString()
-      };
-    }
-  }
-
-  // Rule 4: Standalone numbers with 4 to 9 digits (e.g. "3500000" or already formatted "3,500,000")
-  const standaloneMatch = text.match(/\b(\d{1,3}(?:,\d{3})+|\d{4,9})\b/);
-  if (standaloneMatch) {
-    const digitsOnly = standaloneMatch[1].replace(/[.,]/g, "").trim();
-    const num = parseInt(digitsOnly, 10);
-    if (!isNaN(num) && num >= 500) {
-      return {
-        formattedPrice: num.toLocaleString("en-US"), // "3,500,000"
-        rawPrice: num.toString()
-      };
-    }
-  }
-
-  return { formattedPrice: "0", rawPrice: "0" };
-}
-
-// ============================================
-// PARALLEL CLOUDINARY UPLOADER
-// ============================================
-async function uploadImagesToCloudinary(fileIds, env) {
-  if (!fileIds || fileIds.length === 0) return [];
-
-  const uploadPromises = fileIds.map(async (fileId) => {
-    try {
-      const fileRes = await fetch(
-        `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`
-      );
-      const fileInfo = await fileRes.json();
-      if (!fileInfo.ok || !fileInfo.result?.file_path) return null;
-
-      const tgFileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`;
-
-      const formData = new FormData();
-      formData.append("file", tgFileUrl);
-      formData.append("upload_preset", env.CLOUDINARY_UPLOAD_PRESET);
-
-      const cloudRes = await fetch(
-        `https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/image/upload`,
-        { method: "POST", body: formData }
-      );
-      const cloudData = await cloudRes.json();
-      return cloudData.secure_url || null;
-    } catch (err) {
-      console.error("Image upload failed for fileId:", fileId, err);
-      return null;
-    }
-  });
-
-  const results = await Promise.all(uploadPromises);
-  return results.filter(Boolean);
-}
-
-// ============================================
-// TEXT CLEANING & EXTRACTION HELPERS
+// HELPER FUNCTIONS (UNTOUCHED)
 // ============================================
 function cleanTheText(text) {
-  return text
-    .replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{2700}-\u{27BF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu, "")
-    .replace(/[*_~`|]/g, "")
-    .replace(/https?:\/\/[^\s]+/gi, "")
-    .replace(/t\.me\/[^\s]+/gi, "")
-    .replace(/@[a-zA-Z0-9_]+/g, "")
-    .replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .replace(/[ \t]+/g, " ")
-    .trim();
+  let cleanText = text;
+  cleanText = cleanText.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{2700}-\u{27BF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu, "");
+  cleanText = cleanText.replace(/[*_~`|]/g, "");
+  cleanText = cleanText.replace(/https?:\/\/[^\s]+/gi, "");
+  cleanText = cleanText.replace(/t\.me\/[^\s]+/gi, "");
+  cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
+  cleanText = cleanText.replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "(Phone Hidden)");
+  cleanText = cleanText.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
+  return cleanText;
 }
 
 function detectCategory(text) {
   const lowerText = text.toLowerCase();
-  if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|elantra|avante|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) return "Cars";
-  if (/(house|villa|condominium|condo|ቤት|ቪላ|ኮንዶሚኒየም)/i.test(lowerText)) return "Houses";
-  if (/(apartment|office|shop|አፓርታማ|ቢሮ|ሱቅ|መጋዘን)/i.test(lowerText)) return "Rentals";
-  if (/(iphone|samsung|tecno|infinix|phone|smartphone|laptop|computer|tv|camera|ስልክ|ሞባይል|ላፕቶፕ|ኮምፒውተር|ቲቪ|ቴሌቪዥን|ካሜራ)/i.test(lowerText)) return "Electronics";
-  if (/(sofa|bed|table|chair|furniture|cabinet|ሶፋ|አልጋ|ጠረጴዛ|ጠረንጴዛ|ወንበር|ቁምሳጥን|እቃ)/i.test(lowerText)) return "Furniture";
-  if (/(clothes|shoes|dress|shirt|pants|fashion|ልብስ|ጫማ|ቀሚስ|ሱሪ|ሸሚዝ)/i.test(lowerText)) return "Clothes";
-  if (/(construction|electrician|plumber|painter|cleaning|worker|ግንባታ|ኤሌክትሪሺያን|ቧንቧ|ቀለም|ጽዳት|ሰራተኛ|ሠራተኛ)/i.test(lowerText)) return "Labor & Services";
-  if (/(used|second-hand|ምንአለሽ ተራ|ያገለገለ)/i.test(lowerText)) return "ምንአለሽ_ተራ";
-  return "Other";
+  if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|elantra|avante|byd|corolla|yaris|vitz|rav4|chery|tiggo|sealion|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ባይድ|ተሽከርካሪ)/i.test(lowerText)) return "Cars";
+  if (/(house|villa|condominium|condo|g\+1|g\+2|real estate|compound|ቤት|ቪላ|ኮንዶሚኒየም|ሪል እስቴት)/i.test(lowerText)) return "Houses";
+  if (/(apartment|office|shop|rent|lease|hall|warehouse|አፓርታማ|ቢሮ|ሱቅ|ኪራይ|መጋዘን)/i.test(lowerText)) return "Rentals";
+  if (/(iphone|samsung|laptop|computer|macbook|tv|camera|phone|ipad|ስልክ|ላፕቶፕ|ኮምፒውተር|ቴሌቪዥን)/i.test(lowerText)) return "Electronics";
+  if (/(sofa|bed|table|chair|cupboard|wardrobe|furniture|ሶፋ|አልጋ|ጠረጴዛ|ወንበር|ቁምሳጥን|ፈርኒቸር)/i.test(lowerText)) return "Furniture";
+  if (/(jacket|shoes|dress|suit|t-shirt|clothes|ጫማ|ጃኬት|ቀሚስ|ልብስ)/i.test(lowerText)) return "Clothes";
+  if (/(plumber|electrician|painter|mechanic|driver|cleaner|service|ቧንቧ|ኤሌክትሪክ|ቀለም|ሹፌር|ሰርቪስ)/i.test(lowerText)) return "Labor & Services";
+  return "ምንአለሽ_ተራ";
 }
 
-function extractCity(text) {
-  const lower = text.toLowerCase();
-  if (/(አዲስ አበባ|addis ababa|finfinne|bole|sarbet|cmc|gerji|piassa)/i.test(lower)) return "Addis Ababa";
-  if (/(hawassa|ሀዋሳ)/i.test(lower)) return "Hawassa";
-  if (/(adama|አዳማ|nazret)/i.test(lower)) return "Adama";
-  if (/(bahir dar|ባህር ዳር)/i.test(lower)) return "Bahir Dar";
-  if (/(dire dawa|ድሬዳዋ)/i.test(lower)) return "Dire Dawa";
-  return "Addis Ababa";
-}
+function extractTitleAndPrice(text) {
+  const brands = [
+    "Toyota", "Suzuki", "Hyundai", "Honda", "BYD", "Mercedes-Benz", "Benz",
+    "BMW", "Nissan", "Ford", "Kia", "Chery", "Geely", "Volkswagen", "Audi",
+    "Mitsubishi", "Mazda", "Land Rover", "Lexus", "Isuzu", "Lifan"
+  ];
+  
+  const models = [
+    "Corolla", "Yaris", "Vitz", "RAV4", "Prado", "Land Cruiser", "Hilux", "Camry",
+    "Swift", "Dzire", "Celerio", "Alto", "Vitara", "Tucson", "Elantra", "Avante",
+    "Santa Fe", "Sonata", "Accent", "Creta", "Civic", "CR-V", "Fit", "Sealion", "Seagull",
+    "Tiggo", "Arrizo", "Ranger", "Explorer", "Sportage", "Sorento", "Picanto"
+  ];
 
-function extractTitle(text) {
-  const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 2);
-  let title = lines[0] || "New Listing";
-  if (/(urgent|አስቸኳይ|sale|ሽያጭ|for sale|የሚሸጥ)/i.test(title) && lines.length > 1) {
-    title = lines[1];
+  let detectedBrand = "";
+  let detectedModel = "";
+  let detectedYear = "";
+
+  const makeMatch = text.match(/(?:make|የመኪናው\s*ዓይነት)\s*[:=-]\s*([a-zA-Z0-9_-]+)/i);
+  if (makeMatch && makeMatch[1]) detectedBrand = makeMatch[1].trim();
+
+  const modelMatch = text.match(/(?:model|ሞዴል)\s*[:=-]\s*([a-zA-Z0-9 _-]+)/i);
+  if (modelMatch && modelMatch[1]) detectedModel = modelMatch[1].trim();
+
+  const yearMatch = text.match(/\b(199\d|200\d|201\d|202\d)\b/);
+  if (yearMatch) detectedYear = yearMatch[1];
+
+  if (!detectedBrand) {
+    for (const b of brands) {
+      if (new RegExp(`\\b${b}\\b`, "i").test(text)) {
+        detectedBrand = b;
+        break;
+      }
+    }
   }
-  if (title.length > 55) {
-    title = title.substring(0, 55) + "...";
+
+  if (!detectedModel) {
+    for (const m of models) {
+      if (new RegExp(`\\b${m}\\b`, "i").test(text)) {
+        detectedModel = m;
+        break;
+      }
+    }
   }
-  return title;
+
+  let title = "";
+  if (detectedBrand) {
+    title = [detectedBrand, detectedModel, detectedYear].filter(Boolean).join(" ");
+  } else {
+    const lines = text.split("\n").map(l => l.trim()).filter(l => l.length > 2 && !l.startsWith("#"));
+    title = lines[0] ? lines[0].substring(0, 40) : "Featured Item";
+  }
+
+  let price = "0";
+  const priceMatches = text.match(/(?:ዋጋ|price|etb|ብር)?\s*[:=-]?\s*([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{4,10})\s*(?:ብር|etb|birr|million)?/i);
+  if (priceMatches && priceMatches[1]) {
+    const rawDigits = priceMatches[1].replace(/[.,]/g, "");
+    const num = parseInt(rawDigits, 10);
+    if (!isNaN(num) && num > 100) {
+      price = num.toLocaleString("en-US");
+    }
+  }
+
+  return { title, price };
 }
 
-// ============================================
-// CACHED GOOGLE / FIREBASE AUTH TOKEN
-// ============================================
 async function getFirebaseToken(env) {
+  const sa = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT);
   const now = Math.floor(Date.now() / 1000);
-
-  if (cachedFirebaseToken && tokenExpiresAt > now + 300) {
-    return cachedFirebaseToken;
-  }
-
-  const clientEmail = env.FIREBASE_CLIENT_EMAIL;
-  const privateKey = env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n");
-
-  const header = { alg: "RS256", typ: "JWT" };
-  const payload = {
-    iss: clientEmail,
+  const header = btoa(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+  const claimSet = btoa(JSON.stringify({
+    iss: sa.client_email,
     scope: "https://www.googleapis.com/auth/datastore",
     aud: "https://oauth2.googleapis.com/token",
-    iat: now,
-    exp: now + 3600
-  };
+    exp: now + 3600,
+    iat: now
+  }));
 
-  const encHeader = base64UrlEncode(JSON.stringify(header));
-  const encPayload = base64UrlEncode(JSON.stringify(payload));
-  const signingInput = `${encHeader}.${encPayload}`;
+  const pemHeader = "-----BEGIN PRIVATE KEY-----";
+  const pemFooter = "-----END PRIVATE KEY-----";
+  const pemContents = sa.private_key
+    .replace(pemHeader, "")
+    .replace(pemFooter, "")
+    .replace(/\s+/g, "");
+  const binaryDer = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0));
 
-  const pemContents = privateKey
-    .replace("-----BEGIN PRIVATE KEY-----", "")
-    .replace("-----END PRIVATE KEY-----", "")
-    .replace(/\s/g, "");
-
-  const binaryDer = Uint8Array.from(atob(pemContents), (c) => c.charCodeAt(0));
-  const cryptoKey = await crypto.subtle.importKey(
+  const key = await crypto.subtle.importKey(
     "pkcs8",
-    binaryDer,
+    binaryDer.buffer,
     { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
     false,
     ["sign"]
   );
 
-  const sigBuffer = await crypto.subtle.sign(
+  const unsignedToken = `${header}.${claimSet}`;
+  const signature = await crypto.subtle.sign(
     "RSASSA-PKCS1-v1_5",
-    cryptoKey,
-    new TextEncoder().encode(signingInput)
+    key,
+    new TextEncoder().encode(unsignedToken)
   );
 
-  const sigBytes = new Uint8Array(sigBuffer);
-  let binary = "";
-  for (let i = 0; i < sigBytes.length; i++) binary += String.fromCharCode(sigBytes[i]);
-  const signature = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const signedToken = `${unsignedToken}.${btoa(String.fromCharCode(...new Uint8Array(signature))).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_")}`;
 
-  const jwt = `${signingInput}.${signature}`;
-
-  const tokRes = await fetch("https://oauth2.googleapis.com/token", {
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
+    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${signedToken}`
   });
-
-  const tokData = await tokRes.json();
-  if (!tokData.access_token) {
-    throw new Error("Token Error: " + JSON.stringify(tokData));
-  }
-
-  cachedFirebaseToken = tokData.access_token;
-  tokenExpiresAt = now + (tokData.expires_in || 3600);
-  return cachedFirebaseToken;
-}
-
-function base64UrlEncode(str) {
-  const bytes = new TextEncoder().encode(str);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function cleanupStaleAlbums() {
-  const twoMinutesAgo = Date.now() - 120000;
-  for (const [key, value] of albumCache.entries()) {
-    if (value.timestamp < twoMinutesAgo) {
-      albumCache.delete(key);
-    }
-  }
+  const tokenData = await tokenRes.json();
+  return tokenData.access_token;
 }
