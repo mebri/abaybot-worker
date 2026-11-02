@@ -2,9 +2,8 @@
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * Features:
  * - Saves to website FIRST
- * - Wipes all hidden AI Entities
- * - If edit fails, deletes and reposts.
- * - STRICT BOT ID LOOP PREVENTION (Fixes duplicate website entries)
+ * - Watermark moved to TOP to prevent loop duplicates
+ * - Delete & Repost fallback
  */
 
 const albumCache = new Map();
@@ -29,32 +28,21 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // ✅ 1. STRICT BOT LOOP PREVENTION
-  // Check if the message was sent by THIS bot. If yes, ignore immediately.
-  const botId = env.TELEGRAM_BOT_TOKEN.split(":")[0];
-  if (message.from && String(message.from.id) === botId) {
-    console.log("⏭️ Ignored: Message was sent by the bot itself.");
-    return;
-  }
-
-  // Fallback anti-bot check
-  if (message.from && message.from.is_bot) return;
-
-  // 2. Prevent infinite loops in Repost Channel
+  // 1. Prevent infinite loops in Repost Channel
   if (env.REPOST_CHANNEL_ID && String(message.chat.id) === String(env.REPOST_CHANNEL_ID)) return;
 
   const rawText = (message.text || message.caption || "").trim();
 
-  // 3. STRICT TEXT CHECK (Catches any bot watermarks)
+  // 2. STRICT ANTI-LOOP TEXT CHECK
+  // If the bot sees its own formatting or watermarks, it stops immediately.
   if (
-    rawText.includes("Yegna Gebeya") ||
-    rawText.includes("mebrigranite") ||
-    rawText.includes("0911680790") ||
-    rawText.includes("የኛ ገበያ") ||
-    (rawText.includes("📝 Title:") && rawText.includes("💰 Price:")) ||
+    rawText.includes("🏢 የኛ ገበያ (Yegna Gebeya)") ||
+    rawText.includes("📝 Title:") ||
+    rawText.includes("💰 Price:") ||
+    rawText.includes("@mebrigranite") ||
     /#(Cars|Houses|Rentals|Electronics|Furniture|Clothes|Labor|ምንአለሽ_ተራ|Other)\b/i.test(rawText)
   ) {
-    console.log("⏭️ Ignored: Message contains bot watermark.");
+    console.log("⏭️ Ignored: Message is bot's own repost.");
     return;
   }
 
@@ -206,11 +194,13 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   let safeDetails = safeSubstring(cleanText, 800);
   if (cleanText.length > 800) safeDetails = safeDetails.trimEnd() + "…";
 
-  let newPostText = `📝 Title: ${title}\n`;
+  // ✅ 2. WATERMARK MOVED TO TOP (So it can never be cut off)
+  let newPostText = `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
+  newPostText += `━━━━━━━━━━━━━━━\n`;
+  newPostText += `📝 Title: ${title}\n`;
   newPostText += `💰 Price: ${displayPriceText}\n\n`;
   newPostText += `📄 Details:\n${safeDetails}\n\n`;
   newPostText += `━━━━━━━━━━━━━━━\n`;
-  newPostText += `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
   newPostText += `📞 Phone: 0911680790\n`;
   newPostText += `🌐 Website: mebri.yegna.workers.dev\n`;
   newPostText += `✈️ Telegram: @mebrigranite\n`;
@@ -223,7 +213,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
 
   let messageHandled = false;
 
-  // ✅ 2. TRY TO EDIT (Stripping entities: [])
+  // ✅ 3. TRY TO EDIT (Stripping entities: [])
   try {
     if (isPhoto) {
       await callTelegram("editMessageCaption", { 
@@ -246,9 +236,8 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     console.log("⚠️ Edit failed (Premium Emojis/AI Editor). Attempting delete...", editErr.message);
   }
 
-  // ✅ 3. IF EDIT FAILED, DELETE AND REPOST
+  // ✅ 4. IF EDIT FAILED, DELETE AND REPOST
   if (!messageHandled) {
-    // Delete the original dirty message
     try {
       if (messageIds.length === 1) {
         await callTelegram("deleteMessage", { chat_id: chatId, message_id: messageIds[0] }, env);
@@ -260,7 +249,6 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       console.log("⚠️ Could not delete original (Bot needs Admin delete rights):", delErr.message);
     }
 
-    // Post the new clean message
     try {
       if (isPhoto) {
         await callTelegram("sendPhoto", { chat_id: chatId, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
@@ -273,7 +261,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     }
   }
 
-  // ✅ 4. SEND TO REPOST CHANNEL (Always send a fresh copy here)
+  // ✅ 5. SEND TO REPOST CHANNEL
   if (env.REPOST_CHANNEL_ID) {
     try {
       if (isPhoto) {
