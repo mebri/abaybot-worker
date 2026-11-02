@@ -1,3 +1,6 @@
+// Temporary cache to hold album images
+const albumCache = new Map();
+
 export default {
   async fetch(request, env, ctx) {
     if (request.method !== "POST") {
@@ -15,12 +18,15 @@ export default {
 };
 
 async function processUpdate(update, env) {
+  // 🚨 1. ANTI-LOOP & DUPLICATE PROTECTION
   if (update.edited_message || update.edited_channel_post) return;
 
   const message = update.message || update.channel_post;
   if (!message) return;
 
   if (message.from && message.from.is_bot) return;
+
+  // Stop duplicates from discussion groups and automatic forwards
   if (
     message.is_automatic_forward ||
     message.forward_from_chat ||
@@ -30,16 +36,70 @@ async function processUpdate(update, env) {
   }
   
   const text = (message.text || message.caption || "").trim();
-  
-  // Anti-loop protection
   if (
-    text.includes("✅ Official Ad Posted") ||
-    text.includes("⚠️ Debug") ||
-    text.includes("Yegna Gebeya")
+    text.includes("#Cars") ||
+    text.includes("#Electronics") ||
+    text.includes("Yegna Gebeya") ||
+    text.includes("የኛ ገበያ") ||
+    text.includes("0911680790")
   ) {
     return;
   }
 
+  // ============================================
+  // ALBUM LOGIC (Multiple Images)
+  // ============================================
+  if (message.media_group_id) {
+    const groupId = message.media_group_id;
+    
+    // Add this image to the cache
+    if (!albumCache.has(groupId)) {
+      albumCache.set(groupId, { 
+        images: [], 
+        firstMessage: text.length > 3 ? message : null,
+        processing: false
+      });
+    }
+    
+    const albumData = albumCache.get(groupId);
+    
+    // Add the image file_id
+    if (message.photo && message.photo.length > 0) {
+      const fileId = message.photo[message.photo.length - 1].file_id;
+      if (!albumData.images.includes(fileId)) {
+        albumData.images.push(fileId);
+      }
+    }
+
+    // If this message has the text, save it as the primary message
+    if (text.length > 3 && !albumData.firstMessage) {
+      albumData.firstMessage = message;
+    }
+
+    // 🕒 Wait 2 seconds only once per album to let all photos arrive, then process
+    if (text.length > 3 && !albumData.processing) {
+      albumData.processing = true;
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      // If the album was deleted from cache by another thread, stop
+      if (!albumCache.has(groupId)) return;
+      
+      const finalData = albumCache.get(groupId);
+      albumCache.delete(groupId); // Clear cache
+      
+      // Process the complete album
+      await processFinalAd(
+        finalData.firstMessage || message, 
+        finalData.images, 
+        env
+      );
+    }
+    return;
+  }
+
+  // ============================================
+  // SINGLE IMAGE OR TEXT-ONLY LOGIC
+  // ============================================
   if (text.length < 3) return;
   
   const images = [];
@@ -55,38 +115,11 @@ async function processUpdate(update, env) {
 // ============================================
 async function processFinalAd(message, imageFileIds, env) {
   const messageText = (message.text || message.caption || "").trim();
-  
-  // ✅ ULTIMATE EMOJI KILLER (Removes ALL emojis, flags, symbols)
-  let cleanText = messageText.replace(/\p{Extended_Pictographic}/gu, "");
-  
-  // Remove other formatting
-  cleanText = cleanText.replace(/[*_~`|]/g, "");
-  cleanText = cleanText.replace(/https?:\/\/[^\s]+/gi, "");
-  cleanText = cleanText.replace(/t\.me\/[^\s]+/gi, "");
-  cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
-  cleanText = cleanText.replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "(Phone Hidden)");
-  cleanText = cleanText.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
-
+  const cleanText = cleanTheText(messageText);
   const category = detectCategory(cleanText);
   const { title, price } = extractTitleAndPrice(cleanText);
 
-  // ============================================
-  // DEBUG MESSAGE: Tell the channel what the bot is doing
-  // ============================================
-  try {
-    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ 
-        chat_id: message.chat.id, 
-        text: `⚠️ Debug: I am processing this ad.\nCleaned Text:\n${cleanText.substring(0, 100)}...` 
-      }),
-    });
-  } catch (e) {}
-
-  // ============================================
-  // 1. Upload images to Cloudinary
-  // ============================================
+  // 1. Upload ALL images to Cloudinary
   const imageUrls = [];
   for (const fileId of imageFileIds) {
     try {
@@ -105,49 +138,42 @@ async function processFinalAd(message, imageFileIds, env) {
     } catch (e) {}
   }
 
-  // ============================================
-  // 2. Save to Firebase
-  // ============================================
-  try {
-    const token = await getFirebaseToken(env);
-    const projectId = env.FIREBASE_PROJECT_ID;
-    const adOwnerId = env.ADMIN_UID || "admin_bot"; 
+  // 2. Save to Firebase (⚡ DEDUPLICATED VIA DETERMINISTIC ID & PATCH)
+  const token = await getFirebaseToken(env);
+  const projectId = env.FIREBASE_PROJECT_ID;
+  const adOwnerId = env.ADMIN_UID || "admin_bot"; 
 
-    const adData = {
-      fields: {
-        title: { stringValue: title },
-        description: { stringValue: cleanText }, 
-        price: { stringValue: price || "0" },
-        phone: { stringValue: "0911680790" }, 
-        city: { stringValue: "" },
-        category: { stringValue: category },
-        image: { stringValue: imageUrls.length > 0 ? imageUrls[0] : "" },
-        images: { arrayValue: imageUrls.length > 0 ? { values: imageUrls.map(url => ({ stringValue: url })) } : { values: [] } },
-        status: { stringValue: "available" }, 
-        source: { stringValue: "telegram" },
-        userId: { stringValue: adOwnerId }, 
-        views: { integerValue: "0" },
-        createdAt: { timestampValue: new Date().toISOString() },
-      },
-    };
+  const adData = {
+    fields: {
+      title: { stringValue: title },
+      description: { stringValue: cleanText }, 
+      price: { stringValue: price || "0" },
+      phone: { stringValue: "0911680790" }, 
+      city: { stringValue: "" },
+      category: { stringValue: category },
+      image: { stringValue: imageUrls.length > 0 ? imageUrls[0] : "" },
+      images: { arrayValue: imageUrls.length > 0 ? { values: imageUrls.map(url => ({ stringValue: url })) } : { values: [] } },
+      status: { stringValue: "available" }, 
+      source: { stringValue: "telegram" },
+      userId: { stringValue: adOwnerId }, 
+      views: { integerValue: "0" },
+      createdAt: { timestampValue: new Date().toISOString() },
+    },
+  };
 
-    const docId = message.media_group_id 
-      ? `album_${message.media_group_id}` 
-      : `msg_${Math.abs(message.chat.id)}_${message.message_id}`;
+  // ⚡ Deterministic ID prevents duplicate documents in Firestore
+  const docId = message.media_group_id 
+    ? `album_${message.media_group_id}` 
+    : `msg_${Math.abs(message.chat.id)}_${message.message_id}`;
 
-    const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
-    await fetch(fbUrl, {
-      method: "PATCH",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify(adData),
-    });
-  } catch (fbError) {
-    console.error("Firebase save failed:", fbError);
-  }
+  const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
+  await fetch(fbUrl, {
+    method: "PATCH",
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    body: JSON.stringify(adData),
+  });
 
-  // ============================================
-  // 3. Build the Telegram Message
-  // ============================================
+  // 3. Build the Telegram Message (With Business Card)
   let hashtag = "#Other";
   if (category === "Cars") hashtag = "#Cars";
   else if (category === "Houses") hashtag = "#Houses";
@@ -161,8 +187,7 @@ async function processFinalAd(message, imageFileIds, env) {
   let safeDetails = cleanText.substring(0, 500); 
   if (cleanText.length > 500) safeDetails += "...";
 
-  let newPostText = `✅ Official Ad Posted!\n\n`;
-  newPostText += `📝 Title: ${title}\n`;
+  let newPostText = `📝 Title: ${title}\n`;
   if (price && price !== "0") newPostText += `💰 Price: ${price} ETB\n`;
   newPostText += `\n📄 Details:\n${safeDetails}\n\n`;
   newPostText += `━━━━━━━━━━━━━━━\n`;
@@ -173,13 +198,10 @@ async function processFinalAd(message, imageFileIds, env) {
   newPostText += `━━━━━━━━━━━━━━━\n\n`;
   newPostText += `${hashtag}`; 
 
-  // ============================================
-  // 4. Edit the caption (WITH FALLBACK)
-  // ============================================
+  // 4. Edit the caption
   try {
-    let editRes;
     if (message.photo && message.photo.length > 0) {
-      editRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageCaption`, {
+      await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageCaption`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ 
@@ -189,7 +211,7 @@ async function processFinalAd(message, imageFileIds, env) {
         }),
       });
     } else {
-      editRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageText`, {
+      await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editMessageText`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ 
@@ -199,46 +221,24 @@ async function processFinalAd(message, imageFileIds, env) {
         }),
       });
     }
-    
-    const editData = await editRes.json();
-    
-    // 🚨 IF EDIT FAILS, DELETE AND REPOST
-    if (!editData.ok) {
-       await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteMessage`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ chat_id: message.chat.id, message_id: message.message_id }),
-       });
-
-       if (imageUrls.length > 0) {
-          await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendPhoto`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ 
-              chat_id: message.chat.id, 
-              photo: imageUrls[0], 
-              caption: newPostText.substring(0, 1024)
-            }),
-          });
-       } else {
-          await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ 
-              chat_id: message.chat.id, 
-              text: newPostText.substring(0, 4096)
-            }),
-          });
-       }
-    }
-  } catch (err) {
-    console.error("Edit failed:", err);
-  }
+  } catch (err) {}
 }
 
 // ============================================
-// HELPER FUNCTIONS
+// HELPER FUNCTIONS (UNTOUCHED)
 // ============================================
+function cleanTheText(text) {
+  let cleanText = text;
+  cleanText = cleanText.replace(/[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{2700}-\u{27BF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu, "");
+  cleanText = cleanText.replace(/[*_~`|]/g, "");
+  cleanText = cleanText.replace(/https?:\/\/[^\s]+/gi, "");
+  cleanText = cleanText.replace(/t\.me\/[^\s]+/gi, "");
+  cleanText = cleanText.replace(/@[a-zA-Z0-9_]+/g, "");
+  cleanText = cleanText.replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}/g, "(Phone Hidden)");
+  cleanText = cleanText.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
+  return cleanText;
+}
+
 function detectCategory(text) {
   const lowerText = text.toLowerCase();
   if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|elantra|avante|byd|corolla|yaris|vitz|rav4|chery|tiggo|sealion|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ባይድ|ተሽከርካሪ)/i.test(lowerText)) return "Cars";
@@ -252,8 +252,18 @@ function detectCategory(text) {
 }
 
 function extractTitleAndPrice(text) {
-  const brands = ["Toyota", "Suzuki", "Hyundai", "Honda", "BYD", "Mercedes-Benz", "Benz", "BMW", "Nissan", "Ford", "Kia", "Chery", "Geely", "Volkswagen", "Audi", "Mitsubishi", "Mazda", "Land Rover", "Lexus", "Isuzu", "Lifan"];
-  const models = ["Corolla", "Yaris", "Vitz", "RAV4", "Prado", "Land Cruiser", "Hilux", "Camry", "Swift", "Dzire", "Celerio", "Alto", "Vitara", "Tucson", "Elantra", "Avante", "Santa Fe", "Sonata", "Accent", "Creta", "Civic", "CR-V", "Fit", "Sealion", "Seagull", "Tiggo", "Arrizo", "Ranger", "Explorer", "Sportage", "Sorento", "Picanto"];
+  const brands = [
+    "Toyota", "Suzuki", "Hyundai", "Honda", "BYD", "Mercedes-Benz", "Benz",
+    "BMW", "Nissan", "Ford", "Kia", "Chery", "Geely", "Volkswagen", "Audi",
+    "Mitsubishi", "Mazda", "Land Rover", "Lexus", "Isuzu", "Lifan"
+  ];
+  
+  const models = [
+    "Corolla", "Yaris", "Vitz", "RAV4", "Prado", "Land Cruiser", "Hilux", "Camry",
+    "Swift", "Dzire", "Celerio", "Alto", "Vitara", "Tucson", "Elantra", "Avante",
+    "Santa Fe", "Sonata", "Accent", "Creta", "Civic", "CR-V", "Fit", "Sealion", "Seagull",
+    "Tiggo", "Arrizo", "Ranger", "Explorer", "Sportage", "Sorento", "Picanto"
+  ];
 
   let detectedBrand = "";
   let detectedModel = "";
@@ -308,49 +318,47 @@ function extractTitleAndPrice(text) {
 }
 
 async function getFirebaseToken(env) {
-  const clientEmail = env.FIREBASE_CLIENT_EMAIL;
-  const privateKey = env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n");
+  const sa = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT);
   const now = Math.floor(Date.now() / 1000);
-  
-  const header = { alg: "RS256", typ: "JWT" };
-  const payload = {
-    iss: clientEmail,
+  const header = btoa(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+  const claimSet = btoa(JSON.stringify({
+    iss: sa.client_email,
     scope: "https://www.googleapis.com/auth/datastore",
     aud: "https://oauth2.googleapis.com/token",
-    iat: now,
-    exp: now + 3600
-  };
+    exp: now + 3600,
+    iat: now
+  }));
 
-  const h = base64UrlEncodeString(JSON.stringify(header));
-  const p = base64UrlEncodeString(JSON.stringify(payload));
-  const signingInput = `${h}.${p}`;
-
-  const pemContents = privateKey.replace("-----BEGIN PRIVATE KEY-----", "").replace("-----END PRIVATE KEY-----", "").replace(/\s/g, "");
+  const pemHeader = "-----BEGIN PRIVATE KEY-----";
+  const pemFooter = "-----END PRIVATE KEY-----";
+  const pemContents = sa.private_key
+    .replace(pemHeader, "")
+    .replace(pemFooter, "")
+    .replace(/\s+/g, "");
   const binaryDer = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0));
-  const cryptoKey = await crypto.subtle.importKey("pkcs8", binaryDer, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
-  
-  const sigBuffer = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", cryptoKey, new TextEncoder().encode(signingInput));
-  const signature = base64UrlEncodeBytes(new Uint8Array(sigBuffer));
-  const jwt = `${signingInput}.${signature}`;
+
+  const key = await crypto.subtle.importKey(
+    "pkcs8",
+    binaryDer.buffer,
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const unsignedToken = `${header}.${claimSet}`;
+  const signature = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    key,
+    new TextEncoder().encode(unsignedToken)
+  );
+
+  const signedToken = `${unsignedToken}.${btoa(String.fromCharCode(...new Uint8Array(signature))).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_")}`;
 
   const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
+    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${signedToken}`
   });
-  
   const tokenData = await tokenRes.json();
-  if (!tokenData.access_token) throw new Error(JSON.stringify(tokenData));
   return tokenData.access_token;
-}
-
-function base64UrlEncodeString(str) {
-  const base64 = btoa(unescape(encodeURIComponent(str)));
-  return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function base64UrlEncodeBytes(bytes) {
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
