@@ -4,7 +4,7 @@
  * - Mathematical comma-separated price rules (3500000 -> 3,500,000)
  * - Support for million/thousand shorthands (3.5M -> 3,500,000 / 500k -> 500,000)
  * - Parallel Cloudinary uploads
- * - Idempotent Firestore sync (Prevents duplicate ads)
+ * - Strict Duplicate Protection (Prevents Telegram retry duplicates)
  * - Unicode-safe text cleaning & edit/repost fallback
  */
 
@@ -41,6 +41,7 @@ async function processUpdate(update, env) {
   if (
     rawText.includes("የኛ ገበያ") ||
     rawText.includes("@mebrigranite") ||
+    rawText.includes("Yegna Gebeya") ||
     /#(Cars|Houses|Rentals|Electronics|Furniture|Clothes|Labor|ምንአለሽ_ተራ|Other)\b/i.test(rawText)
   ) {
     return;
@@ -165,14 +166,13 @@ async function processFinalAd(message, imageFileIds, env) {
     const adOwnerId = env.ADMIN_UID || "admin_bot";
 
     // ✅ Create a unique Document ID based on the Telegram message.
-    // If Telegram sends the webhook twice, it updates the SAME document.
     const docId = message.media_group_id
       ? `tg_${message.chat.id}_${message.media_group_id}`
       : `tg_${message.chat.id}_${message.message_id}`;
 
     const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
 
-    // ✅ Merge images if the document already exists 
+    // ✅ FIX: Strict Duplicate Check for Single Messages
     let allImages = imageUrls;
     try {
       const checkRes = await fetch(fbUrl, {
@@ -180,6 +180,17 @@ async function processFinalAd(message, imageFileIds, env) {
       });
       if (checkRes.ok) {
         const existingData = await checkRes.json();
+        
+        // If it's a SINGLE message and was created < 30s ago, it's a Telegram retry!
+        if (!message.media_group_id && existingData.fields?.createdAt?.timestampValue) {
+          const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
+          if (Date.now() - createdTime < 30000) {
+            console.log("⏭️ Skipping: Duplicate single message webhook detected.");
+            return; // Stop processing!
+          }
+        }
+
+        // Merge images if album
         if (existingData.fields?.images?.arrayValue?.values) {
           const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
           allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
