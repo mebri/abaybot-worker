@@ -4,9 +4,8 @@
  * - Mathematical comma-separated price rules (3500000 -> 3,500,000)
  * - Support for million/thousand shorthands (3.5M -> 3,500,000 / 500k -> 500,000)
  * - Parallel Cloudinary uploads
- * - Zero-touch Firebase Firestore sync
- * - Unicode-safe text cleaning
- * - Telegram edit-with-repost-fallback
+ * - Idempotent Firestore sync (Prevents duplicate ads)
+ * - Unicode-safe text cleaning & edit/repost fallback
  */
 
 const albumCache = new Map();
@@ -105,7 +104,7 @@ async function processUpdate(update, env) {
 }
 
 // ============================================
-// ✅ NEW: SAFE TELEGRAM API WRAPPER
+// SAFE TELEGRAM API WRAPPER
 // ============================================
 async function callTelegram(method, body, env) {
   const res = await fetch(
@@ -124,7 +123,7 @@ async function callTelegram(method, body, env) {
 }
 
 // ============================================
-// ✅ NEW: UNICODE-SAFE SUBSTRING (never splits emojis)
+// UNICODE-SAFE SUBSTRING (never splits emojis)
 // ============================================
 function safeSubstring(str, maxLen) {
   if (!str) return "";
@@ -144,7 +143,7 @@ async function processFinalAd(message, imageFileIds, env) {
   const messageText = (message.text || message.caption || "").trim();
   const cleanText = cleanTheText(messageText);
 
-  // ✅ FIX: skip if cleaning left nothing usable
+  // Skip if cleaning left nothing usable
   if (!cleanText || cleanText.length < 3) {
     console.log("⏭️ Skipping: no usable text after cleaning");
     return;
@@ -152,18 +151,43 @@ async function processFinalAd(message, imageFileIds, env) {
 
   const category = detectCategory(cleanText);
   const title = extractTitle(cleanText);
-
+  
   // Mathematical price extraction with comma formatting rules
   const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText);
 
   // 1. Upload ALL images to Cloudinary in PARALLEL
   const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
 
-  // 2. Save directly to Firebase Firestore
+  // 2. Save directly to Firebase Firestore (Idempotent - prevents duplicates)
   try {
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
     const adOwnerId = env.ADMIN_UID || "admin_bot";
+
+    // ✅ FIX: Create a unique Document ID based on the Telegram message.
+    // If Telegram sends the webhook twice, it updates the SAME document.
+    const docId = message.media_group_id
+      ? `tg_${message.chat.id}_${message.media_group_id}`
+      : `tg_${message.chat.id}_${message.message_id}`;
+
+    const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
+
+    // ✅ FIX: Merge images if the document already exists 
+    let allImages = imageUrls;
+    try {
+      const checkRes = await fetch(fbUrl, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (checkRes.ok) {
+        const existingData = await checkRes.json();
+        if (existingData.fields?.images?.arrayValue?.values) {
+          const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
+          allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
+        }
+      }
+    } catch (e) {
+      // Document doesn't exist yet, proceed normally
+    }
 
     const adData = {
       fields: {
@@ -174,10 +198,10 @@ async function processFinalAd(message, imageFileIds, env) {
         phone: { stringValue: "0911680790" },
         city: { stringValue: extractCity(cleanText) },
         category: { stringValue: category },
-        image: { stringValue: imageUrls.length > 0 ? imageUrls[0] : "" },
+        image: { stringValue: allImages.length > 0 ? allImages[0] : "" },
         images: {
           arrayValue: {
-            values: imageUrls.map((url) => ({ stringValue: url }))
+            values: allImages.map((url) => ({ stringValue: url }))
           }
         },
         status: { stringValue: "available" },
@@ -188,9 +212,9 @@ async function processFinalAd(message, imageFileIds, env) {
       }
     };
 
-    const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads`;
+    // ✅ FIX: Use PATCH instead of POST to overwrite existing duplicates
     const fbRes = await fetch(fbUrl, {
-      method: "POST",
+      method: "PATCH",
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json"
@@ -198,7 +222,6 @@ async function processFinalAd(message, imageFileIds, env) {
       body: JSON.stringify(adData)
     });
 
-    // ✅ FIX: surface Firestore errors instead of swallowing them
     if (!fbRes.ok) {
       const errBody = await fbRes.text().catch(() => "");
       console.error("Firestore Save Error:", fbRes.status, errBody);
@@ -225,7 +248,6 @@ async function processFinalAd(message, imageFileIds, env) {
       ? `${formattedPrice} ETB`
       : "Negotiable / ተደራዳሪ";
 
-  // ✅ FIX: Unicode-safe truncation
   let safeDetails = safeSubstring(cleanText, 480);
   if (cleanText.length > 480) safeDetails = safeDetails.trimEnd() + "…";
 
@@ -240,7 +262,7 @@ async function processFinalAd(message, imageFileIds, env) {
   newPostText += `━━━━━━━━━━━━━━━\n\n`;
   newPostText += `${hashtag}`;
 
-  // 4. ✅ FIX: Try edit-in-place; fall back to reposting as a new message
+  // 4. Update the Telegram Message / Caption
   const isPhoto = message.photo && message.photo.length > 0;
   const chatId = message.chat.id;
   const lastPhotoFileId = isPhoto
@@ -292,8 +314,7 @@ async function processFinalAd(message, imageFileIds, env) {
     }
   }
 
-  // 5. ✅ NEW: Optional — also repost to a curated channel
-  //    Set REPOST_CHANNEL_ID (e.g. -1001234567890) in Worker secrets to enable.
+  // 5. Optional — repost to a curated channel (Set REPOST_CHANNEL_ID in Worker secrets)
   if (env.REPOST_CHANNEL_ID) {
     try {
       if (isPhoto) {
@@ -418,8 +439,7 @@ async function uploadImagesToCloudinary(fileIds, env) {
 function cleanTheText(text) {
   if (!text) return "";
 
-  // ✅ FIX: Full-coverage emoji matcher that keeps useful symbols
-  //    (●, ■, ★, →, ✓) while removing all emojis + their components.
+  // Full-coverage emoji matcher
   const EMOJI = /[\p{Extended_Pictographic}\u{1F3FB}-\u{1F3FF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{E0020}-\u{E007F}\u{1F1E6}-\u{1F1FF}]/gu;
 
   return text
@@ -427,12 +447,12 @@ function cleanTheText(text) {
     .replace(/https?:\/\/\S+/gi, "")
     .replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "")
     .replace(/@[a-zA-Z0-9_]{2,}/g, "")
-    // 2. ✅ FIX: Strip phone numbers ONLY when labeled — protects big prices
+    // 2. Strip phone numbers ONLY when labeled — protects big prices
     .replace(
       /(?:\b(?:tel|phone|call|ስልክ|ደውል)\b[\s:.]*)?(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}\b/gi,
       (m) => (/tel|phone|call|ስልክ|ደውል/i.test(m) ? "" : m)
     )
-    // 3. Strip emojis (after phone/url so we don't expose hidden ones)
+    // 3. Strip emojis
     .replace(EMOJI, "")
     // 4. Drop Markdown control chars
     .replace(/[*_~`|]/g, "")
@@ -472,7 +492,6 @@ function extractTitle(text) {
   if (/(urgent|አስቸኳይ|sale|ሽያጭ|for sale|የሚሸጥ)/i.test(title) && lines.length > 1) {
     title = lines[1];
   }
-  // ✅ FIX: Unicode-safe title truncation
   if (title.length > 55) title = safeSubstring(title, 55) + "…";
   return title;
 }
