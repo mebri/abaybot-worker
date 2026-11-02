@@ -164,7 +164,7 @@ async function processFinalAd(message, imageFileIds, env) {
     const projectId = env.FIREBASE_PROJECT_ID;
     const adOwnerId = env.ADMIN_UID || "admin_bot";
 
-    // ✅ FIX: Create a unique Document ID based on the Telegram message.
+    // ✅ Create a unique Document ID based on the Telegram message.
     // If Telegram sends the webhook twice, it updates the SAME document.
     const docId = message.media_group_id
       ? `tg_${message.chat.id}_${message.media_group_id}`
@@ -172,7 +172,7 @@ async function processFinalAd(message, imageFileIds, env) {
 
     const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
 
-    // ✅ FIX: Merge images if the document already exists 
+    // ✅ Merge images if the document already exists 
     let allImages = imageUrls;
     try {
       const checkRes = await fetch(fbUrl, {
@@ -212,7 +212,7 @@ async function processFinalAd(message, imageFileIds, env) {
       }
     };
 
-    // ✅ FIX: Use PATCH instead of POST to overwrite existing duplicates
+    // ✅ Use PATCH instead of POST to overwrite existing duplicates
     const fbRes = await fetch(fbUrl, {
       method: "PATCH",
       headers: {
