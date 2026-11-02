@@ -1,8 +1,9 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * Features:
- * - Bulletproof Entity Stripping (Fixes Telegram AI Editor errors)
- * - Advanced Emoji Removal
+ * - Saves to website (Firebase) FIRST
+ * - Uses Delete + Repost instead of Edit (Fixes AI Text Editor errors)
+ * - Handles multi-photo albums perfectly
  */
 
 const albumCache = new Map();
@@ -11,9 +12,7 @@ let tokenExpiresAt = 0;
 
 export default {
   async fetch(request, env, ctx) {
-    if (request.method !== "POST") {
-      return new Response("Bot is running ✅", { status: 200 });
-    }
+    if (request.method !== "POST") return new Response("Bot is running ✅", { status: 200 });
 
     try {
       const update = await request.json();
@@ -32,10 +31,8 @@ async function processUpdate(update, env) {
   // 1. Anti-bot protection
   if (message.from && message.from.is_bot) return;
 
-  // 2. Prevent infinite loops ONLY in the Repost Channel
-  if (env.REPOST_CHANNEL_ID && String(message.chat.id) === String(env.REPOST_CHANNEL_ID)) {
-    return;
-  }
+  // 2. Prevent infinite loops
+  if (env.REPOST_CHANNEL_ID && String(message.chat.id) === String(env.REPOST_CHANNEL_ID)) return;
 
   const rawText = (message.text || message.caption || "").trim();
 
@@ -58,6 +55,7 @@ async function processUpdate(update, env) {
     if (!albumCache.has(groupId)) {
       albumCache.set(groupId, {
         images: [],
+        messageIds: [], // ✅ Track IDs to delete the whole album later
         firstMessage: rawText.length > 3 ? message : null,
         timerActive: false,
         timestamp: Date.now()
@@ -68,6 +66,7 @@ async function processUpdate(update, env) {
 
     if (message.photo && message.photo.length > 0) {
       albumData.images.push(message.photo[message.photo.length - 1].file_id);
+      albumData.messageIds.push(message.message_id);
     }
     if (rawText.length > 3 && !albumData.firstMessage) {
       albumData.firstMessage = message;
@@ -81,7 +80,7 @@ async function processUpdate(update, env) {
       const finalData = albumCache.get(groupId);
       albumCache.delete(groupId);
 
-      await processFinalAd(finalData.firstMessage || message, Array.from(new Set(finalData.images)), env);
+      await processFinalAd(finalData.firstMessage || message, Array.from(new Set(finalData.images)), finalData.messageIds, env);
     }
 
     cleanupStaleAlbums();
@@ -98,7 +97,7 @@ async function processUpdate(update, env) {
     images.push(message.photo[message.photo.length - 1].file_id);
   }
 
-  await processFinalAd(message, images, env);
+  await processFinalAd(message, images, [message.message_id], env);
 }
 
 // ============================================
@@ -111,9 +110,7 @@ async function callTelegram(method, body, env) {
     body: JSON.stringify(body)
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok || !data.ok) {
-    throw new Error(`${method} → ${data.description || res.statusText} (${res.status})`);
-  }
+  if (!res.ok || !data.ok) throw new Error(`${method} → ${data.description || res.statusText}`);
   return data.result;
 }
 
@@ -131,10 +128,9 @@ function safeSubstring(str, maxLen) {
 // ============================================
 // MAIN PROCESSING
 // ============================================
-async function processFinalAd(message, imageFileIds, env) {
+async function processFinalAd(message, imageFileIds, messageIds, env) {
   const messageText = (message.text || message.caption || "").trim();
   const cleanText = cleanTheText(messageText);
-
   if (!cleanText || cleanText.length < 3) return;
 
   const category = detectCategory(cleanText);
@@ -143,12 +139,11 @@ async function processFinalAd(message, imageFileIds, env) {
 
   const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
 
-  // Save to Firebase
+  // ✅ 1. SAVE TO WEBSITE (FIREBASE) FIRST
   try {
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
     const adOwnerId = env.ADMIN_UID || "admin_bot";
-
     const docId = message.media_group_id ? `tg_${message.chat.id}_${message.media_group_id}` : `tg_${message.chat.id}_${message.message_id}`;
     const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
 
@@ -159,7 +154,7 @@ async function processFinalAd(message, imageFileIds, env) {
         const existingData = await checkRes.json();
         if (!message.media_group_id && existingData.fields?.createdAt?.timestampValue) {
           const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
-          if (Date.now() - createdTime < 30000) return; // Skip duplicate webhooks
+          if (Date.now() - createdTime < 30000) return; // Prevent duplicates
         }
         if (existingData.fields?.images?.arrayValue?.values) {
           const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
@@ -186,9 +181,11 @@ async function processFinalAd(message, imageFileIds, env) {
         createdAt: { timestampValue: new Date().toISOString() }
       }
     };
-
     await fetch(fbUrl, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(adData) });
-  } catch (fbErr) {}
+    console.log("✅ Saved to Website (Firebase)");
+  } catch (fbErr) {
+    console.error("Firebase Error:", fbErr.message);
+  }
 
   // Build Message
   const hashtagMap = { Cars: "#Cars", Houses: "#Houses", Rentals: "#Rentals", Electronics: "#Electronics", Furniture: "#Furniture", Clothes: "#Clothes", "Labor & Services": "#Labor", "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ" };
@@ -213,53 +210,40 @@ async function processFinalAd(message, imageFileIds, env) {
   const chatId = message.chat.id;
   const lastPhotoFileId = isPhoto ? message.photo[message.photo.length - 1].file_id : null;
 
-  // --- EDIT, OR DELETE & REPOST ---
+  // ✅ 2. DELETE ORIGINAL DIRTY POST(S)
   try {
-    if (isPhoto) {
-      // ✅ FIX: caption_entities: [] strips all AI formatting from the original message
-      await callTelegram("editMessageCaption", { 
-        chat_id: chatId, 
-        message_id: message.message_id, 
-        caption: safeSubstring(newPostText, 1024),
-        caption_entities: [] 
-      }, env);
+    if (messageIds.length === 1) {
+      await callTelegram("deleteMessage", { chat_id: chatId, message_id: messageIds[0] }, env);
     } else {
-      // ✅ FIX: entities: [] strips all AI formatting from the original message
-      await callTelegram("editMessageText", { 
-        chat_id: chatId, 
-        message_id: message.message_id, 
-        text: safeSubstring(newPostText, 4096),
-        entities: []
-      }, env);
+      await callTelegram("deleteMessages", { chat_id: chatId, message_ids: messageIds }, env);
     }
-    console.log("✅ Edited in place");
-  } catch (editErr) {
-    if (/not modified/i.test(String(editErr.message))) return;
-    
-    console.warn("⚠️ Edit blocked. Deleting original and posting clean version...");
-
-    try {
-      await callTelegram("deleteMessage", { chat_id: chatId, message_id: message.message_id }, env);
-    } catch (delErr) {}
-
-    try {
-      if (isPhoto) {
-        await callTelegram("sendPhoto", { chat_id: chatId, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
-      } else {
-        await callTelegram("sendMessage", { chat_id: chatId, text: safeSubstring(newPostText, 4096), entities: [] }, env);
-      }
-    } catch (repostErr) {}
+    console.log("✅ Deleted original dirty post(s)");
+  } catch (delErr) {
+    console.log("⚠️ Could not delete original (Bot needs Admin delete rights):", delErr.message);
   }
 
-  // --- SEND TO REPOST CHANNEL ---
+  // ✅ 3. SEND CLEAN POST TO MAIN CHAT
+  try {
+    if (isPhoto) {
+      await callTelegram("sendPhoto", { chat_id: chatId, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024) }, env);
+    } else {
+      await callTelegram("sendMessage", { chat_id: chatId, text: safeSubstring(newPostText, 4096) }, env);
+    }
+    console.log("✅ Posted clean ad to main chat");
+  } catch (e) {}
+
+  // ✅ 4. SEND TO REPOST CHANNEL
   if (env.REPOST_CHANNEL_ID) {
     try {
       if (isPhoto) {
-        await callTelegram("sendPhoto", { chat_id: env.REPOST_CHANNEL_ID, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
+        await callTelegram("sendPhoto", { chat_id: env.REPOST_CHANNEL_ID, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024) }, env);
       } else {
-        await callTelegram("sendMessage", { chat_id: env.REPOST_CHANNEL_ID, text: safeSubstring(newPostText, 4096), entities: [] }, env);
+        await callTelegram("sendMessage", { chat_id: env.REPOST_CHANNEL_ID, text: safeSubstring(newPostText, 4096) }, env);
       }
-    } catch (chErr) {}
+      console.log("✅ Sent to Repost Channel");
+    } catch (chErr) {
+      console.error("❌ Channel send failed:", chErr.message);
+    }
   }
 }
 
@@ -312,7 +296,6 @@ async function uploadImagesToCloudinary(fileIds, env) {
 
 function cleanTheText(text) {
   if (!text) return "";
-  // ✅ The ultimate emoji regex that strips all custom emojis, AI emojis, and standard emojis
   const EMOJI = /[\p{Extended_Pictographic}\u{1F3FB}-\u{1F3FF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{E0020}-\u{E007F}\u{1F1E6}-\u{1F1FF}]/gu;
   
   return text
