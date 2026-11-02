@@ -1,9 +1,9 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * Features:
+ * - STRICT Forward Blocking (Fixes Auto-Forward duplicates)
  * - Saves to website FIRST
- * - Watermark moved to TOP to prevent loop duplicates
- * - Delete & Repost fallback
+ * - Delete & Repost fallback for AI/Premium Emojis
  */
 
 const albumCache = new Map();
@@ -28,18 +28,29 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 1. Prevent infinite loops in Repost Channel
+  // ✅ 1. IGNORE FORWARDED MESSAGES (Stops the Auto-Forward loop)
+  if (message.forward_origin || message.forward_from_chat || message.forward_from) {
+    console.log("⏭️ Ignored: Message is a forward.");
+    return;
+  }
+
+  // ✅ 2. IGNORE MESSAGES SENT BY THE BOT (Stops loops)
+  const botId = env.TELEGRAM_BOT_TOKEN.split(":")[0];
+  if (message.from && String(message.from.id) === botId) return;
+  if (message.from && message.from.is_bot) return;
+
+  // ✅ 3. Ignore messages in the Repost Channel
   if (env.REPOST_CHANNEL_ID && String(message.chat.id) === String(env.REPOST_CHANNEL_ID)) return;
 
   const rawText = (message.text || message.caption || "").trim();
 
-  // 2. STRICT ANTI-LOOP TEXT CHECK
-  // If the bot sees its own formatting or watermarks, it stops immediately.
+  // ✅ 4. STRICT WATERMARK CHECK
   if (
     rawText.includes("🏢 የኛ ገበያ (Yegna Gebeya)") ||
     rawText.includes("📝 Title:") ||
     rawText.includes("💰 Price:") ||
     rawText.includes("@mebrigranite") ||
+    rawText.includes("0911680790") ||
     /#(Cars|Houses|Rentals|Electronics|Furniture|Clothes|Labor|ምንአለሽ_ተራ|Other)\b/i.test(rawText)
   ) {
     console.log("⏭️ Ignored: Message is bot's own repost.");
@@ -194,13 +205,12 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   let safeDetails = safeSubstring(cleanText, 800);
   if (cleanText.length > 800) safeDetails = safeDetails.trimEnd() + "…";
 
-  // ✅ 2. WATERMARK MOVED TO TOP (So it can never be cut off)
-  let newPostText = `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
-  newPostText += `━━━━━━━━━━━━━━━\n`;
-  newPostText += `📝 Title: ${title}\n`;
+  // ✅ Business Card at the bottom (as you preferred)
+  let newPostText = `📝 Title: ${title}\n`;
   newPostText += `💰 Price: ${displayPriceText}\n\n`;
   newPostText += `📄 Details:\n${safeDetails}\n\n`;
   newPostText += `━━━━━━━━━━━━━━━\n`;
+  newPostText += `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
   newPostText += `📞 Phone: 0911680790\n`;
   newPostText += `🌐 Website: mebri.yegna.workers.dev\n`;
   newPostText += `✈️ Telegram: @mebrigranite\n`;
@@ -213,21 +223,21 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
 
   let messageHandled = false;
 
-  // ✅ 3. TRY TO EDIT (Stripping entities: [])
+  // ✅ 2. TRY TO EDIT (Stripping hidden entities)
   try {
     if (isPhoto) {
       await callTelegram("editMessageCaption", { 
         chat_id: chatId, 
         message_id: message.message_id, 
         caption: safeSubstring(newPostText, 1024),
-        caption_entities: [] // Force strip AI text formatting
+        caption_entities: [] 
       }, env);
     } else {
       await callTelegram("editMessageText", { 
         chat_id: chatId, 
         message_id: message.message_id, 
         text: safeSubstring(newPostText, 4096),
-        entities: [] // Force strip AI text formatting
+        entities: [] 
       }, env);
     }
     console.log("✅ Edited in place");
@@ -236,7 +246,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     console.log("⚠️ Edit failed (Premium Emojis/AI Editor). Attempting delete...", editErr.message);
   }
 
-  // ✅ 4. IF EDIT FAILED, DELETE AND REPOST
+  // ✅ 3. IF EDIT FAILED, DELETE AND REPOST
   if (!messageHandled) {
     try {
       if (messageIds.length === 1) {
@@ -261,7 +271,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     }
   }
 
-  // ✅ 5. SEND TO REPOST CHANNEL
+  // ✅ 4. SEND TO REPOST CHANNEL
   if (env.REPOST_CHANNEL_ID) {
     try {
       if (isPhoto) {
