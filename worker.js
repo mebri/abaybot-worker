@@ -2,12 +2,12 @@
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * 
  * Features:
- * 1. Title Arranger: Formats clean titles [Year] [Brand] [Model] [Trim]
+ * 1. Title Arranger: [Year] [Brand] [Model] [Trim]
  * 2. Brand, Model & Production Year Extractor
  * 3. Deep Category & Subcategory Classifier (Electric EV, SUV, Sedan, etc.)
- * 4. Zero Duplicates: Deterministic ad_${textHash} Firestore docId & auto-forward filtering
- * 5. Full Emoji & Text Cleaning (Preserves Amharic characters)
- * 6. Mathematical Price Converter & Business Card Formatting
+ * 4. Real Ad Price Reference: Accurately calculates 7,400,000 ETB (Never guesses year 2025 as ETB 2,025)
+ * 5. Zero Duplicates: Deterministic ad_${textHash} docId & auto-forward filtering
+ * 6. Full Emoji & Text Cleaning (Preserves Amharic characters)
  */
 
 const albumCache = new Map();
@@ -29,7 +29,7 @@ export default {
 };
 
 async function processUpdate(update, env) {
-  // 1. ANTI-DUPLICATE: Ignore edited messages (prevents repeat loop/duplicate when bot edits caption)
+  // 1. ANTI-DUPLICATE: Ignore edited messages
   if (update.edited_message || update.edited_channel_post) return;
 
   const message = update.message || update.channel_post;
@@ -67,7 +67,7 @@ async function processUpdate(update, env) {
   }
 
   // ============================================
-  // ALBUM HANDLING (Multi-photo posts)
+  // ALBUM HANDLING
   // ============================================
   if (message.media_group_id) {
     const groupId = message.media_group_id;
@@ -171,17 +171,17 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   // 2. Determine Category and Subcategory
   const { category, subcategory } = determineCategoryAndSubcategory(cleanText, meta.brand, meta.model, meta.suggestedSubcategory);
 
-  // 3. Arrange Standardized Clean Title
+  // 3. Arrange Standardized Title
   const title = arrangeTitle(cleanText, meta.brand, meta.model, meta.year, meta.trim, category, subcategory);
 
-  // 4. Parse Price
-  const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText || messageText);
+  // 4. Parse Real Price from Ad (Never guesses year 2025 as price)
+  const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText || messageText, meta.year);
 
   // 5. Upload images to Cloudinary
   const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
   const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
   
-  // ✅ 6. SAVE TO WEBSITE (FIREBASE) FIRST WITH STRUCTURED METADATA
+  // 6. SAVE TO WEBSITE (FIREBASE) WITH STRUCTURED METADATA
   try {
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
@@ -240,7 +240,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       }
     };
     await fetch(fbUrl, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(adData) });
-    console.log("✅ Saved to Website (Firebase) with Brand, Model & Subcategory");
+    console.log("✅ Saved to Website (Firebase) with Brand, Model, Year & Price");
   } catch (fbErr) {
     console.error("Firebase Error:", fbErr.message);
   }
@@ -278,7 +278,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
 
   let messageHandled = false;
 
-  // 8. TRY TO EDIT IN PLACE (Stripping hidden AI/Premium entities)
+  // 8. TRY TO EDIT IN PLACE
   try {
     if (isPhoto) {
       await callTelegram("editMessageCaption", { 
@@ -301,7 +301,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     console.log("⚠️ Edit failed. Deleting & Reposting...", editErr.message);
   }
 
-  // 9. IF EDIT FAILED, DELETE DIRTY POST AND REPOST CLEAN ONE
+  // 9. IF EDIT FAILED, DELETE AND REPOST
   if (!messageHandled) {
     try {
       if (messageIds.length === 1) {
@@ -323,7 +323,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     }
   }
 
-  // 10. FORWARD/SEND TO REPOST CHANNEL
+  // 10. SEND TO REPOST CHANNEL
   if (env.REPOST_CHANNEL_ID) {
     try {
       if (isPhoto) {
@@ -347,7 +347,6 @@ function extractBrandModelYear(text) {
   let fuelType = "";
   let suggestedSubcategory = "";
 
-  // 1. Direct key-value extraction
   const makeMatch = text.match(/(?:Make|የመኪናው\s*ዓይነት|Brand|ብራንድ)[\s:=-]+([a-zA-Z0-9\s/._-]+)/i);
   if (makeMatch && makeMatch[1]) brand = makeMatch[1].split("\n")[0].trim();
 
@@ -371,7 +370,6 @@ function extractBrandModelYear(text) {
   const fuelMatch = text.match(/(?:Fuel|ነዳጅ)[\s:=-]+([a-zA-Z0-9\s/._-]+)/i);
   if (fuelMatch && fuelMatch[1]) fuelType = fuelMatch[1].split("\n")[0].trim();
 
-  // 2. Pattern Matching against Car and Electronics Brands Database
   const carDatabase = [
     { name: "BYD", pattern: /\b(byd|ባይድ)\b/i, models: [
       { name: "Sealion 06 EV", pattern: /sealion\s*06/i, subcategory: "Electric (EV)" },
@@ -405,21 +403,11 @@ function extractBrandModelYear(text) {
       { name: "Avante", pattern: /avante|አቫንቴ/i, subcategory: "Sedan" },
       { name: "Creta", pattern: /creta|ክሬታ/i, subcategory: "SUV / Crossover" }
     ]},
-    { name: "Mercedes-Benz", pattern: /\b(mercedes|benz|መርሴዲስ|ቤንዝ)\b/i, models: [
-      { name: "C-Class", pattern: /c-?class|c\s*\d{3}/i, subcategory: "Sedan" },
-      { name: "E-Class", pattern: /e-?class|e\s*\d{3}/i, subcategory: "Sedan" },
-      { name: "GLE", pattern: /gle/i, subcategory: "SUV / Crossover" },
-      { name: "G-Wagon", pattern: /g-?wagon|g\s*63/i, subcategory: "SUV / Crossover" }
-    ]},
     { name: "Apple", pattern: /\b(apple|iphone|ipad|macbook|አፕል|አይፎን)\b/i, models: [
       { name: "iPhone 16 Pro Max", pattern: /16\s*pro\s*max/i, subcategory: "Smartphones & Tablets" },
       { name: "iPhone 15 Pro Max", pattern: /15\s*pro\s*max/i, subcategory: "Smartphones & Tablets" },
       { name: "iPhone 15", pattern: /iphone\s*15/i, subcategory: "Smartphones & Tablets" },
       { name: "MacBook Pro", pattern: /macbook\s*pro/i, subcategory: "Laptops & Computers" }
-    ]},
-    { name: "Samsung", pattern: /\b(samsung|ሳምሰንግ|galaxy)\b/i, models: [
-      { name: "Galaxy S24 Ultra", pattern: /s24\s*ultra/i, subcategory: "Smartphones & Tablets" },
-      { name: "Galaxy S23 Ultra", pattern: /s23\s*ultra/i, subcategory: "Smartphones & Tablets" }
     ]}
   ];
 
@@ -539,29 +527,83 @@ function determineCategoryAndSubcategory(text, brand, model, suggestedSubcat) {
 }
 
 // ============================================
-// HELPERS (100% UNTOUCHED)
+// ACCURATE PRICE PARSER (NEVER GUESSES YEARS)
 // ============================================
-function parseMathematicalPrice(text) {
-  const millionMatch = text.match(/([\d.]+)\s*(?:million|mil|mln|m|ሚሊዮን)\b/i);
-  if (millionMatch) {
-    const val = parseFloat(millionMatch[1]);
-    if (!isNaN(val) && val > 0 && val < 1000) return { formattedPrice: Math.round(val * 1000000).toLocaleString("en-US"), rawPrice: Math.round(val * 1000000).toString() };
+function parseMathematicalPrice(text, knownYear) {
+  if (!text) return { formattedPrice: "0", rawPrice: "0" };
+
+  const detectedYear = (knownYear ? knownYear.split("/")[0] : "") || "";
+
+  // 1. Check EXPLICIT PRICE line first (with 💰, Price, ዋጋ, fixed, etc.)
+  // Matches: 💰Price: 7.400,000 ETB Million OR Price: 7.4 Million OR ዋጋ 7.4 ሚሊዮን
+  const explicitLineMatch = text.match(/(?:💰|price|ዋጋ|fixed|የመሸጫ\s*ዋጋ)\s*[:=.-]?\s*([0-9.,]+)\s*(?:ETB|ብር|Birr)?\s*(?:million|mil|mln|m|ሚሊዮን)?/i);
+  if (explicitLineMatch && explicitLineMatch[1]) {
+    const rawVal = explicitLineMatch[1];
+    const isMillion = /(?:million|mil|mln|m|ሚሊዮን)/i.test(explicitLineMatch[0]);
+
+    if (isMillion) {
+      const cleanNum = rawVal.replace(/,/g, "");
+      const val = parseFloat(cleanNum);
+      if (!isNaN(val) && val > 0) {
+        if (val < 1000) {
+          const finalNum = Math.round(val * 1000000);
+          return { formattedPrice: finalNum.toLocaleString("en-US"), rawPrice: finalNum.toString() };
+        } else {
+          const finalNum = Math.round(val);
+          return { formattedPrice: finalNum.toLocaleString("en-US"), rawPrice: finalNum.toString() };
+        }
+      }
+    } else {
+      const num = parseInt(rawVal.replace(/[.,]/g, ""), 10);
+      if (!isNaN(num) && num > 100 && num.toString() !== detectedYear) {
+        return { formattedPrice: num.toLocaleString("en-US"), rawPrice: num.toString() };
+      }
+    }
   }
-  const thousandMatch = text.match(/([\d.]+)\s*(?:k|thousand|ሺህ|ሺ)\b/i);
-  if (thousandMatch) {
-    const val = parseFloat(thousandMatch[1]);
-    if (!isNaN(val) && val > 0 && val < 10000) return { formattedPrice: Math.round(val * 1000).toLocaleString("en-US"), rawPrice: Math.round(val * 1000).toString() };
+
+  // 2. Matches general Million patterns: "7.400,000 ETB Million", "7.4 Million", "7.4 ሚሊዮን"
+  const generalMillionMatch = text.match(/([0-9]+(?:[.,][0-9]+)*)\s*(?:ETB|ብር|Birr)?\s*(?:million|mil|mln|m|ሚሊዮን)\b/i);
+  if (generalMillionMatch && generalMillionMatch[1]) {
+    const rawVal = generalMillionMatch[1];
+    const cleanNum = rawVal.replace(/,/g, "");
+    const val = parseFloat(cleanNum);
+    if (!isNaN(val) && val > 0) {
+      if (val < 1000) {
+        const finalNum = Math.round(val * 1000000);
+        return { formattedPrice: finalNum.toLocaleString("en-US"), rawPrice: finalNum.toString() };
+      } else {
+        const finalNum = Math.round(val);
+        return { formattedPrice: finalNum.toLocaleString("en-US"), rawPrice: finalNum.toString() };
+      }
+    }
   }
-  const explicitMatch = text.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
-  if (explicitMatch) {
-    const num = parseInt(explicitMatch[1].replace(/[.,]/g, "").trim(), 10);
-    if (!isNaN(num) && num > 50) return { formattedPrice: num.toLocaleString("en-US"), rawPrice: num.toString() };
+
+  // 3. Matches general Thousand patterns: "850k", "500 thousand", "500 ሺህ"
+  const thousandMatch = text.match(/([0-9]+(?:[.,][0-9]+)*)\s*(?:ETB|ብር|Birr)?\s*(?:k|thousand|ሺህ|ሺ)\b/i);
+  if (thousandMatch && thousandMatch[1]) {
+    const rawVal = thousandMatch[1];
+    const val = parseFloat(rawVal.replace(/,/g, ""));
+    if (!isNaN(val) && val > 0 && val < 10000) {
+      const finalNum = Math.round(val * 1000);
+      return { formattedPrice: finalNum.toLocaleString("en-US"), rawPrice: finalNum.toString() };
+    }
   }
-  const standaloneMatch = text.match(/\b(\d{1,3}(?:,\d{3})+|\d{4,9})\b/);
-  if (standaloneMatch) {
-    const num = parseInt(standaloneMatch[1].replace(/[.,]/g, "").trim(), 10);
-    if (!isNaN(num) && num >= 500) return { formattedPrice: num.toLocaleString("en-US"), rawPrice: num.toString() };
+
+  // 4. Matches explicit currency tags: "7,400,000 ETB", "ETB 7,400,000", "7,400,000 ብር"
+  const currencyMatch = text.match(/(?:ETB|ብር|Birr)\s*[:=.-]?\s*([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{5,10})|([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{5,10})\s*(?:ETB|ብር|Birr)/i);
+  if (currencyMatch) {
+    const rawVal = currencyMatch[1] || currencyMatch[2];
+    if (rawVal) {
+      const num = parseInt(rawVal.replace(/[.,]/g, ""), 10);
+      if (!isNaN(num) && num > 100 && num.toString() !== detectedYear) {
+        return { formattedPrice: num.toLocaleString("en-US"), rawPrice: num.toString() };
+      }
+    }
   }
+
+  // 5. DO NOT GUESS STANDALONE NUMBERS!
+  // If no price or currency keyword is present in the ad, return 0 (Negotiable / ተደራዳሪ).
+  // Never guess years like 2025 or mileage 3,000 as price!
   return { formattedPrice: "0", rawPrice: "0" };
 }
 
