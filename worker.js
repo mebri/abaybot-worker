@@ -19,7 +19,6 @@ export default {
 
 async function processUpdate(update, env) {
   // 🚨 1. ANTI-LOOP & DUPLICATE PROTECTION
-  // Ignore edited messages (prevents loop when bot edits caption)
   if (update.edited_message || update.edited_channel_post) return;
 
   const message = update.message || update.channel_post;
@@ -27,11 +26,25 @@ async function processUpdate(update, env) {
 
   if (message.from && message.from.is_bot) return;
 
-  // Stop duplicate if Telegram automatically forwards channel post to linked discussion group
-  if (message.is_automatic_forward || message.forward_from_chat) return;
+  // Stop duplicates from discussion groups and automatic forwards
+  if (
+    message.is_automatic_forward ||
+    message.forward_from_chat ||
+    (message.chat && (message.chat.type === "group" || message.chat.type === "supergroup"))
+  ) {
+    return;
+  }
   
   const text = (message.text || message.caption || "").trim();
-  if (text.includes("#Cars") || text.includes("#Electronics") || text.includes("Yegna Gebeya") || text.includes("የኛ ገበያ")) return;
+  if (
+    text.includes("#Cars") ||
+    text.includes("#Electronics") ||
+    text.includes("Yegna Gebeya") ||
+    text.includes("የኛ ገበያ") ||
+    text.includes("0911680790")
+  ) {
+    return;
+  }
 
   // ============================================
   // ALBUM LOGIC (Multiple Images)
