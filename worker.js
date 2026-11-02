@@ -1,9 +1,5 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
- * Features:
- * - Strict Channel Loop Protection
- * - Prevents text truncation on long ads
- * - Unicode-safe text cleaning
  */
 
 const albumCache = new Map();
@@ -30,25 +26,16 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 1. Anti-bot protection (for groups)
+  // 1. Anti-bot protection
   if (message.from && message.from.is_bot) return;
 
-  // ✅ FIX: Hard block for Channel Posts. 
-  // If the message has a channel_post, it came from the bot's own channel repost.
-  if (update.channel_post) {
-    console.log("⏭️ Ignoring channel post to prevent loop.");
-    return;
-  }
-
-  // ✅ FIX: Hard block for the Repost Channel ID
-  if (env.REPOST_CHANNEL_ID && String(message.chat.id) === String(env.REPOST_CHANNEL_ID)) {
-    console.log("⏭️ Ignoring message in the repost channel.");
-    return;
-  }
+  // 2. Block channel posts (prevent loops)
+  if (update.channel_post) return;
+  if (env.REPOST_CHANNEL_ID && String(message.chat.id) === String(env.REPOST_CHANNEL_ID)) return;
 
   const rawText = (message.text || message.caption || "").trim();
 
-  // 2. Comprehensive Anti-Loop Protection
+  // 3. Anti-Loop Protection
   if (
     rawText.includes("የኛ ገበያ") ||
     rawText.includes("@mebrigranite") ||
@@ -59,7 +46,7 @@ async function processUpdate(update, env) {
   }
 
   // ============================================
-  // ALBUM HANDLING (Media Groups)
+  // ALBUM HANDLING
   // ============================================
   if (message.media_group_id) {
     const groupId = message.media_group_id;
@@ -78,7 +65,6 @@ async function processUpdate(update, env) {
     if (message.photo && message.photo.length > 0) {
       albumData.images.push(message.photo[message.photo.length - 1].file_id);
     }
-
     if (rawText.length > 3 && !albumData.firstMessage) {
       albumData.firstMessage = message;
     }
@@ -91,11 +77,7 @@ async function processUpdate(update, env) {
       const finalData = albumCache.get(groupId);
       albumCache.delete(groupId);
 
-      await processFinalAd(
-        finalData.firstMessage || message,
-        Array.from(new Set(finalData.images)),
-        env
-      );
+      await processFinalAd(finalData.firstMessage || message, Array.from(new Set(finalData.images)), env);
     }
 
     cleanupStaleAlbums();
@@ -103,7 +85,7 @@ async function processUpdate(update, env) {
   }
 
   // ============================================
-  // SINGLE IMAGE OR TEXT-ONLY POST
+  // SINGLE POST
   // ============================================
   if (rawText.length < 3) return;
 
@@ -119,14 +101,11 @@ async function processUpdate(update, env) {
 // SAFE TELEGRAM API WRAPPER
 // ============================================
 async function callTelegram(method, body, env) {
-  const res = await fetch(
-    `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    }
-  );
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || !data.ok) {
     throw new Error(`${method} → ${data.description || res.statusText} (${res.status})`);
@@ -146,7 +125,7 @@ function safeSubstring(str, maxLen) {
 }
 
 // ============================================
-// MAIN PROCESSING & CLOUDINARY UPLOAD
+// MAIN PROCESSING
 // ============================================
 async function processFinalAd(message, imageFileIds, env) {
   const messageText = (message.text || message.caption || "").trim();
@@ -166,10 +145,7 @@ async function processFinalAd(message, imageFileIds, env) {
     const projectId = env.FIREBASE_PROJECT_ID;
     const adOwnerId = env.ADMIN_UID || "admin_bot";
 
-    const docId = message.media_group_id
-      ? `tg_${message.chat.id}_${message.media_group_id}`
-      : `tg_${message.chat.id}_${message.message_id}`;
-
+    const docId = message.media_group_id ? `tg_${message.chat.id}_${message.media_group_id}` : `tg_${message.chat.id}_${message.message_id}`;
     const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
 
     let allImages = imageUrls;
@@ -179,7 +155,7 @@ async function processFinalAd(message, imageFileIds, env) {
         const existingData = await checkRes.json();
         if (!message.media_group_id && existingData.fields?.createdAt?.timestampValue) {
           const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
-          if (Date.now() - createdTime < 30000) return; // Skip duplicate
+          if (Date.now() - createdTime < 30000) return;
         }
         if (existingData.fields?.images?.arrayValue?.values) {
           const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
@@ -207,11 +183,7 @@ async function processFinalAd(message, imageFileIds, env) {
       }
     };
 
-    await fetch(fbUrl, {
-      method: "PATCH",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify(adData)
-    });
+    await fetch(fbUrl, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(adData) });
   } catch (fbErr) {}
 
   // Build Message
@@ -219,7 +191,6 @@ async function processFinalAd(message, imageFileIds, env) {
   const hashtag = hashtagMap[category] || "#Other";
   const displayPriceText = formattedPrice && formattedPrice !== "0" ? `${formattedPrice} ETB` : "Negotiable / ተደራዳሪ";
 
-  // ✅ FIX: Reduced max length to 800 to leave room for the footer
   let safeDetails = safeSubstring(cleanText, 800);
   if (cleanText.length > 800) safeDetails = safeDetails.trimEnd() + "…";
 
@@ -238,25 +209,34 @@ async function processFinalAd(message, imageFileIds, env) {
   const chatId = message.chat.id;
   const lastPhotoFileId = isPhoto ? message.photo[message.photo.length - 1].file_id : null;
 
+  // --- EDIT OR REPOST ---
   try {
     if (isPhoto) {
       await callTelegram("editMessageCaption", { chat_id: chatId, message_id: message.message_id, caption: safeSubstring(newPostText, 1024) }, env);
     } else {
       await callTelegram("editMessageText", { chat_id: chatId, message_id: message.message_id, text: safeSubstring(newPostText, 4096) }, env);
     }
+    console.log("✅ Edited in place");
   } catch (editErr) {
     if (!/not modified/i.test(String(editErr.message))) {
+      console.warn("⚠️ Edit failed, trying fallback repost:", editErr.message);
+      
+      // Fallback: Send as a NEW message. 
+      // We do NOT delete the original because we might not have delete permissions.
       try {
         if (isPhoto) {
           await callTelegram("sendPhoto", { chat_id: chatId, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024) }, env);
         } else {
           await callTelegram("sendMessage", { chat_id: chatId, text: safeSubstring(newPostText, 4096) }, env);
         }
-      } catch (repostErr) {}
+        console.log("✅ Reposted as new message");
+      } catch (repostErr) {
+        console.error("❌ Repost also failed:", repostErr.message);
+      }
     }
   }
 
-  // Send to channel
+  // --- SEND TO REPOST CHANNEL ---
   if (env.REPOST_CHANNEL_ID) {
     try {
       if (isPhoto) {
@@ -264,7 +244,10 @@ async function processFinalAd(message, imageFileIds, env) {
       } else {
         await callTelegram("sendMessage", { chat_id: env.REPOST_CHANNEL_ID, text: safeSubstring(newPostText, 4096) }, env);
       }
-    } catch (chErr) {}
+      console.log("✅ Sent to channel");
+    } catch (chErr) {
+      console.error("❌ Channel send failed:", chErr.message);
+    }
   }
 }
 
