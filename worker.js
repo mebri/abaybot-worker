@@ -1,12 +1,14 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * Features:
- * - STRICT Forward Blocking (Fixes Auto-Forward duplicates)
+ * - Duplicate Text Hash Check (Stops Auto-Forward duplicates)
  * - Saves to website FIRST
- * - Delete & Repost fallback for AI/Premium Emojis
+ * - Wipes hidden AI Entities
+ * - Delete & Repost fallback
  */
 
 const albumCache = new Map();
+const recentHashes = new Map(); // ✅ Tracks recent text to stop duplicates
 let cachedFirebaseToken = null;
 let tokenExpiresAt = 0;
 
@@ -28,21 +30,39 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // ✅ 1. IGNORE FORWARDED MESSAGES (Stops the Auto-Forward loop)
-  if (message.forward_origin || message.forward_from_chat || message.forward_from) {
-    console.log("⏭️ Ignored: Message is a forward.");
-    return;
+  // ✅ 1. IGNORE TARGET CHANNEL
+  if (env.REPOST_CHANNEL_ID) {
+    const target = String(env.REPOST_CHANNEL_ID).replace("@", "").toLowerCase();
+    const currentId = String(message.chat.id);
+    const currentUsername = (message.chat.username || "").toLowerCase();
+    
+    if (currentId === target || (currentUsername && currentUsername === target)) {
+      console.log("⏭️ Ignored: Message is from the Repost Channel.");
+      return;
+    }
   }
 
-  // ✅ 2. IGNORE MESSAGES SENT BY THE BOT (Stops loops)
+  // ✅ 2. IGNORE BOT MESSAGES
   const botId = env.TELEGRAM_BOT_TOKEN.split(":")[0];
   if (message.from && String(message.from.id) === botId) return;
   if (message.from && message.from.is_bot) return;
 
-  // ✅ 3. Ignore messages in the Repost Channel
-  if (env.REPOST_CHANNEL_ID && String(message.chat.id) === String(env.REPOST_CHANNEL_ID)) return;
-
   const rawText = (message.text || message.caption || "").trim();
+
+  // ✅ 3. DUPLICATE TEXT HASH PROTECTION (Stops Auto-Forwarders)
+  // Strips all emojis and spaces to create a unique "fingerprint" of the text
+  const cleanTextForCheck = cleanTheText(rawText).replace(/\s+/g, '');
+  if (cleanTextForCheck.length > 10) {
+    const hash = simpleHash(cleanTextForCheck);
+    if (recentHashes.has(hash)) {
+      const lastSeen = recentHashes.get(hash);
+      if (Date.now() - lastSeen < 120000) { // 2 minutes
+        console.log("⏭️ Ignored: Duplicate text detected within 2 minutes.");
+        return;
+      }
+    }
+    recentHashes.set(hash, Date.now());
+  }
 
   // ✅ 4. STRICT WATERMARK CHECK
   if (
@@ -53,7 +73,6 @@ async function processUpdate(update, env) {
     rawText.includes("0911680790") ||
     /#(Cars|Houses|Rentals|Electronics|Furniture|Clothes|Labor|ምንአለሽ_ተራ|Other)\b/i.test(rawText)
   ) {
-    console.log("⏭️ Ignored: Message is bot's own repost.");
     return;
   }
 
@@ -109,6 +128,18 @@ async function processUpdate(update, env) {
   }
 
   await processFinalAd(message, images, [message.message_id], env);
+}
+
+// ============================================
+// HASH FUNCTION (For Duplicate Check)
+// ============================================
+function simpleHash(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i);
+    hash = hash & hash;
+  }
+  return hash.toString();
 }
 
 // ============================================
@@ -205,7 +236,6 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   let safeDetails = safeSubstring(cleanText, 800);
   if (cleanText.length > 800) safeDetails = safeDetails.trimEnd() + "…";
 
-  // ✅ Business Card at the bottom (as you preferred)
   let newPostText = `📝 Title: ${title}\n`;
   newPostText += `💰 Price: ${displayPriceText}\n\n`;
   newPostText += `📄 Details:\n${safeDetails}\n\n`;
