@@ -2,8 +2,9 @@
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * Features:
  * - Saves to website FIRST
- * - Wipes all hidden AI Entities (custom_emoji, text_link, etc.)
+ * - Wipes all hidden AI Entities
  * - If edit fails, deletes and reposts.
+ * - STRICT BOT ID LOOP PREVENTION (Fixes duplicate website entries)
  */
 
 const albumCache = new Map();
@@ -28,21 +29,32 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 1. Anti-bot protection
+  // ✅ 1. STRICT BOT LOOP PREVENTION
+  // Check if the message was sent by THIS bot. If yes, ignore immediately.
+  const botId = env.TELEGRAM_BOT_TOKEN.split(":")[0];
+  if (message.from && String(message.from.id) === botId) {
+    console.log("⏭️ Ignored: Message was sent by the bot itself.");
+    return;
+  }
+
+  // Fallback anti-bot check
   if (message.from && message.from.is_bot) return;
 
-  // 2. Prevent infinite loops
+  // 2. Prevent infinite loops in Repost Channel
   if (env.REPOST_CHANNEL_ID && String(message.chat.id) === String(env.REPOST_CHANNEL_ID)) return;
 
   const rawText = (message.text || message.caption || "").trim();
 
-  // 3. Anti-Loop Text Check
+  // 3. STRICT TEXT CHECK (Catches any bot watermarks)
   if (
-    rawText.includes("የኛ ገበያ") ||
-    rawText.includes("@mebrigranite") ||
     rawText.includes("Yegna Gebeya") ||
+    rawText.includes("mebrigranite") ||
+    rawText.includes("0911680790") ||
+    rawText.includes("የኛ ገበያ") ||
+    (rawText.includes("📝 Title:") && rawText.includes("💰 Price:")) ||
     /#(Cars|Houses|Rentals|Electronics|Furniture|Clothes|Labor|ምንአለሽ_ተራ|Other)\b/i.test(rawText)
   ) {
+    console.log("⏭️ Ignored: Message contains bot watermark.");
     return;
   }
 
@@ -251,9 +263,9 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     // Post the new clean message
     try {
       if (isPhoto) {
-        await callTelegram("sendPhoto", { chat_id: chatId, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024) }, env);
+        await callTelegram("sendPhoto", { chat_id: chatId, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
       } else {
-        await callTelegram("sendMessage", { chat_id: chatId, text: safeSubstring(newPostText, 4096) }, env);
+        await callTelegram("sendMessage", { chat_id: chatId, text: safeSubstring(newPostText, 4096), entities: [] }, env);
       }
       console.log("✅ Sent clean message to main chat");
     } catch (repostErr) {
@@ -265,9 +277,9 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   if (env.REPOST_CHANNEL_ID) {
     try {
       if (isPhoto) {
-        await callTelegram("sendPhoto", { chat_id: env.REPOST_CHANNEL_ID, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024) }, env);
+        await callTelegram("sendPhoto", { chat_id: env.REPOST_CHANNEL_ID, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
       } else {
-        await callTelegram("sendMessage", { chat_id: env.REPOST_CHANNEL_ID, text: safeSubstring(newPostText, 4096) }, env);
+        await callTelegram("sendMessage", { chat_id: env.REPOST_CHANNEL_ID, text: safeSubstring(newPostText, 4096), entities: [] }, env);
       }
       console.log("✅ Sent to Repost Channel");
     } catch (chErr) {
