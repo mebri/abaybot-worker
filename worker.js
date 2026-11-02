@@ -3,7 +3,6 @@
  */
 
 const albumCache = new Map();
-const recentHashes = new Map(); 
 let cachedFirebaseToken = null;
 let tokenExpiresAt = 0;
 
@@ -25,39 +24,22 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // ✅ 1. IGNORE TARGET CHANNEL
+  // 1. Ignore target channel
   if (env.REPOST_CHANNEL_ID) {
     const target = String(env.REPOST_CHANNEL_ID).replace("@", "").toLowerCase();
     const currentId = String(message.chat.id);
     const currentUsername = (message.chat.username || "").toLowerCase();
-    
-    if (currentId === target || (currentUsername && currentUsername === target)) {
-      return;
-    }
+    if (currentId === target || (currentUsername && currentUsername === target)) return;
   }
 
-  // ✅ 2. IGNORE BOT MESSAGES
+  // 2. Ignore bot messages
   const botId = env.TELEGRAM_BOT_TOKEN.split(":")[0];
   if (message.from && String(message.from.id) === botId) return;
   if (message.from && message.from.is_bot) return;
 
   const rawText = (message.text || message.caption || "").trim();
 
-  // ✅ 3. DUPLICATE TEXT HASH PROTECTION
-  const cleanTextForCheck = cleanTheText(rawText).replace(/\s+/g, '');
-  if (cleanTextForCheck.length > 10) {
-    const hash = simpleHash(cleanTextForCheck);
-    if (recentHashes.has(hash)) {
-      const lastSeen = recentHashes.get(hash);
-      if (Date.now() - lastSeen < 120000) { 
-        console.log("⏭️ Ignored: Duplicate text detected within 2 minutes.");
-        return;
-      }
-    }
-    recentHashes.set(hash, Date.now());
-  }
-
-  // ✅ 4. STRICT WATERMARK CHECK
+  // 3. Strict Watermark Check
   if (
     rawText.includes("🏢 የኛ ገበያ (Yegna Gebeya)") ||
     rawText.includes("📝 Title:") ||
@@ -132,7 +114,7 @@ function simpleHash(str) {
     hash = ((hash << 5) - hash) + str.charCodeAt(i);
     hash = hash & hash;
   }
-  return hash.toString();
+  return Math.abs(hash).toString();
 }
 
 // ============================================
@@ -172,13 +154,20 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   const title = extractTitle(cleanText);
   const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText);
 
-  // ✅ SAVE TO WEBSITE (FIREBASE) FIRST
+  // ✅ 1. SAVE TO WEBSITE (FIREBASE) FIRST (With Text Hash Duplicate Check)
   const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
+  const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
+  
   try {
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
     const adOwnerId = env.ADMIN_UID || "admin_bot";
-    const docId = message.media_group_id ? `tg_${message.chat.id}_${message.media_group_id}` : `tg_${message.chat.id}_${message.message_id}`;
+    
+    // We use the Text Hash as the Document ID. If the same text is sent, it hits the same document.
+    const docId = message.media_group_id 
+      ? `tg_${message.chat.id}_${message.media_group_id}` 
+      : `ad_${textHash}`; 
+      
     const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
 
     let allImages = imageUrls;
@@ -186,10 +175,16 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       const checkRes = await fetch(fbUrl, { headers: { Authorization: `Bearer ${token}` } });
       if (checkRes.ok) {
         const existingData = await checkRes.json();
-        if (!message.media_group_id && existingData.fields?.createdAt?.timestampValue) {
+        
+        // ✅ STRICT DUPLICATE CHECK: If it was created in the last 5 minutes, ignore it
+        if (existingData.fields?.createdAt?.timestampValue) {
           const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
-          if (Date.now() - createdTime < 30000) return;
+          if (Date.now() - createdTime < 300000) { // 5 minutes
+            console.log("⏭️ Ignored: Duplicate text detected on website.");
+            return; // Stop processing, don't post to Telegram again
+          }
         }
+
         if (existingData.fields?.images?.arrayValue?.values) {
           const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
           allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
@@ -201,6 +196,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       fields: {
         title: { stringValue: title },
         description: { stringValue: cleanText },
+        textHash: { stringValue: textHash },
         price: { stringValue: formattedPrice },
         rawPrice: { integerValue: rawPrice },
         phone: { stringValue: "0911680790" },
@@ -246,30 +242,30 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
 
   let messageHandled = false;
 
-  // ✅ TRY TO EDIT (Stripping hidden AI/Premium entities)
+  // ✅ 2. TRY TO EDIT (Force stripping hidden AI/Premium entities)
   try {
     if (isPhoto) {
       await callTelegram("editMessageCaption", { 
         chat_id: chatId, 
         message_id: message.message_id, 
         caption: safeSubstring(newPostText, 1024),
-        caption_entities: [] 
+        caption_entities: [] // THIS IS CRUCIAL FOR PREMIUM EMOJIS
       }, env);
     } else {
       await callTelegram("editMessageText", { 
         chat_id: chatId, 
         message_id: message.message_id, 
         text: safeSubstring(newPostText, 4096),
-        entities: [] 
+        entities: [] // THIS IS CRUCIAL FOR PREMIUM EMOJIS
       }, env);
     }
-    console.log("✅ Edited in place");
+    console.log("✅ Edited in place (First process completed).");
     messageHandled = true;
   } catch (editErr) {
-    console.log("⚠️ Edit failed (Premium Emojis). Attempting delete & repost...");
+    console.log("⚠️ Edit failed. Deleting & Reposting...", editErr.message);
   }
 
-  // ✅ IF EDIT FAILED, DELETE AND REPOST
+  // ✅ 3. IF EDIT FAILED, DELETE AND REPOST
   if (!messageHandled) {
     try {
       if (messageIds.length === 1) {
@@ -277,7 +273,10 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       } else {
         await callTelegram("deleteMessages", { chat_id: chatId, message_ids: messageIds }, env);
       }
-    } catch (delErr) {}
+      console.log("✅ Deleted original dirty post(s)");
+    } catch (delErr) {
+      console.log("⚠️ Could not delete original. Bot needs Admin delete rights:", delErr.message);
+    }
 
     try {
       if (isPhoto) {
@@ -285,10 +284,13 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       } else {
         await callTelegram("sendMessage", { chat_id: chatId, text: safeSubstring(newPostText, 4096), entities: [] }, env);
       }
-    } catch (repostErr) {}
+      console.log("✅ Sent clean message to main chat");
+    } catch (repostErr) {
+      console.error("❌ Failed to send clean message:", repostErr.message);
+    }
   }
 
-  // ✅ SEND TO REPOST CHANNEL
+  // ✅ 4. SEND TO REPOST CHANNEL
   if (env.REPOST_CHANNEL_ID) {
     try {
       if (isPhoto) {
@@ -350,7 +352,8 @@ async function uploadImagesToCloudinary(fileIds, env) {
 function cleanTheText(text) {
   if (!text) return "";
   
-  // ✅ ABSOLUTELY AGGRESSIVE EMOJI STRIPPER (Catches Premium emojis, fallback diamonds, and symbols)
+  // ✅ HARD-CODED REGEX: Strips ALL standard and premium fallback emojis (including diamonds)
+  // without breaking on Amharic text.
   const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu;
   
   return text
