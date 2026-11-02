@@ -1,8 +1,10 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * Features:
- * - Strict Channel Loop Protection
- * - Delete original & repost fresh message (Ensures clean text & correct phone)
+ * - Mathematical comma-separated price rules
+ * - Parallel Cloudinary uploads
+ * - Strict Duplicate Protection
+ * - Automatic Delete & Repost if editing is blocked
  */
 
 const albumCache = new Map();
@@ -29,16 +31,16 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 1. Anti-bot protection (prevents bot replying to its own reposts)
+  // 1. Anti-bot protection
   if (message.from && message.from.is_bot) return;
 
-  // 2. Hard block for Channel Posts (stops infinite loops)
+  // 2. Block channel posts (prevent loops)
   if (update.channel_post) return;
   if (env.REPOST_CHANNEL_ID && String(message.chat.id) === String(env.REPOST_CHANNEL_ID)) return;
 
   const rawText = (message.text || message.caption || "").trim();
 
-  // 3. Anti-Loop Text Check
+  // 3. Anti-Loop Protection
   if (
     rawText.includes("የኛ ገበያ") ||
     rawText.includes("@mebrigranite") ||
@@ -49,7 +51,7 @@ async function processUpdate(update, env) {
   }
 
   // ============================================
-  // ALBUM HANDLING (Media Groups)
+  // ALBUM HANDLING
   // ============================================
   if (message.media_group_id) {
     const groupId = message.media_group_id;
@@ -68,7 +70,6 @@ async function processUpdate(update, env) {
     if (message.photo && message.photo.length > 0) {
       albumData.images.push(message.photo[message.photo.length - 1].file_id);
     }
-
     if (rawText.length > 3 && !albumData.firstMessage) {
       albumData.firstMessage = message;
     }
@@ -81,11 +82,7 @@ async function processUpdate(update, env) {
       const finalData = albumCache.get(groupId);
       albumCache.delete(groupId);
 
-      await processFinalAd(
-        finalData.firstMessage || message,
-        Array.from(new Set(finalData.images)),
-        env
-      );
+      await processFinalAd(finalData.firstMessage || message, Array.from(new Set(finalData.images)), env);
     }
 
     cleanupStaleAlbums();
@@ -93,7 +90,7 @@ async function processUpdate(update, env) {
   }
 
   // ============================================
-  // SINGLE IMAGE OR TEXT-ONLY POST
+  // SINGLE POST
   // ============================================
   if (rawText.length < 3) return;
 
@@ -109,14 +106,11 @@ async function processUpdate(update, env) {
 // SAFE TELEGRAM API WRAPPER
 // ============================================
 async function callTelegram(method, body, env) {
-  const res = await fetch(
-    `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    }
-  );
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || !data.ok) {
     throw new Error(`${method} → ${data.description || res.statusText} (${res.status})`);
@@ -156,10 +150,7 @@ async function processFinalAd(message, imageFileIds, env) {
     const projectId = env.FIREBASE_PROJECT_ID;
     const adOwnerId = env.ADMIN_UID || "admin_bot";
 
-    const docId = message.media_group_id
-      ? `tg_${message.chat.id}_${message.media_group_id}`
-      : `tg_${message.chat.id}_${message.message_id}`;
-
+    const docId = message.media_group_id ? `tg_${message.chat.id}_${message.media_group_id}` : `tg_${message.chat.id}_${message.message_id}`;
     const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
 
     let allImages = imageUrls;
@@ -169,7 +160,7 @@ async function processFinalAd(message, imageFileIds, env) {
         const existingData = await checkRes.json();
         if (!message.media_group_id && existingData.fields?.createdAt?.timestampValue) {
           const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
-          if (Date.now() - createdTime < 30000) return; // Skip duplicate webhooks
+          if (Date.now() - createdTime < 30000) return;
         }
         if (existingData.fields?.images?.arrayValue?.values) {
           const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
@@ -197,11 +188,7 @@ async function processFinalAd(message, imageFileIds, env) {
       }
     };
 
-    await fetch(fbUrl, {
-      method: "PATCH",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify(adData)
-    });
+    await fetch(fbUrl, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(adData) });
   } catch (fbErr) {}
 
   // Build Message
@@ -227,53 +214,47 @@ async function processFinalAd(message, imageFileIds, env) {
   const chatId = message.chat.id;
   const lastPhotoFileId = isPhoto ? message.photo[message.photo.length - 1].file_id : null;
 
-  // --- DELETE ORIGINAL AND SEND CLEAN MESSAGE ---
-  // This guarantees we don't get "Not enough rights to edit" errors.
+  // --- EDIT, OR DELETE & REPOST ---
   try {
-    // 1. Try to delete the original message (If bot is admin)
-    try {
-      await callTelegram("deleteMessage", {
-        chat_id: chatId,
-        message_id: message.message_id
-      }, env);
-      console.log("✅ Original message deleted.");
-    } catch (delErr) {
-      console.warn("⚠️ Could not delete original (Bot may not be admin):", delErr.message);
-    }
-
-    // 2. Send the newly formatted message
+    // 1. Try to edit in place
     if (isPhoto) {
-      await callTelegram("sendPhoto", {
-        chat_id: chatId,
-        photo: lastPhotoFileId,
-        caption: safeSubstring(newPostText, 1024)
-      }, env);
+      await callTelegram("editMessageCaption", { chat_id: chatId, message_id: message.message_id, caption: safeSubstring(newPostText, 1024) }, env);
     } else {
-      await callTelegram("sendMessage", {
-        chat_id: chatId,
-        text: safeSubstring(newPostText, 4096)
-      }, env);
+      await callTelegram("editMessageText", { chat_id: chatId, message_id: message.message_id, text: safeSubstring(newPostText, 4096) }, env);
     }
-    console.log("✅ Sent clean message to main chat");
+    console.log("✅ Edited in place");
+  } catch (editErr) {
+    if (/not modified/i.test(String(editErr.message))) return;
+    
+    console.warn("⚠️ Edit blocked. Deleting original and posting clean version...");
 
-  } catch (error) {
-    console.error("❌ Failed to process main chat message:", error.message);
+    // 2. If edit fails, DELETE the original (requires Delete Admin rights)
+    try {
+      await callTelegram("deleteMessage", { chat_id: chatId, message_id: message.message_id }, env);
+    } catch (delErr) {
+      console.warn("⚠️ Could not delete original (Bot is not admin):", delErr.message);
+    }
+
+    // 3. Send the clean replacement
+    try {
+      if (isPhoto) {
+        await callTelegram("sendPhoto", { chat_id: chatId, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024) }, env);
+      } else {
+        await callTelegram("sendMessage", { chat_id: chatId, text: safeSubstring(newPostText, 4096) }, env);
+      }
+      console.log("✅ Sent clean replacement");
+    } catch (repostErr) {
+      console.error("❌ Repost failed:", repostErr.message);
+    }
   }
 
   // --- SEND TO REPOST CHANNEL ---
   if (env.REPOST_CHANNEL_ID) {
     try {
       if (isPhoto) {
-        await callTelegram("sendPhoto", {
-          chat_id: env.REPOST_CHANNEL_ID,
-          photo: lastPhotoFileId,
-          caption: safeSubstring(newPostText, 1024)
-        }, env);
+        await callTelegram("sendPhoto", { chat_id: env.REPOST_CHANNEL_ID, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024) }, env);
       } else {
-        await callTelegram("sendMessage", {
-          chat_id: env.REPOST_CHANNEL_ID,
-          text: safeSubstring(newPostText, 4096)
-        }, env);
+        await callTelegram("sendMessage", { chat_id: env.REPOST_CHANNEL_ID, text: safeSubstring(newPostText, 4096) }, env);
       }
       console.log("✅ Sent to channel");
     } catch (chErr) {
