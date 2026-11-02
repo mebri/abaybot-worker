@@ -1,11 +1,10 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * Features:
- * - Mathematical comma-separated price rules (3500000 -> 3,500,000)
- * - Support for million/thousand shorthands (3.5M -> 3,500,000 / 500k -> 500,000)
+ * - Mathematical comma-separated price rules
  * - Parallel Cloudinary uploads
- * - Strict Duplicate Protection (Prevents Telegram retry duplicates)
- * - Unicode-safe text cleaning & edit/repost fallback
+ * - Strict Duplicate Protection (Prevents channel loop & webhook retry duplicates)
+ * - Unicode-safe text cleaning
  */
 
 const albumCache = new Map();
@@ -34,6 +33,13 @@ async function processUpdate(update, env) {
 
   // 1. Anti-bot protection
   if (message.from && message.from.is_bot) return;
+
+  // ✅ FIX: Completely ignore messages sent to your Repost Channel.
+  // This stops the bot from processing its own channel posts and creating duplicates.
+  if (env.REPOST_CHANNEL_ID && String(message.chat.id) === String(env.REPOST_CHANNEL_ID)) {
+    console.log("⏭️ Ignoring message in the repost channel.");
+    return;
+  }
 
   const rawText = (message.text || message.caption || "").trim();
 
@@ -144,35 +150,29 @@ async function processFinalAd(message, imageFileIds, env) {
   const messageText = (message.text || message.caption || "").trim();
   const cleanText = cleanTheText(messageText);
 
-  // Skip if cleaning left nothing usable
   if (!cleanText || cleanText.length < 3) {
-    console.log("⏭️ Skipping: no usable text after cleaning");
     return;
   }
 
   const category = detectCategory(cleanText);
   const title = extractTitle(cleanText);
-  
-  // Mathematical price extraction with comma formatting rules
   const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText);
 
   // 1. Upload ALL images to Cloudinary in PARALLEL
   const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
 
-  // 2. Save directly to Firebase Firestore (Idempotent - prevents duplicates)
+  // 2. Save directly to Firebase Firestore (Idempotent)
   try {
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
     const adOwnerId = env.ADMIN_UID || "admin_bot";
 
-    // ✅ Create a unique Document ID based on the Telegram message.
     const docId = message.media_group_id
       ? `tg_${message.chat.id}_${message.media_group_id}`
       : `tg_${message.chat.id}_${message.message_id}`;
 
     const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
 
-    // ✅ FIX: Strict Duplicate Check for Single Messages
     let allImages = imageUrls;
     try {
       const checkRes = await fetch(fbUrl, {
@@ -181,24 +181,22 @@ async function processFinalAd(message, imageFileIds, env) {
       if (checkRes.ok) {
         const existingData = await checkRes.json();
         
-        // If it's a SINGLE message and was created < 30s ago, it's a Telegram retry!
+        // Strict Duplicate Check for Webhook Retries
         if (!message.media_group_id && existingData.fields?.createdAt?.timestampValue) {
           const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
           if (Date.now() - createdTime < 30000) {
             console.log("⏭️ Skipping: Duplicate single message webhook detected.");
-            return; // Stop processing!
+            return;
           }
         }
 
-        // Merge images if album
+        // Merge images
         if (existingData.fields?.images?.arrayValue?.values) {
           const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
           allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
         }
       }
-    } catch (e) {
-      // Document doesn't exist yet, proceed normally
-    }
+    } catch (e) {}
 
     const adData = {
       fields: {
@@ -223,7 +221,6 @@ async function processFinalAd(message, imageFileIds, env) {
       }
     };
 
-    // ✅ Use PATCH instead of POST to overwrite existing duplicates
     const fbRes = await fetch(fbUrl, {
       method: "PATCH",
       headers: {
@@ -234,8 +231,7 @@ async function processFinalAd(message, imageFileIds, env) {
     });
 
     if (!fbRes.ok) {
-      const errBody = await fbRes.text().catch(() => "");
-      console.error("Firestore Save Error:", fbRes.status, errBody);
+      console.error("Firestore Save Error:", await fbRes.text().catch(() => ""));
     }
   } catch (fbErr) {
     console.error("Firestore Save Error:", fbErr);
@@ -262,11 +258,13 @@ async function processFinalAd(message, imageFileIds, env) {
   let safeDetails = safeSubstring(cleanText, 480);
   if (cleanText.length > 480) safeDetails = safeDetails.trimEnd() + "…";
 
-  let newPostText = `📝 Title: ${title}\n`;
+  // ✅ FIX: Moved branding to the TOP so it NEVER gets truncated/cut off.
+  let newPostText = `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
+  newPostText += `━━━━━━━━━━━━━━━\n`;
+  newPostText += `📝 Title: ${title}\n`;
   newPostText += `💰 Price: ${displayPriceText}\n\n`;
   newPostText += `📄 Details:\n${safeDetails}\n\n`;
   newPostText += `━━━━━━━━━━━━━━━\n`;
-  newPostText += `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
   newPostText += `📞 Phone: 0911680790\n`;
   newPostText += `🌐 Website: mebri.yegna.workers.dev\n`;
   newPostText += `✈️ Telegram: @mebrigranite\n`;
@@ -298,14 +296,10 @@ async function processFinalAd(message, imageFileIds, env) {
   } catch (editErr) {
     const msg = String(editErr.message || "");
 
-    if (/not modified/i.test(msg)) {
-      console.log("ℹ️ Content unchanged, skipping");
-      return;
-    }
+    if (/not modified/i.test(msg)) return;
 
     console.warn("⚠️ Edit failed, reposting:", msg);
 
-    // Fallback: send as a new message (the actual "repost")
     try {
       if (isPhoto) {
         await callTelegram("sendPhoto", {
@@ -325,7 +319,7 @@ async function processFinalAd(message, imageFileIds, env) {
     }
   }
 
-  // 5. Optional — repost to a curated channel (Set REPOST_CHANNEL_ID in Worker secrets)
+  // 5. Repost to curated channel
   if (env.REPOST_CHANNEL_ID) {
     try {
       if (isPhoto) {
@@ -348,61 +342,37 @@ async function processFinalAd(message, imageFileIds, env) {
 }
 
 // ============================================
-// MATHEMATICAL PRICE RULES (e.g. 3500000 -> 3,500,000)
+// MATHEMATICAL PRICE RULES
 // ============================================
 function parseMathematicalPrice(text) {
-  // Rule 1: Million shorthands (e.g. "3.5M", "3.5 million", "3.5 ሚሊዮን", "3.5mln")
   const millionMatch = text.match(/([\d.]+)\s*(?:million|mil|mln|m|ሚሊዮን)\b/i);
   if (millionMatch) {
     const val = parseFloat(millionMatch[1]);
     if (!isNaN(val) && val > 0 && val < 1000) {
       const calculated = Math.round(val * 1000000);
-      return {
-        formattedPrice: calculated.toLocaleString("en-US"),
-        rawPrice: calculated.toString()
-      };
+      return { formattedPrice: calculated.toLocaleString("en-US"), rawPrice: calculated.toString() };
     }
   }
 
-  // Rule 2: Thousand shorthands (e.g. "500k", "500 ሺህ", "500 shi")
   const thousandMatch = text.match(/([\d.]+)\s*(?:k|thousand|ሺህ|ሺ)\b/i);
   if (thousandMatch) {
     const val = parseFloat(thousandMatch[1]);
     if (!isNaN(val) && val > 0 && val < 10000) {
       const calculated = Math.round(val * 1000);
-      return {
-        formattedPrice: calculated.toLocaleString("en-US"),
-        rawPrice: calculated.toString()
-      };
+      return { formattedPrice: calculated.toLocaleString("en-US"), rawPrice: calculated.toString() };
     }
   }
 
-  // Rule 3: Explicit Price labels
-  const explicitMatch = text.match(
-    /(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i
-  );
+  const explicitMatch = text.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
   if (explicitMatch) {
-    const digitsOnly = explicitMatch[1].replace(/[.,]/g, "").trim();
-    const num = parseInt(digitsOnly, 10);
-    if (!isNaN(num) && num > 50) {
-      return {
-        formattedPrice: num.toLocaleString("en-US"),
-        rawPrice: num.toString()
-      };
-    }
+    const num = parseInt(explicitMatch[1].replace(/[.,]/g, "").trim(), 10);
+    if (!isNaN(num) && num > 50) return { formattedPrice: num.toLocaleString("en-US"), rawPrice: num.toString() };
   }
 
-  // Rule 4: Standalone numbers with 4 to 9 digits
   const standaloneMatch = text.match(/\b(\d{1,3}(?:,\d{3})+|\d{4,9})\b/);
   if (standaloneMatch) {
-    const digitsOnly = standaloneMatch[1].replace(/[.,]/g, "").trim();
-    const num = parseInt(digitsOnly, 10);
-    if (!isNaN(num) && num >= 500) {
-      return {
-        formattedPrice: num.toLocaleString("en-US"),
-        rawPrice: num.toString()
-      };
-    }
+    const num = parseInt(standaloneMatch[1].replace(/[.,]/g, "").trim(), 10);
+    if (!isNaN(num) && num >= 500) return { formattedPrice: num.toLocaleString("en-US"), rawPrice: num.toString() };
   }
 
   return { formattedPrice: "0", rawPrice: "0" };
@@ -416,26 +386,19 @@ async function uploadImagesToCloudinary(fileIds, env) {
 
   const uploadPromises = fileIds.map(async (fileId) => {
     try {
-      const fileRes = await fetch(
-        `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`
-      );
+      const fileRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`);
       const fileInfo = await fileRes.json();
       if (!fileInfo.ok || !fileInfo.result?.file_path) return null;
 
       const tgFileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`;
-
       const formData = new FormData();
       formData.append("file", tgFileUrl);
       formData.append("upload_preset", env.CLOUDINARY_UPLOAD_PRESET);
 
-      const cloudRes = await fetch(
-        `https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/image/upload`,
-        { method: "POST", body: formData }
-      );
+      const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/image/upload`, { method: "POST", body: formData });
       const cloudData = await cloudRes.json();
       return cloudData.secure_url || null;
     } catch (err) {
-      console.error("Image upload failed for fileId:", fileId, err);
       return null;
     }
   });
@@ -449,25 +412,15 @@ async function uploadImagesToCloudinary(fileIds, env) {
 // ============================================
 function cleanTheText(text) {
   if (!text) return "";
-
-  // Full-coverage emoji matcher
   const EMOJI = /[\p{Extended_Pictographic}\u{1F3FB}-\u{1F3FF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{E0020}-\u{E007F}\u{1F1E6}-\u{1F1FF}]/gu;
 
   return text
-    // 1. Strip URLs / handles FIRST
     .replace(/https?:\/\/\S+/gi, "")
     .replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "")
     .replace(/@[a-zA-Z0-9_]{2,}/g, "")
-    // 2. Strip phone numbers ONLY when labeled — protects big prices
-    .replace(
-      /(?:\b(?:tel|phone|call|ስልክ|ደውል)\b[\s:.]*)?(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}\b/gi,
-      (m) => (/tel|phone|call|ስልክ|ደውል/i.test(m) ? "" : m)
-    )
-    // 3. Strip emojis
+    .replace(/(?:\b(?:tel|phone|call|ስልክ|ደውል)\b[\s:.]*)?(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}\b/gi, (m) => (/tel|phone|call|ስልክ|ደውል/i.test(m) ? "" : m))
     .replace(EMOJI, "")
-    // 4. Drop Markdown control chars
     .replace(/[*_~`|]/g, "")
-    // 5. Normalize whitespace
     .replace(/[ \t]+/g, " ")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
@@ -512,10 +465,7 @@ function extractTitle(text) {
 // ============================================
 async function getFirebaseToken(env) {
   const now = Math.floor(Date.now() / 1000);
-
-  if (cachedFirebaseToken && tokenExpiresAt > now + 300) {
-    return cachedFirebaseToken;
-  }
+  if (cachedFirebaseToken && tokenExpiresAt > now + 300) return cachedFirebaseToken;
 
   const clientEmail = env.FIREBASE_CLIENT_EMAIL;
   const privateKey = env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n");
@@ -533,31 +483,15 @@ async function getFirebaseToken(env) {
   const encPayload = base64UrlEncode(JSON.stringify(payload));
   const signingInput = `${encHeader}.${encPayload}`;
 
-  const pemContents = privateKey
-    .replace("-----BEGIN PRIVATE KEY-----", "")
-    .replace("-----END PRIVATE KEY-----", "")
-    .replace(/\s/g, "");
-
+  const pemContents = privateKey.replace("-----BEGIN PRIVATE KEY-----", "").replace("-----END PRIVATE KEY-----", "").replace(/\s/g, "");
   const binaryDer = Uint8Array.from(atob(pemContents), (c) => c.charCodeAt(0));
-  const cryptoKey = await crypto.subtle.importKey(
-    "pkcs8",
-    binaryDer,
-    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
-
-  const sigBuffer = await crypto.subtle.sign(
-    "RSASSA-PKCS1-v1_5",
-    cryptoKey,
-    new TextEncoder().encode(signingInput)
-  );
+  const cryptoKey = await crypto.subtle.importKey("pkcs8", binaryDer, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
+  const sigBuffer = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", cryptoKey, new TextEncoder().encode(signingInput));
 
   const sigBytes = new Uint8Array(sigBuffer);
   let binary = "";
   for (let i = 0; i < sigBytes.length; i++) binary += String.fromCharCode(sigBytes[i]);
   const signature = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-
   const jwt = `${signingInput}.${signature}`;
 
   const tokRes = await fetch("https://oauth2.googleapis.com/token", {
@@ -567,9 +501,7 @@ async function getFirebaseToken(env) {
   });
 
   const tokData = await tokRes.json();
-  if (!tokData.access_token) {
-    throw new Error("Token Error: " + JSON.stringify(tokData));
-  }
+  if (!tokData.access_token) throw new Error("Token Error: " + JSON.stringify(tokData));
 
   cachedFirebaseToken = tokData.access_token;
   tokenExpiresAt = now + (tokData.expires_in || 3600);
@@ -586,8 +518,6 @@ function base64UrlEncode(str) {
 function cleanupStaleAlbums() {
   const twoMinutesAgo = Date.now() - 120000;
   for (const [key, value] of albumCache.entries()) {
-    if (value.timestamp < twoMinutesAgo) {
-      albumCache.delete(key);
-    }
+    if (value.timestamp < twoMinutesAgo) albumCache.delete(key);
   }
 }
