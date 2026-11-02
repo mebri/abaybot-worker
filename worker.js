@@ -1,14 +1,9 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
- * Features:
- * - Duplicate Text Hash Check (Stops Auto-Forward duplicates)
- * - Saves to website FIRST
- * - Wipes hidden AI Entities
- * - Delete & Repost fallback
  */
 
 const albumCache = new Map();
-const recentHashes = new Map(); // ✅ Tracks recent text to stop duplicates
+const recentHashes = new Map(); 
 let cachedFirebaseToken = null;
 let tokenExpiresAt = 0;
 
@@ -37,7 +32,6 @@ async function processUpdate(update, env) {
     const currentUsername = (message.chat.username || "").toLowerCase();
     
     if (currentId === target || (currentUsername && currentUsername === target)) {
-      console.log("⏭️ Ignored: Message is from the Repost Channel.");
       return;
     }
   }
@@ -49,14 +43,13 @@ async function processUpdate(update, env) {
 
   const rawText = (message.text || message.caption || "").trim();
 
-  // ✅ 3. DUPLICATE TEXT HASH PROTECTION (Stops Auto-Forwarders)
-  // Strips all emojis and spaces to create a unique "fingerprint" of the text
+  // ✅ 3. DUPLICATE TEXT HASH PROTECTION
   const cleanTextForCheck = cleanTheText(rawText).replace(/\s+/g, '');
   if (cleanTextForCheck.length > 10) {
     const hash = simpleHash(cleanTextForCheck);
     if (recentHashes.has(hash)) {
       const lastSeen = recentHashes.get(hash);
-      if (Date.now() - lastSeen < 120000) { // 2 minutes
+      if (Date.now() - lastSeen < 120000) { 
         console.log("⏭️ Ignored: Duplicate text detected within 2 minutes.");
         return;
       }
@@ -131,7 +124,7 @@ async function processUpdate(update, env) {
 }
 
 // ============================================
-// HASH FUNCTION (For Duplicate Check)
+// HASH FUNCTION
 // ============================================
 function simpleHash(str) {
   let hash = 0;
@@ -179,7 +172,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   const title = extractTitle(cleanText);
   const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText);
 
-  // ✅ 1. SAVE TO WEBSITE (FIREBASE) FIRST
+  // ✅ SAVE TO WEBSITE (FIREBASE) FIRST
   const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
   try {
     const token = await getFirebaseToken(env);
@@ -195,7 +188,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
         const existingData = await checkRes.json();
         if (!message.media_group_id && existingData.fields?.createdAt?.timestampValue) {
           const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
-          if (Date.now() - createdTime < 30000) return; // Skip duplicate webhooks
+          if (Date.now() - createdTime < 30000) return;
         }
         if (existingData.fields?.images?.arrayValue?.values) {
           const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
@@ -253,7 +246,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
 
   let messageHandled = false;
 
-  // ✅ 2. TRY TO EDIT (Stripping hidden entities)
+  // ✅ TRY TO EDIT (Stripping hidden AI/Premium entities)
   try {
     if (isPhoto) {
       await callTelegram("editMessageCaption", { 
@@ -273,10 +266,10 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     console.log("✅ Edited in place");
     messageHandled = true;
   } catch (editErr) {
-    console.log("⚠️ Edit failed (Premium Emojis/AI Editor). Attempting delete...", editErr.message);
+    console.log("⚠️ Edit failed (Premium Emojis). Attempting delete & repost...");
   }
 
-  // ✅ 3. IF EDIT FAILED, DELETE AND REPOST
+  // ✅ IF EDIT FAILED, DELETE AND REPOST
   if (!messageHandled) {
     try {
       if (messageIds.length === 1) {
@@ -284,10 +277,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       } else {
         await callTelegram("deleteMessages", { chat_id: chatId, message_ids: messageIds }, env);
       }
-      console.log("✅ Deleted original dirty post(s)");
-    } catch (delErr) {
-      console.log("⚠️ Could not delete original (Bot needs Admin delete rights):", delErr.message);
-    }
+    } catch (delErr) {}
 
     try {
       if (isPhoto) {
@@ -295,13 +285,10 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       } else {
         await callTelegram("sendMessage", { chat_id: chatId, text: safeSubstring(newPostText, 4096), entities: [] }, env);
       }
-      console.log("✅ Sent clean message to main chat");
-    } catch (repostErr) {
-      console.error("❌ Failed to send clean message:", repostErr.message);
-    }
+    } catch (repostErr) {}
   }
 
-  // ✅ 4. SEND TO REPOST CHANNEL
+  // ✅ SEND TO REPOST CHANNEL
   if (env.REPOST_CHANNEL_ID) {
     try {
       if (isPhoto) {
@@ -309,10 +296,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       } else {
         await callTelegram("sendMessage", { chat_id: env.REPOST_CHANNEL_ID, text: safeSubstring(newPostText, 4096), entities: [] }, env);
       }
-      console.log("✅ Sent to Repost Channel");
-    } catch (chErr) {
-      console.error("❌ Channel send failed:", chErr.message);
-    }
+    } catch (chErr) {}
   }
 }
 
@@ -365,7 +349,9 @@ async function uploadImagesToCloudinary(fileIds, env) {
 
 function cleanTheText(text) {
   if (!text) return "";
-  const EMOJI = /[\p{Extended_Pictographic}\u{1F3FB}-\u{1F3FF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{E0020}-\u{E007F}\u{1F1E6}-\u{1F1FF}]/gu;
+  
+  // ✅ ABSOLUTELY AGGRESSIVE EMOJI STRIPPER (Catches Premium emojis, fallback diamonds, and symbols)
+  const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu;
   
   return text
     .replace(/https?:\/\/\S+/gi, "")
