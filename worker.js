@@ -1,9 +1,8 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * Features:
- * - Mathematical comma-separated price rules
- * - Parallel Cloudinary uploads
- * - Strict Duplicate Protection (Prevents channel loop & webhook retry duplicates)
+ * - Strict Channel Loop Protection
+ * - Prevents text truncation on long ads
  * - Unicode-safe text cleaning
  */
 
@@ -31,11 +30,17 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 1. Anti-bot protection
+  // 1. Anti-bot protection (for groups)
   if (message.from && message.from.is_bot) return;
 
-  // ✅ FIX: Completely ignore messages sent to your Repost Channel.
-  // This stops the bot from processing its own channel posts and creating duplicates.
+  // ✅ FIX: Hard block for Channel Posts. 
+  // If the message has a channel_post, it came from the bot's own channel repost.
+  if (update.channel_post) {
+    console.log("⏭️ Ignoring channel post to prevent loop.");
+    return;
+  }
+
+  // ✅ FIX: Hard block for the Repost Channel ID
   if (env.REPOST_CHANNEL_ID && String(message.chat.id) === String(env.REPOST_CHANNEL_ID)) {
     console.log("⏭️ Ignoring message in the repost channel.");
     return;
@@ -129,9 +134,6 @@ async function callTelegram(method, body, env) {
   return data.result;
 }
 
-// ============================================
-// UNICODE-SAFE SUBSTRING (never splits emojis)
-// ============================================
 function safeSubstring(str, maxLen) {
   if (!str) return "";
   if (str.length <= maxLen) return str;
@@ -150,18 +152,15 @@ async function processFinalAd(message, imageFileIds, env) {
   const messageText = (message.text || message.caption || "").trim();
   const cleanText = cleanTheText(messageText);
 
-  if (!cleanText || cleanText.length < 3) {
-    return;
-  }
+  if (!cleanText || cleanText.length < 3) return;
 
   const category = detectCategory(cleanText);
   const title = extractTitle(cleanText);
   const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText);
 
-  // 1. Upload ALL images to Cloudinary in PARALLEL
   const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
 
-  // 2. Save directly to Firebase Firestore (Idempotent)
+  // Save to Firebase
   try {
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
@@ -175,22 +174,13 @@ async function processFinalAd(message, imageFileIds, env) {
 
     let allImages = imageUrls;
     try {
-      const checkRes = await fetch(fbUrl, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const checkRes = await fetch(fbUrl, { headers: { Authorization: `Bearer ${token}` } });
       if (checkRes.ok) {
         const existingData = await checkRes.json();
-        
-        // Strict Duplicate Check for Webhook Retries
         if (!message.media_group_id && existingData.fields?.createdAt?.timestampValue) {
           const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
-          if (Date.now() - createdTime < 30000) {
-            console.log("⏭️ Skipping: Duplicate single message webhook detected.");
-            return;
-          }
+          if (Date.now() - createdTime < 30000) return; // Skip duplicate
         }
-
-        // Merge images
         if (existingData.fields?.images?.arrayValue?.values) {
           const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
           allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
@@ -208,11 +198,7 @@ async function processFinalAd(message, imageFileIds, env) {
         city: { stringValue: extractCity(cleanText) },
         category: { stringValue: category },
         image: { stringValue: allImages.length > 0 ? allImages[0] : "" },
-        images: {
-          arrayValue: {
-            values: allImages.map((url) => ({ stringValue: url }))
-          }
-        },
+        images: { arrayValue: { values: allImages.map((url) => ({ stringValue: url })) } },
         status: { stringValue: "available" },
         source: { stringValue: "telegram" },
         userId: { stringValue: adOwnerId },
@@ -221,199 +207,117 @@ async function processFinalAd(message, imageFileIds, env) {
       }
     };
 
-    const fbRes = await fetch(fbUrl, {
+    await fetch(fbUrl, {
       method: "PATCH",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json"
-      },
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify(adData)
     });
+  } catch (fbErr) {}
 
-    if (!fbRes.ok) {
-      console.error("Firestore Save Error:", await fbRes.text().catch(() => ""));
-    }
-  } catch (fbErr) {
-    console.error("Firestore Save Error:", fbErr);
-  }
-
-  // 3. Build Formatted Telegram Message
-  const hashtagMap = {
-    Cars: "#Cars",
-    Houses: "#Houses",
-    Rentals: "#Rentals",
-    Electronics: "#Electronics",
-    Furniture: "#Furniture",
-    Clothes: "#Clothes",
-    "Labor & Services": "#Labor",
-    "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ"
-  };
+  // Build Message
+  const hashtagMap = { Cars: "#Cars", Houses: "#Houses", Rentals: "#Rentals", Electronics: "#Electronics", Furniture: "#Furniture", Clothes: "#Clothes", "Labor & Services": "#Labor", "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ" };
   const hashtag = hashtagMap[category] || "#Other";
+  const displayPriceText = formattedPrice && formattedPrice !== "0" ? `${formattedPrice} ETB` : "Negotiable / ተደራዳሪ";
 
-  const displayPriceText =
-    formattedPrice && formattedPrice !== "0"
-      ? `${formattedPrice} ETB`
-      : "Negotiable / ተደራዳሪ";
+  // ✅ FIX: Reduced max length to 800 to leave room for the footer
+  let safeDetails = safeSubstring(cleanText, 800);
+  if (cleanText.length > 800) safeDetails = safeDetails.trimEnd() + "…";
 
-  let safeDetails = safeSubstring(cleanText, 480);
-  if (cleanText.length > 480) safeDetails = safeDetails.trimEnd() + "…";
-
-  // ✅ FIX: Moved branding to the TOP so it NEVER gets truncated/cut off.
-  let newPostText = `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
-  newPostText += `━━━━━━━━━━━━━━━\n`;
-  newPostText += `📝 Title: ${title}\n`;
+  let newPostText = `📝 Title: ${title}\n`;
   newPostText += `💰 Price: ${displayPriceText}\n\n`;
   newPostText += `📄 Details:\n${safeDetails}\n\n`;
   newPostText += `━━━━━━━━━━━━━━━\n`;
+  newPostText += `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
   newPostText += `📞 Phone: 0911680790\n`;
   newPostText += `🌐 Website: mebri.yegna.workers.dev\n`;
   newPostText += `✈️ Telegram: @mebrigranite\n`;
   newPostText += `━━━━━━━━━━━━━━━\n\n`;
   newPostText += `${hashtag}`;
 
-  // 4. Update the Telegram Message / Caption
   const isPhoto = message.photo && message.photo.length > 0;
   const chatId = message.chat.id;
-  const lastPhotoFileId = isPhoto
-    ? message.photo[message.photo.length - 1].file_id
-    : null;
+  const lastPhotoFileId = isPhoto ? message.photo[message.photo.length - 1].file_id : null;
 
   try {
     if (isPhoto) {
-      await callTelegram("editMessageCaption", {
-        chat_id: chatId,
-        message_id: message.message_id,
-        caption: safeSubstring(newPostText, 1024)
-      }, env);
+      await callTelegram("editMessageCaption", { chat_id: chatId, message_id: message.message_id, caption: safeSubstring(newPostText, 1024) }, env);
     } else {
-      await callTelegram("editMessageText", {
-        chat_id: chatId,
-        message_id: message.message_id,
-        text: safeSubstring(newPostText, 4096)
-      }, env);
+      await callTelegram("editMessageText", { chat_id: chatId, message_id: message.message_id, text: safeSubstring(newPostText, 4096) }, env);
     }
-    console.log("✅ Edited in place");
   } catch (editErr) {
-    const msg = String(editErr.message || "");
-
-    if (/not modified/i.test(msg)) return;
-
-    console.warn("⚠️ Edit failed, reposting:", msg);
-
-    try {
-      if (isPhoto) {
-        await callTelegram("sendPhoto", {
-          chat_id: chatId,
-          photo: lastPhotoFileId,
-          caption: safeSubstring(newPostText, 1024)
-        }, env);
-      } else {
-        await callTelegram("sendMessage", {
-          chat_id: chatId,
-          text: safeSubstring(newPostText, 4096)
-        }, env);
-      }
-      console.log("✅ Reposted as new message");
-    } catch (repostErr) {
-      console.error("❌ Repost also failed:", repostErr.message);
+    if (!/not modified/i.test(String(editErr.message))) {
+      try {
+        if (isPhoto) {
+          await callTelegram("sendPhoto", { chat_id: chatId, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024) }, env);
+        } else {
+          await callTelegram("sendMessage", { chat_id: chatId, text: safeSubstring(newPostText, 4096) }, env);
+        }
+      } catch (repostErr) {}
     }
   }
 
-  // 5. Repost to curated channel
+  // Send to channel
   if (env.REPOST_CHANNEL_ID) {
     try {
       if (isPhoto) {
-        await callTelegram("sendPhoto", {
-          chat_id: env.REPOST_CHANNEL_ID,
-          photo: lastPhotoFileId,
-          caption: safeSubstring(newPostText, 1024)
-        }, env);
+        await callTelegram("sendPhoto", { chat_id: env.REPOST_CHANNEL_ID, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024) }, env);
       } else {
-        await callTelegram("sendMessage", {
-          chat_id: env.REPOST_CHANNEL_ID,
-          text: safeSubstring(newPostText, 4096)
-        }, env);
+        await callTelegram("sendMessage", { chat_id: env.REPOST_CHANNEL_ID, text: safeSubstring(newPostText, 4096) }, env);
       }
-      console.log("✅ Reposted to channel");
-    } catch (chErr) {
-      console.error("❌ Channel repost failed:", chErr.message);
-    }
+    } catch (chErr) {}
   }
 }
 
 // ============================================
-// MATHEMATICAL PRICE RULES
+// HELPERS
 // ============================================
 function parseMathematicalPrice(text) {
   const millionMatch = text.match(/([\d.]+)\s*(?:million|mil|mln|m|ሚሊዮን)\b/i);
   if (millionMatch) {
     const val = parseFloat(millionMatch[1]);
-    if (!isNaN(val) && val > 0 && val < 1000) {
-      const calculated = Math.round(val * 1000000);
-      return { formattedPrice: calculated.toLocaleString("en-US"), rawPrice: calculated.toString() };
-    }
+    if (!isNaN(val) && val > 0 && val < 1000) return { formattedPrice: Math.round(val * 1000000).toLocaleString("en-US"), rawPrice: Math.round(val * 1000000).toString() };
   }
-
   const thousandMatch = text.match(/([\d.]+)\s*(?:k|thousand|ሺህ|ሺ)\b/i);
   if (thousandMatch) {
     const val = parseFloat(thousandMatch[1]);
-    if (!isNaN(val) && val > 0 && val < 10000) {
-      const calculated = Math.round(val * 1000);
-      return { formattedPrice: calculated.toLocaleString("en-US"), rawPrice: calculated.toString() };
-    }
+    if (!isNaN(val) && val > 0 && val < 10000) return { formattedPrice: Math.round(val * 1000).toLocaleString("en-US"), rawPrice: Math.round(val * 1000).toString() };
   }
-
   const explicitMatch = text.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
   if (explicitMatch) {
     const num = parseInt(explicitMatch[1].replace(/[.,]/g, "").trim(), 10);
     if (!isNaN(num) && num > 50) return { formattedPrice: num.toLocaleString("en-US"), rawPrice: num.toString() };
   }
-
   const standaloneMatch = text.match(/\b(\d{1,3}(?:,\d{3})+|\d{4,9})\b/);
   if (standaloneMatch) {
     const num = parseInt(standaloneMatch[1].replace(/[.,]/g, "").trim(), 10);
     if (!isNaN(num) && num >= 500) return { formattedPrice: num.toLocaleString("en-US"), rawPrice: num.toString() };
   }
-
   return { formattedPrice: "0", rawPrice: "0" };
 }
 
-// ============================================
-// PARALLEL CLOUDINARY UPLOADER
-// ============================================
 async function uploadImagesToCloudinary(fileIds, env) {
   if (!fileIds || fileIds.length === 0) return [];
-
   const uploadPromises = fileIds.map(async (fileId) => {
     try {
       const fileRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`);
       const fileInfo = await fileRes.json();
       if (!fileInfo.ok || !fileInfo.result?.file_path) return null;
-
       const tgFileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`;
       const formData = new FormData();
       formData.append("file", tgFileUrl);
       formData.append("upload_preset", env.CLOUDINARY_UPLOAD_PRESET);
-
       const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/image/upload`, { method: "POST", body: formData });
       const cloudData = await cloudRes.json();
       return cloudData.secure_url || null;
-    } catch (err) {
-      return null;
-    }
+    } catch (err) { return null; }
   });
-
   const results = await Promise.all(uploadPromises);
   return results.filter(Boolean);
 }
 
-// ============================================
-// TEXT CLEANING & EXTRACTION HELPERS
-// ============================================
 function cleanTheText(text) {
   if (!text) return "";
   const EMOJI = /[\p{Extended_Pictographic}\u{1F3FB}-\u{1F3FF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{E0020}-\u{E007F}\u{1F1E6}-\u{1F1FF}]/gu;
-
   return text
     .replace(/https?:\/\/\S+/gi, "")
     .replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "")
@@ -460,49 +364,28 @@ function extractTitle(text) {
   return title;
 }
 
-// ============================================
-// CACHED GOOGLE / FIREBASE AUTH TOKEN
-// ============================================
 async function getFirebaseToken(env) {
   const now = Math.floor(Date.now() / 1000);
   if (cachedFirebaseToken && tokenExpiresAt > now + 300) return cachedFirebaseToken;
-
   const clientEmail = env.FIREBASE_CLIENT_EMAIL;
   const privateKey = env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n");
-
   const header = { alg: "RS256", typ: "JWT" };
-  const payload = {
-    iss: clientEmail,
-    scope: "https://www.googleapis.com/auth/datastore",
-    aud: "https://oauth2.googleapis.com/token",
-    iat: now,
-    exp: now + 3600
-  };
-
+  const payload = { iss: clientEmail, scope: "https://www.googleapis.com/auth/datastore", aud: "https://oauth2.googleapis.com/token", iat: now, exp: now + 3600 };
   const encHeader = base64UrlEncode(JSON.stringify(header));
   const encPayload = base64UrlEncode(JSON.stringify(payload));
   const signingInput = `${encHeader}.${encPayload}`;
-
   const pemContents = privateKey.replace("-----BEGIN PRIVATE KEY-----", "").replace("-----END PRIVATE KEY-----", "").replace(/\s/g, "");
   const binaryDer = Uint8Array.from(atob(pemContents), (c) => c.charCodeAt(0));
   const cryptoKey = await crypto.subtle.importKey("pkcs8", binaryDer, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
   const sigBuffer = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", cryptoKey, new TextEncoder().encode(signingInput));
-
   const sigBytes = new Uint8Array(sigBuffer);
   let binary = "";
   for (let i = 0; i < sigBytes.length; i++) binary += String.fromCharCode(sigBytes[i]);
   const signature = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   const jwt = `${signingInput}.${signature}`;
-
-  const tokRes = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
-  });
-
+  const tokRes = await fetch("https://oauth2.googleapis.com/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}` });
   const tokData = await tokRes.json();
   if (!tokData.access_token) throw new Error("Token Error: " + JSON.stringify(tokData));
-
   cachedFirebaseToken = tokData.access_token;
   tokenExpiresAt = now + (tokData.expires_in || 3600);
   return cachedFirebaseToken;
