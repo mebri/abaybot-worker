@@ -1,9 +1,8 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * Features:
- * - Processes Channel Posts correctly
- * - Strict Channel Loop Protection
- * - Cleans Ethiopian Phone Numbers
+ * - Bulletproof Entity Stripping (Fixes Telegram AI Editor errors)
+ * - Advanced Emoji Removal
  */
 
 const albumCache = new Map();
@@ -40,7 +39,7 @@ async function processUpdate(update, env) {
 
   const rawText = (message.text || message.caption || "").trim();
 
-  // 3. Anti-Loop Text Check (Prevents processing its own cleaned messages)
+  // 3. Anti-Loop Text Check
   if (
     rawText.includes("የኛ ገበያ") ||
     rawText.includes("@mebrigranite") ||
@@ -217,9 +216,21 @@ async function processFinalAd(message, imageFileIds, env) {
   // --- EDIT, OR DELETE & REPOST ---
   try {
     if (isPhoto) {
-      await callTelegram("editMessageCaption", { chat_id: chatId, message_id: message.message_id, caption: safeSubstring(newPostText, 1024) }, env);
+      // ✅ FIX: caption_entities: [] strips all AI formatting from the original message
+      await callTelegram("editMessageCaption", { 
+        chat_id: chatId, 
+        message_id: message.message_id, 
+        caption: safeSubstring(newPostText, 1024),
+        caption_entities: [] 
+      }, env);
     } else {
-      await callTelegram("editMessageText", { chat_id: chatId, message_id: message.message_id, text: safeSubstring(newPostText, 4096) }, env);
+      // ✅ FIX: entities: [] strips all AI formatting from the original message
+      await callTelegram("editMessageText", { 
+        chat_id: chatId, 
+        message_id: message.message_id, 
+        text: safeSubstring(newPostText, 4096),
+        entities: []
+      }, env);
     }
     console.log("✅ Edited in place");
   } catch (editErr) {
@@ -227,19 +238,15 @@ async function processFinalAd(message, imageFileIds, env) {
     
     console.warn("⚠️ Edit blocked. Deleting original and posting clean version...");
 
-    // Delete original (requires Delete Admin rights)
     try {
       await callTelegram("deleteMessage", { chat_id: chatId, message_id: message.message_id }, env);
-    } catch (delErr) {
-      console.warn("⚠️ Could not delete original:", delErr.message);
-    }
+    } catch (delErr) {}
 
-    // Send clean replacement
     try {
       if (isPhoto) {
-        await callTelegram("sendPhoto", { chat_id: chatId, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024) }, env);
+        await callTelegram("sendPhoto", { chat_id: chatId, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
       } else {
-        await callTelegram("sendMessage", { chat_id: chatId, text: safeSubstring(newPostText, 4096) }, env);
+        await callTelegram("sendMessage", { chat_id: chatId, text: safeSubstring(newPostText, 4096), entities: [] }, env);
       }
     } catch (repostErr) {}
   }
@@ -248,9 +255,9 @@ async function processFinalAd(message, imageFileIds, env) {
   if (env.REPOST_CHANNEL_ID) {
     try {
       if (isPhoto) {
-        await callTelegram("sendPhoto", { chat_id: env.REPOST_CHANNEL_ID, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024) }, env);
+        await callTelegram("sendPhoto", { chat_id: env.REPOST_CHANNEL_ID, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
       } else {
-        await callTelegram("sendMessage", { chat_id: env.REPOST_CHANNEL_ID, text: safeSubstring(newPostText, 4096) }, env);
+        await callTelegram("sendMessage", { chat_id: env.REPOST_CHANNEL_ID, text: safeSubstring(newPostText, 4096), entities: [] }, env);
       }
     } catch (chErr) {}
   }
@@ -305,12 +312,13 @@ async function uploadImagesToCloudinary(fileIds, env) {
 
 function cleanTheText(text) {
   if (!text) return "";
+  // ✅ The ultimate emoji regex that strips all custom emojis, AI emojis, and standard emojis
   const EMOJI = /[\p{Extended_Pictographic}\u{1F3FB}-\u{1F3FF}\u{FE00}-\u{FE0F}\u{200D}\u{20E3}\u{E0020}-\u{E007F}\u{1F1E6}-\u{1F1FF}]/gu;
+  
   return text
     .replace(/https?:\/\/\S+/gi, "")
     .replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "")
     .replace(/@[a-zA-Z0-9_]{2,}/g, "")
-    // ✅ FIX: Better phone number removal (catches 09... and 07... even without the word "Phone")
     .replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}\b/gi, "")
     .replace(EMOJI, "")
     .replace(/[*_~`|]/g, "")
