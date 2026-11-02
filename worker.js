@@ -1,10 +1,10 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
- * Fully fixed:
- * 1. Solves "Model 2022" year confusion -> Extracts Make: Hyundai, Model: Elantra, Year: 2022
- * 2. Arranges clean titles: "2022 Hyundai Elantra"
- * 3. Assigns correct Category: Cars › Sedan
- * 4. Preserves deterministic Firestore document IDs (no duplicate ads)
+ * Features:
+ * 1. Multimodal Gemini Vision: Detects Brand, Model, Year, Body & Color directly from photos
+ * 2. Solves "Model 2022" year confusion -> Make: Hyundai, Model: Elantra, Year: 2022
+ * 3. Title Arranger: "2022 Hyundai Elantra"
+ * 4. Deterministic Firestore Doc IDs: Zero duplicate ads
  * 5. Full emoji stripping & Amharic contact preservation
  */
 
@@ -104,7 +104,7 @@ async function processUpdate(update, env) {
   // ============================================
   // SINGLE POST
   // ============================================
-  if (rawText.length < 3) return;
+  if (rawText.length < 3 && (!message.photo || message.photo.length === 0)) return;
 
   const images = [];
   if (message.photo && message.photo.length > 0) {
@@ -114,7 +114,6 @@ async function processUpdate(update, env) {
   await processFinalAd(message, images, [message.message_id], env);
 }
 
-// Deterministic hash to prevent duplicate ad documents in Firestore
 function simpleHash(str) {
   let hash = 0;
   for (let i = 0; i < str.length; i++) {
@@ -152,25 +151,41 @@ function safeSubstring(str, maxLen) {
 async function processFinalAd(message, imageFileIds, messageIds, env) {
   const messageText = (message.text || message.caption || "").trim();
   const cleanText = cleanTheText(messageText);
-  if (!cleanText || cleanText.length < 3) return;
 
-  // 1. Extract Brand, Model, Year, Trim
-  const meta = extractBrandModelYear(cleanText || messageText);
+  // 1. Text-based extraction
+  let meta = extractBrandModelYear(cleanText || messageText);
 
-  // 2. Determine Category and Subcategory
+  // 2. Upload images
+  const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
+
+  // 3. MULTIMODAL GEMINI VISION: Look at car photo if brand/model/year is missing or for verification
+  if (imageUrls.length > 0 && env.GEMINI_API_KEY && (!meta.brand || !meta.model || !meta.year)) {
+    try {
+      const vision = await analyzeCarImageWithGemini(imageUrls[0], env);
+      if (vision) {
+        if (!meta.brand && vision.brand) meta.brand = vision.brand;
+        if (!meta.model && vision.model) meta.model = vision.model;
+        if (!meta.year && vision.year) meta.year = vision.year;
+        if (!meta.trim && vision.trim) meta.trim = vision.trim;
+        if (!meta.bodyType && vision.bodyType) meta.bodyType = vision.bodyType;
+        if (!meta.suggestedSubcategory && vision.subcategory) meta.suggestedSubcategory = vision.subcategory;
+      }
+    } catch (e) {
+      console.warn("Vision check bypassed:", e);
+    }
+  }
+
+  // 4. Category & Subcategory
   const { category, subcategory } = determineCategoryAndSubcategory(cleanText, meta.brand, meta.model, meta.suggestedSubcategory);
 
-  // 3. Arrange Title
+  // 5. Arrange Title
   const title = arrangeTitle(cleanText, meta.brand, meta.model, meta.year, meta.trim, category, subcategory);
 
-  // 4. Calculate Price
-  const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText, meta.year);
+  // 6. Parse Price
+  const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText || messageText, meta.year);
 
-  // 5. Upload images to Cloudinary
-  const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
-  const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ""));
-
-  // 6. Save to Firebase (deterministic docId prevents duplicates)
+  // 7. Save to Firebase (deterministic docId prevents duplicates)
+  const textHash = simpleHash((cleanText || title).toLowerCase().replace(/\s+/g, ""));
   try {
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
@@ -185,7 +200,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     const adData = {
       fields: {
         title: { stringValue: title },
-        description: { stringValue: cleanText },
+        description: { stringValue: cleanText || title },
         price: { doubleValue: parseFloat(rawPrice) || 0 },
         formattedPrice: { stringValue: `${formattedPrice} ETB` },
         category: { stringValue: category },
@@ -221,7 +236,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     console.error("Firebase Error:", err);
   }
 
-  // 7. Repost formatted ad to Telegram Channel
+  // 8. Repost formatted ad to Telegram Channel
   const displayBrand = meta.brand ? meta.brand : "N/A";
   const displayModel = meta.model ? meta.model : "Standard";
   const displayYear = meta.year ? meta.year : "N/A";
@@ -231,7 +246,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     `🏷 Make: ${displayBrand} | Model: ${displayModel} | Year: ${displayYear}\n` +
     `📁 Category: ${category} › ${subcategory}\n` +
     `💰 Price: ${formattedPrice} ETB\n\n` +
-    `📄 Details:\n${cleanText}\n\n` +
+    `📄 Details:\n${cleanText || title}\n\n` +
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `🏢 የኛ ገበያ (Yegna Gebeya)\n` +
     `📞 Phone: 0911680790\n` +
@@ -248,7 +263,6 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       if (index === 0) item.caption = safeSubstring(fullCaption, 1024);
       return item;
     });
-
     await callTelegram("sendMediaGroup", { chat_id: repostTarget, media }, env);
   } else if (imageFileIds.length === 1) {
     await callTelegram("sendPhoto", {
@@ -265,6 +279,75 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
 }
 
 // ============================================
+// GEMINI VISION INSPECTOR (LOOK AT CAR PHOTO)
+// ============================================
+async function analyzeCarImageWithGemini(imageUrl, env) {
+  if (!env.GEMINI_API_KEY || !imageUrl) return null;
+  try {
+    const imgRes = await fetch(imageUrl);
+    if (!imgRes.ok) return null;
+    const arrayBuffer = await imgRes.arrayBuffer();
+    const bytes = new Uint8Array(arrayBuffer);
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    const base64Image = btoa(binary);
+    const mimeType = (imgRes.headers.get("content-type") || "image/jpeg").split(";")[0];
+
+    const prompt = `Analyze this vehicle or marketplace item image.
+Identify:
+1. Make / Brand (e.g., Hyundai, BYD, Toyota, Apple)
+2. Model (e.g., Elantra, Sealion 06, RAV4, iPhone 16 Pro Max)
+3. Production Year or Generation (e.g., 2022)
+4. Trim if visible (e.g., Champion Edition, Limited)
+5. Body Type (e.g., Sedan, SUV / Crossover, Hatchback, Pickup)
+6. Color (e.g., Silver, Dark Green, White)
+7. Subcategory (e.g., Sedan, SUV / Crossover, Electric (EV))
+
+Respond ONLY in valid JSON:
+{
+  "brand": "Hyundai",
+  "model": "Elantra",
+  "year": "2022",
+  "trim": "",
+  "bodyType": "Sedan",
+  "color": "Silver",
+  "subcategory": "Sedan"
+}`;
+
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              { text: prompt },
+              {
+                inline_data: {
+                  mime_type: mimeType,
+                  data: base64Image
+                }
+              }
+            ]
+          }
+        ],
+        generationConfig: {
+          response_mime_type: "application/json"
+        }
+      })
+    });
+
+    const data = await res.json();
+    const rawOutput = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!rawOutput) return null;
+    return JSON.parse(rawOutput);
+  } catch (err) {
+    console.warn("Vision error:", err);
+    return null;
+  }
+}
+
+// ============================================
 // BRAND, MODEL, AND YEAR EXTRACTION
 // ============================================
 function extractBrandModelYear(text) {
@@ -276,7 +359,6 @@ function extractBrandModelYear(text) {
   let fuelType = "";
   let suggestedSubcategory = "";
 
-  // 1. Explicit Key-Value Extraction
   const makeMatch = text.match(/(?:Make|የመኪናው\s*ዓይነት|Brand|ብራንድ)[\s:=-]+([a-zA-Z0-9\s/._-]+)/i);
   if (makeMatch && makeMatch[1]) brand = makeMatch[1].split("\n")[0].trim();
 
@@ -291,7 +373,7 @@ function extractBrandModelYear(text) {
     if (rawYear) year = rawYear[0];
   }
 
-  // CRITICAL FIX: If "Model 2022" contains a year, assign it to year and clear model
+  // Handle "Model 2022" as production year
   if (model && /^(?:19|20)\d{2}(?:\/\d{1,2})?$/.test(model)) {
     if (!year) year = model;
     model = "";
@@ -306,7 +388,6 @@ function extractBrandModelYear(text) {
   const fuelMatch = text.match(/(?:Fuel|ነዳጅ)[\s:=-]+([a-zA-Z0-9\s/._-]+)/i);
   if (fuelMatch && fuelMatch[1]) fuelType = fuelMatch[1].split("\n")[0].trim();
 
-  // 2. Pattern Matching against Car Brands Database
   const carDatabase = [
     {
       name: "Hyundai",
@@ -316,8 +397,7 @@ function extractBrandModelYear(text) {
         { name: "Elantra", pattern: /elantra|ኤላንትራ/i, subcategory: "Sedan" },
         { name: "Avante", pattern: /avante|አቫንቴ/i, subcategory: "Sedan" },
         { name: "Creta", pattern: /creta|ክሬታ/i, subcategory: "SUV / Crossover" },
-        { name: "Santa Fe", pattern: /santa\s*fe|ሳንታፌ/i, subcategory: "SUV / Crossover" },
-        { name: "Grand i10", pattern: /i10|አይ10/i, subcategory: "Hatchback / Compact" }
+        { name: "Santa Fe", pattern: /santa\s*fe|ሳንታፌ/i, subcategory: "SUV / Crossover" }
       ]
     },
     {
@@ -357,25 +437,6 @@ function extractBrandModelYear(text) {
         { name: "Alto", pattern: /alto|አልቶ/i, subcategory: "Hatchback / Compact" },
         { name: "Vitara", pattern: /vitara|ቪታራ/i, subcategory: "SUV / Crossover" }
       ]
-    },
-    {
-      name: "Mercedes-Benz",
-      pattern: /\b(mercedes|benz|መርሴዲስ|ቤንዝ)\b/i,
-      models: [
-        { name: "C-Class", pattern: /c-?class|c\s*\d{3}/i, subcategory: "Sedan" },
-        { name: "E-Class", pattern: /e-?class|e\s*\d{3}/i, subcategory: "Sedan" },
-        { name: "GLE", pattern: /gle/i, subcategory: "SUV / Crossover" }
-      ]
-    },
-    {
-      name: "Apple",
-      pattern: /\b(apple|iphone|ipad|macbook|አፕል|አይፎን)\b/i,
-      models: [
-        { name: "iPhone 16 Pro Max", pattern: /16\s*pro\s*max/i, subcategory: "Smartphones & Tablets" },
-        { name: "iPhone 15 Pro Max", pattern: /15\s*pro\s*max/i, subcategory: "Smartphones & Tablets" },
-        { name: "iPhone 15", pattern: /iphone\s*15/i, subcategory: "Smartphones & Tablets" },
-        { name: "MacBook Pro", pattern: /macbook\s*pro/i, subcategory: "Laptops & Computers" }
-      ]
     }
   ];
 
@@ -406,7 +467,6 @@ function extractBrandModelYear(text) {
     }
   }
 
-  // Scan across all models if still missing
   if (!model || !brand) {
     for (const b of carDatabase) {
       for (const m of b.models) {
@@ -430,9 +490,6 @@ function extractBrandModelYear(text) {
   return { brand, model, year, trim, bodyType, fuelType, suggestedSubcategory };
 }
 
-// ============================================
-// TITLE ARRANGER
-// ============================================
 function arrangeTitle(text, brand, model, year, trim, category, subcategory) {
   if (brand && model) {
     const cleanYear = year ? year.split("/")[0] : "";
@@ -460,13 +517,9 @@ function arrangeTitle(text, brand, model, year, trim, category, subcategory) {
   return "Featured Listing";
 }
 
-// ============================================
-// CATEGORY & SUBCATEGORY CLASSIFIER
-// ============================================
 function determineCategoryAndSubcategory(text, brand, model, suggestedSubcat) {
   const lower = text.toLowerCase();
 
-  // CARS
   if (/(car|toyota|suzuki|honda|bmw|benz|byd|hyundai|mazda|tucson|elantra|avante|sealion|seagull|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ባይድ|ተሽከርካሪ|ሞተር)/i.test(lower)) {
     let subcategory = suggestedSubcat || "Sedan";
     if (suggestedSubcat) {
@@ -483,7 +536,6 @@ function determineCategoryAndSubcategory(text, brand, model, suggestedSubcat) {
     return { category: "Cars", subcategory };
   }
 
-  // HOUSES
   if (/(villa|condominium|condo|g\+1|g\+2|real estate|for sale|ሽያጭ)\b/i.test(lower) && /(ቤት|ቪላ|ኮንዶሚኒየም|ሪል እስቴት|ካሬ)/i.test(lower)) {
     let subcategory = "Villa / G+1/G+2";
     if (/(condo|condominium|ኮንዶሚኒየም)/i.test(lower)) subcategory = "Condominium";
@@ -491,7 +543,6 @@ function determineCategoryAndSubcategory(text, brand, model, suggestedSubcat) {
     return { category: "Houses", subcategory };
   }
 
-  // RENTALS
   if (/(rent|lease|ኪራይ|የሚከራይ|ለኪራይ|ወርሃዊ)\b/i.test(lower) || /(office|shop|hall|warehouse|ሱቅ|ቢሮ|መጋዘን)/i.test(lower)) {
     let subcategory = "Apartment Rent";
     if (/(office|ቢሮ)/i.test(lower)) subcategory = "Commercial / Office";
@@ -499,7 +550,6 @@ function determineCategoryAndSubcategory(text, brand, model, suggestedSubcat) {
     return { category: "Rentals", subcategory };
   }
 
-  // ELECTRONICS
   if (/(iphone|samsung|laptop|computer|macbook|ipad|phone|smartphone|tv|camera|ስልክ|ላፕቶፕ|ኮምፒውተር|ቴሌቪዥን)/i.test(lower)) {
     let subcategory = suggestedSubcat || "Smartphones & Tablets";
     if (/(laptop|macbook|computer|ላፕቶፕ)/i.test(lower)) subcategory = "Laptops & Computers";
@@ -507,12 +557,10 @@ function determineCategoryAndSubcategory(text, brand, model, suggestedSubcat) {
     return { category: "Electronics", subcategory };
   }
 
-  // FURNITURE
   if (/(sofa|bed|table|chair|cupboard|wardrobe|furniture|ሶፋ|አልጋ|ጠረጴዛ|ወንበር|ቁምሳጥን)/i.test(lower)) {
     return { category: "Furniture", subcategory: "Home & Office Furniture" };
   }
 
-  // CLOTHES
   if (/(shoes|jacket|dress|suit|clothes|pants|ጫማ|ጃኬት|ቀሚስ|ልብስ)/i.test(lower)) {
     return { category: "Clothes", subcategory: "Fashion & Footwear" };
   }
@@ -520,15 +568,11 @@ function determineCategoryAndSubcategory(text, brand, model, suggestedSubcat) {
   return { category: "ምንአለሽ_ተራ", subcategory: "General Marketplace" };
 }
 
-// ============================================
-// ACCURATE PRICE PARSER (NO GUESSING YEARS)
-// ============================================
 function parseMathematicalPrice(text, knownYear) {
   if (!text) return { formattedPrice: "0", rawPrice: "0" };
 
   const detectedYear = (knownYear ? knownYear.split("/")[0] : "") || "";
 
-  // 1. Explicit Price Line
   const explicitLineMatch = text.match(/(?:💰|price|ዋጋ|fixed|የመሸጫ\s*ዋጋ)\s*[:=.-]?\s*([0-9.,]+)\s*(?:ETB|ብር|Birr)?\s*(?:million|mil|mln|m|ሚሊዮን)?/i);
   if (explicitLineMatch && explicitLineMatch[1]) {
     const rawVal = explicitLineMatch[1];
@@ -554,7 +598,6 @@ function parseMathematicalPrice(text, knownYear) {
     }
   }
 
-  // 2. Standalone Millions
   const millionMatch = text.match(/([0-9]+(?:\.[0-9]+)?)\s*(?:million|mil|mln|ሚሊዮን)\b/i);
   if (millionMatch && millionMatch[1]) {
     const val = parseFloat(millionMatch[1]);
@@ -564,8 +607,7 @@ function parseMathematicalPrice(text, knownYear) {
     }
   }
 
-  // 3. Currency suffixes (Birr / ETB) - excluding year
-  const currencyMatches = text.matchAll(/([0-9]{1,3}(?:[,.][0-9]{3})+|[0-9]{4,9})\s*(?:ETB|Birr|ብር)\b/gi);
+  const currencyMatches = text.matchAll(/([0-9]{1,3}(?:[,.][0-9]{3})+|[0-9]{4,9})\s*(?:ETB|ብር|Birr)\b/gi);
   for (const m of currencyMatches) {
     const cleanNum = m[1].replace(/[,.]/g, "");
     if (detectedYear && cleanNum === detectedYear) continue;
@@ -578,9 +620,6 @@ function parseMathematicalPrice(text, knownYear) {
   return { formattedPrice: "Contact for Price", rawPrice: "0" };
 }
 
-// ============================================
-// EMOJI & TEXT CLEANING
-// ============================================
 function cleanTheText(text) {
   if (!text) return "";
   const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu;
