@@ -1,9 +1,9 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * Features:
- * - Saves to website (Firebase) FIRST
- * - Uses Delete + Repost instead of Edit (Fixes AI Text Editor errors)
- * - Handles multi-photo albums perfectly
+ * - Saves to website FIRST
+ * - Wipes all hidden AI Entities (custom_emoji, text_link, etc.)
+ * - If edit fails, deletes and reposts.
  */
 
 const albumCache = new Map();
@@ -55,7 +55,7 @@ async function processUpdate(update, env) {
     if (!albumCache.has(groupId)) {
       albumCache.set(groupId, {
         images: [],
-        messageIds: [], // ✅ Track IDs to delete the whole album later
+        messageIds: [],
         firstMessage: rawText.length > 3 ? message : null,
         timerActive: false,
         timestamp: Date.now()
@@ -137,9 +137,8 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   const title = extractTitle(cleanText);
   const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText);
 
-  const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
-
   // ✅ 1. SAVE TO WEBSITE (FIREBASE) FIRST
+  const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
   try {
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
@@ -154,7 +153,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
         const existingData = await checkRes.json();
         if (!message.media_group_id && existingData.fields?.createdAt?.timestampValue) {
           const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
-          if (Date.now() - createdTime < 30000) return; // Prevent duplicates
+          if (Date.now() - createdTime < 30000) return; // Skip duplicate webhooks
         }
         if (existingData.fields?.images?.arrayValue?.values) {
           const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
@@ -210,29 +209,59 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   const chatId = message.chat.id;
   const lastPhotoFileId = isPhoto ? message.photo[message.photo.length - 1].file_id : null;
 
-  // ✅ 2. DELETE ORIGINAL DIRTY POST(S)
-  try {
-    if (messageIds.length === 1) {
-      await callTelegram("deleteMessage", { chat_id: chatId, message_id: messageIds[0] }, env);
-    } else {
-      await callTelegram("deleteMessages", { chat_id: chatId, message_ids: messageIds }, env);
-    }
-    console.log("✅ Deleted original dirty post(s)");
-  } catch (delErr) {
-    console.log("⚠️ Could not delete original (Bot needs Admin delete rights):", delErr.message);
-  }
+  let messageHandled = false;
 
-  // ✅ 3. SEND CLEAN POST TO MAIN CHAT
+  // ✅ 2. TRY TO EDIT (Stripping entities: [])
   try {
     if (isPhoto) {
-      await callTelegram("sendPhoto", { chat_id: chatId, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024) }, env);
+      await callTelegram("editMessageCaption", { 
+        chat_id: chatId, 
+        message_id: message.message_id, 
+        caption: safeSubstring(newPostText, 1024),
+        caption_entities: [] // Force strip AI text formatting
+      }, env);
     } else {
-      await callTelegram("sendMessage", { chat_id: chatId, text: safeSubstring(newPostText, 4096) }, env);
+      await callTelegram("editMessageText", { 
+        chat_id: chatId, 
+        message_id: message.message_id, 
+        text: safeSubstring(newPostText, 4096),
+        entities: [] // Force strip AI text formatting
+      }, env);
     }
-    console.log("✅ Posted clean ad to main chat");
-  } catch (e) {}
+    console.log("✅ Edited in place");
+    messageHandled = true;
+  } catch (editErr) {
+    console.log("⚠️ Edit failed (Premium Emojis/AI Editor). Attempting delete...", editErr.message);
+  }
 
-  // ✅ 4. SEND TO REPOST CHANNEL
+  // ✅ 3. IF EDIT FAILED, DELETE AND REPOST
+  if (!messageHandled) {
+    // Delete the original dirty message
+    try {
+      if (messageIds.length === 1) {
+        await callTelegram("deleteMessage", { chat_id: chatId, message_id: messageIds[0] }, env);
+      } else {
+        await callTelegram("deleteMessages", { chat_id: chatId, message_ids: messageIds }, env);
+      }
+      console.log("✅ Deleted original dirty post(s)");
+    } catch (delErr) {
+      console.log("⚠️ Could not delete original (Bot needs Admin delete rights):", delErr.message);
+    }
+
+    // Post the new clean message
+    try {
+      if (isPhoto) {
+        await callTelegram("sendPhoto", { chat_id: chatId, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024) }, env);
+      } else {
+        await callTelegram("sendMessage", { chat_id: chatId, text: safeSubstring(newPostText, 4096) }, env);
+      }
+      console.log("✅ Sent clean message to main chat");
+    } catch (repostErr) {
+      console.error("❌ Failed to send clean message:", repostErr.message);
+    }
+  }
+
+  // ✅ 4. SEND TO REPOST CHANNEL (Always send a fresh copy here)
   if (env.REPOST_CHANNEL_ID) {
     try {
       if (isPhoto) {
