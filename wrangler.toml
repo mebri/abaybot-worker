@@ -1,6 +1,8 @@
-name = "abaybot"
+name = "abaybot-worker"
 main = "worker.js"
 compatibility_date = "2024-10-01"
+compatibility_flags = ["nodejs_compat"]
+
 
 [vars]
 TELEGRAM_BOT_TOKEN = "8983581512:AAEeXyfUEBsalh-ns5DFn5Qcmd9Cpt2a1sQ"
