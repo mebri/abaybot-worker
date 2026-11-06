@@ -1,8 +1,5 @@
 /**
- * Yegna Gebeya Telegram Bot - Cloudflare Worker
- * Features:
- * - Strict Duplicate Protection (Unified Document IDs)
- * - Prevents Telegram webhook retries from creating duplicate website posts
+ * Yegna Gebeya Telegram Bot - FINAL FIXED VERSION
  */
 
 const albumCache = new Map();
@@ -28,7 +25,7 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 1. Ignore target channel
+  // 1. Ignore target channel (Repost Channel)
   if (env.REPOST_CHANNEL_ID) {
     const target = String(env.REPOST_CHANNEL_ID).replace("@", "").toLowerCase();
     const currentId = String(message.chat.id);
@@ -44,16 +41,16 @@ async function processUpdate(update, env) {
   const rawText = (message.text || message.caption || "").trim();
 
   // ============================================
-  // ✅ PROTECTION LAYER 1: IN-MEMORY HASH CHECK
+  // ✅ PROTECTION 1: IN-MEMORY HASH CHECK
   // ============================================
   const cleanTextForCheck = cleanTheText(rawText).replace(/\s+/g, '');
   if (cleanTextForCheck.length > 10) {
     const hash = simpleHash(cleanTextForCheck);
     if (recentHashes.has(hash)) {
       const lastSeen = recentHashes.get(hash);
-      if (Date.now() - lastSeen < 120000) { // 2 minutes
-        console.log("⏭️ Ignored: Duplicate text detected within 2 minutes.");
-        return; // Stops the duplicate webhook instantly
+      if (Date.now() - lastSeen < 120000) { 
+        console.log("⏭️ Ignored: Duplicate webhook detected.");
+        return; 
       }
     }
     recentHashes.set(hash, Date.now());
@@ -174,7 +171,6 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   const title = extractTitle(cleanText);
   const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText);
 
-  // 1. SAVE TO WEBSITE (FIREBASE)
   const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
   
   try {
@@ -183,10 +179,8 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     const adOwnerId = env.ADMIN_UID || "admin_bot";
     
     // ============================================
-    // ✅ PROTECTION LAYER 2: UNIFIED DOCUMENT ID
+    // ✅ PROTECTION 2: UNIFIED DOCUMENT ID
     // ============================================
-    // We use the text hash as the Document ID. Even if the bot processes 
-    // the exact same ad 5 times, it will PATCH the same document.
     const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
     const docId = `ad_${message.chat.id}_${textHash}`; 
       
@@ -198,7 +192,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       if (checkRes.ok) {
         const existingData = await checkRes.json();
         
-        // Final safeguard: If the document exists and is less than 5 minutes old, skip.
+        // Final safeguard against fast retries
         if (existingData.fields?.createdAt?.timestampValue) {
           const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
           if (Date.now() - createdTime < 300000) { 
@@ -235,7 +229,6 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       }
     };
     
-    // ✅ PATCH ensures we update, not create a new one
     await fetch(fbUrl, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(adData) });
     console.log("✅ Saved to Website (Firebase)");
   } catch (fbErr) {
@@ -267,20 +260,19 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
 
   let messageHandled = false;
 
-  // 2. TRY TO EDIT
+  // Try editing
   try {
     if (isPhoto) {
       await callTelegram("editMessageCaption", { chat_id: chatId, message_id: message.message_id, caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
     } else {
       await callTelegram("editMessageText", { chat_id: chatId, message_id: message.message_id, text: safeSubstring(newPostText, 4096), entities: [] }, env);
     }
-    console.log("✅ Edited in place");
     messageHandled = true;
   } catch (editErr) {
     console.log("⚠️ Edit failed. Deleting & Reposting...", editErr.message);
   }
 
-  // 3. IF EDIT FAILED, DELETE AND REPOST
+  // Fallback: Delete & Repost
   if (!messageHandled) {
     try {
       if (messageIds.length === 1) {
@@ -299,7 +291,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     } catch (repostErr) {}
   }
 
-  // 4. SEND TO REPOST CHANNEL
+  // Send to Repost Channel
   if (env.REPOST_CHANNEL_ID) {
     try {
       if (isPhoto) {
@@ -366,7 +358,9 @@ function cleanTheText(text) {
     .replace(/https?:\/\/\S+/gi, "")
     .replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "")
     .replace(/@[a-zA-Z0-9_]{2,}/g, "")
-    .replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}\b/gi, "")
+    // ✅ SAFE PHONE REMOVAL (Does not delete prices like 950000000)
+    .replace(/(?:\+251|251|0)\s*[97]\d(?:[\s.-]?\d){7}\b/gi, "")
+    .replace(/(?:\b(?:tel|phone|call|ስልክ|ደውል)\b[\s:.]*)[97]\d(?:[\s.-]?\d){7}\b/gi, "")
     .replace(EMOJI, "")
     .replace(/[*_~`|]/g, "")
     .replace(/[ \t]+/g, " ")
