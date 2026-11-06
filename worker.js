@@ -1,6 +1,8 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
- * Features: Strict Deduplication using Text Hash
+ * Features:
+ * - Strict Duplicate Protection (Unified Document IDs)
+ * - Prevents Telegram webhook retries from creating duplicate website posts
  */
 
 const albumCache = new Map();
@@ -41,21 +43,23 @@ async function processUpdate(update, env) {
 
   const rawText = (message.text || message.caption || "").trim();
 
-  // 3. Duplicate Text Hash Protection
+  // ============================================
+  // ✅ PROTECTION LAYER 1: IN-MEMORY HASH CHECK
+  // ============================================
   const cleanTextForCheck = cleanTheText(rawText).replace(/\s+/g, '');
   if (cleanTextForCheck.length > 10) {
     const hash = simpleHash(cleanTextForCheck);
     if (recentHashes.has(hash)) {
       const lastSeen = recentHashes.get(hash);
-      if (Date.now() - lastSeen < 120000) { 
+      if (Date.now() - lastSeen < 120000) { // 2 minutes
         console.log("⏭️ Ignored: Duplicate text detected within 2 minutes.");
-        return;
+        return; // Stops the duplicate webhook instantly
       }
     }
     recentHashes.set(hash, Date.now());
   }
 
-  // 4. Strict Watermark Check
+  // 3. Strict Watermark Check
   if (
     rawText.includes("🏢 የኛ ገበያ (Yegna Gebeya)") ||
     rawText.includes("📝 Title:") ||
@@ -172,14 +176,18 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
 
   // 1. SAVE TO WEBSITE (FIREBASE)
   const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
-  const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
   
   try {
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
     const adOwnerId = env.ADMIN_UID || "admin_bot";
     
-    // ✅ UNIFIED DOC ID: Uses Text Hash to prevent any duplicates from webhook retries
+    // ============================================
+    // ✅ PROTECTION LAYER 2: UNIFIED DOCUMENT ID
+    // ============================================
+    // We use the text hash as the Document ID. Even if the bot processes 
+    // the exact same ad 5 times, it will PATCH the same document.
+    const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
     const docId = `ad_${message.chat.id}_${textHash}`; 
       
     const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
@@ -190,16 +198,16 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       if (checkRes.ok) {
         const existingData = await checkRes.json();
         
+        // Final safeguard: If the document exists and is less than 5 minutes old, skip.
         if (existingData.fields?.createdAt?.timestampValue) {
           const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
-          // ✅ If it's a single message and was created recently, ignore.
-          if (!message.media_group_id && Date.now() - createdTime < 300000) { 
-            console.log("⏭️ Ignored: Duplicate single message detected.");
+          if (Date.now() - createdTime < 300000) { 
+            console.log("⏭️ Ignored: Duplicate text detected on website.");
             return; 
           }
         }
 
-        // Merge images (specifically for albums)
+        // Merge images (for albums)
         if (existingData.fields?.images?.arrayValue?.values) {
           const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
           allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
@@ -226,6 +234,8 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
         createdAt: { timestampValue: new Date().toISOString() }
       }
     };
+    
+    // ✅ PATCH ensures we update, not create a new one
     await fetch(fbUrl, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(adData) });
     console.log("✅ Saved to Website (Firebase)");
   } catch (fbErr) {
