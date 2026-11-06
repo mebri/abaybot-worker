@@ -3,6 +3,7 @@
  */
 
 const albumCache = new Map();
+const recentHashes = new Map(); 
 let cachedFirebaseToken = null;
 let tokenExpiresAt = 0;
 
@@ -39,7 +40,21 @@ async function processUpdate(update, env) {
 
   const rawText = (message.text || message.caption || "").trim();
 
-  // 3. Strict Watermark Check
+  // 3. Duplicate Text Hash Protection
+  const cleanTextForCheck = cleanTheText(rawText).replace(/\s+/g, '');
+  if (cleanTextForCheck.length > 10) {
+    const hash = simpleHash(cleanTextForCheck);
+    if (recentHashes.has(hash)) {
+      const lastSeen = recentHashes.get(hash);
+      if (Date.now() - lastSeen < 120000) { 
+        console.log("⏭️ Ignored: Duplicate text detected within 2 minutes.");
+        return;
+      }
+    }
+    recentHashes.set(hash, Date.now());
+  }
+
+  // 4. Strict Watermark Check
   if (
     rawText.includes("🏢 የኛ ገበያ (Yegna Gebeya)") ||
     rawText.includes("📝 Title:") ||
@@ -106,6 +121,18 @@ async function processUpdate(update, env) {
 }
 
 // ============================================
+// HASH FUNCTION
+// ============================================
+function simpleHash(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i);
+    hash = hash & hash;
+  }
+  return Math.abs(hash).toString();
+}
+
+// ============================================
 // SAFE TELEGRAM API WRAPPER
 // ============================================
 async function callTelegram(method, body, env) {
@@ -142,13 +169,19 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   const title = extractTitle(cleanText);
   const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText);
 
-  // ✅ SAVE TO WEBSITE (FIREBASE) FIRST
+  // 1. SAVE TO WEBSITE (FIREBASE) FIRST
   const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
+  const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
+  
   try {
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
     const adOwnerId = env.ADMIN_UID || "admin_bot";
-    const docId = message.media_group_id ? `tg_${message.chat.id}_${message.media_group_id}` : `tg_${message.chat.id}_${message.message_id}`;
+    
+    const docId = message.media_group_id 
+      ? `tg_${message.chat.id}_${message.media_group_id}` 
+      : `ad_${textHash}`; 
+      
     const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
 
     let allImages = imageUrls;
@@ -156,10 +189,15 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       const checkRes = await fetch(fbUrl, { headers: { Authorization: `Bearer ${token}` } });
       if (checkRes.ok) {
         const existingData = await checkRes.json();
-        if (!message.media_group_id && existingData.fields?.createdAt?.timestampValue) {
+        
+        if (existingData.fields?.createdAt?.timestampValue) {
           const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
-          if (Date.now() - createdTime < 30000) return;
+          if (Date.now() - createdTime < 300000) { 
+            console.log("⏭️ Ignored: Duplicate text detected on website.");
+            return; 
+          }
         }
+
         if (existingData.fields?.images?.arrayValue?.values) {
           const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
           allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
@@ -171,6 +209,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       fields: {
         title: { stringValue: title },
         description: { stringValue: cleanText },
+        textHash: { stringValue: textHash },
         price: { stringValue: formattedPrice },
         rawPrice: { integerValue: rawPrice },
         phone: { stringValue: "0911680790" },
@@ -186,7 +225,10 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       }
     };
     await fetch(fbUrl, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(adData) });
-  } catch (fbErr) {}
+    console.log("✅ Saved to Website (Firebase)");
+  } catch (fbErr) {
+    console.error("Firebase Error:", fbErr.message);
+  }
 
   // Build Message
   const hashtagMap = { Cars: "#Cars", Houses: "#Houses", Rentals: "#Rentals", Electronics: "#Electronics", Furniture: "#Furniture", Clothes: "#Clothes", "Labor & Services": "#Labor", "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ" };
@@ -213,7 +255,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
 
   let messageHandled = false;
 
-  // ✅ TRY TO EDIT (Stripping hidden AI/Premium entities)
+  // 2. TRY TO EDIT
   try {
     if (isPhoto) {
       await callTelegram("editMessageCaption", { 
@@ -230,10 +272,13 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
         entities: [] 
       }, env);
     }
+    console.log("✅ Edited in place");
     messageHandled = true;
-  } catch (editErr) {}
+  } catch (editErr) {
+    console.log("⚠️ Edit failed. Deleting & Reposting...", editErr.message);
+  }
 
-  // ✅ IF EDIT FAILED, DELETE AND REPOST
+  // 3. IF EDIT FAILED, DELETE AND REPOST
   if (!messageHandled) {
     try {
       if (messageIds.length === 1) {
@@ -252,7 +297,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     } catch (repostErr) {}
   }
 
-  // ✅ SEND TO REPOST CHANNEL
+  // 4. SEND TO REPOST CHANNEL
   if (env.REPOST_CHANNEL_ID) {
     try {
       if (isPhoto) {
@@ -265,7 +310,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
 }
 
 // ============================================
-// HELPERS
+// HELPERS (Fixed Regex)
 // ============================================
 function parseMathematicalPrice(text) {
   const millionMatch = text.match(/([\d.]+)\s*(?:million|mil|mln|m|ሚሊዮን)\b/i);
@@ -324,7 +369,7 @@ function cleanTheText(text) {
     .replace(/[*_~`|]/g, "")
     .replace(/[ \t]+/g, " ")
     .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n") // ✅ This is the fixed line
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
