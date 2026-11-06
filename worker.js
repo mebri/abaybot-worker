@@ -1,5 +1,6 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
+ * Features: Strict Deduplication using Text Hash
  */
 
 const albumCache = new Map();
@@ -169,7 +170,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   const title = extractTitle(cleanText);
   const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText);
 
-  // 1. SAVE TO WEBSITE (FIREBASE) FIRST
+  // 1. SAVE TO WEBSITE (FIREBASE)
   const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
   const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
   
@@ -178,9 +179,8 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     const projectId = env.FIREBASE_PROJECT_ID;
     const adOwnerId = env.ADMIN_UID || "admin_bot";
     
-    const docId = message.media_group_id 
-      ? `tg_${message.chat.id}_${message.media_group_id}` 
-      : `ad_${textHash}`; 
+    // ✅ UNIFIED DOC ID: Uses Text Hash to prevent any duplicates from webhook retries
+    const docId = `ad_${message.chat.id}_${textHash}`; 
       
     const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
 
@@ -192,12 +192,14 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
         
         if (existingData.fields?.createdAt?.timestampValue) {
           const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
-          if (Date.now() - createdTime < 300000) { 
-            console.log("⏭️ Ignored: Duplicate text detected on website.");
+          // ✅ If it's a single message and was created recently, ignore.
+          if (!message.media_group_id && Date.now() - createdTime < 300000) { 
+            console.log("⏭️ Ignored: Duplicate single message detected.");
             return; 
           }
         }
 
+        // Merge images (specifically for albums)
         if (existingData.fields?.images?.arrayValue?.values) {
           const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
           allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
@@ -258,19 +260,9 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   // 2. TRY TO EDIT
   try {
     if (isPhoto) {
-      await callTelegram("editMessageCaption", { 
-        chat_id: chatId, 
-        message_id: message.message_id, 
-        caption: safeSubstring(newPostText, 1024),
-        caption_entities: [] 
-      }, env);
+      await callTelegram("editMessageCaption", { chat_id: chatId, message_id: message.message_id, caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
     } else {
-      await callTelegram("editMessageText", { 
-        chat_id: chatId, 
-        message_id: message.message_id, 
-        text: safeSubstring(newPostText, 4096),
-        entities: [] 
-      }, env);
+      await callTelegram("editMessageText", { chat_id: chatId, message_id: message.message_id, text: safeSubstring(newPostText, 4096), entities: [] }, env);
     }
     console.log("✅ Edited in place");
     messageHandled = true;
@@ -310,7 +302,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
 }
 
 // ============================================
-// HELPERS (Fixed Regex)
+// HELPERS
 // ============================================
 function parseMathematicalPrice(text) {
   const millionMatch = text.match(/([\d.]+)\s*(?:million|mil|mln|m|ሚሊዮን)\b/i);
