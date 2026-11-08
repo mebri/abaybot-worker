@@ -1,5 +1,9 @@
 /**
- * Yegna Gebeya Telegram Bot - FINAL FIXED VERSION
+ * Yegna Gebeya Telegram Bot - Cloudflare Worker
+ * Features:
+ * - Saves all ads under Admin UID (q7zMj6aMAvgx97OCwqlYRVbSQgX2)
+ * - Prevents duplicate posts using tg_chatID_messageID
+ * - Strips AI/Premium emojis without breaking text
  */
 
 const albumCache = new Map();
@@ -25,7 +29,7 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 1. Ignore target channel (Repost Channel)
+  // 1. Ignore target channel (prevents infinite loops)
   if (env.REPOST_CHANNEL_ID) {
     const target = String(env.REPOST_CHANNEL_ID).replace("@", "").toLowerCase();
     const currentId = String(message.chat.id);
@@ -40,23 +44,21 @@ async function processUpdate(update, env) {
 
   const rawText = (message.text || message.caption || "").trim();
 
-  // ============================================
-  // ✅ PROTECTION 1: IN-MEMORY HASH CHECK
-  // ============================================
+  // 3. In-Memory Duplicate Text Hash Protection
   const cleanTextForCheck = cleanTheText(rawText).replace(/\s+/g, '');
   if (cleanTextForCheck.length > 10) {
     const hash = simpleHash(cleanTextForCheck);
     if (recentHashes.has(hash)) {
       const lastSeen = recentHashes.get(hash);
       if (Date.now() - lastSeen < 120000) { 
-        console.log("⏭️ Ignored: Duplicate webhook detected.");
-        return; 
+        console.log("⏭️ Ignored: Duplicate text detected within 2 minutes.");
+        return;
       }
     }
     recentHashes.set(hash, Date.now());
   }
 
-  // 3. Strict Watermark Check
+  // 4. Strict Watermark Check
   if (
     rawText.includes("🏢 የኛ ገበያ (Yegna Gebeya)") ||
     rawText.includes("📝 Title:") ||
@@ -171,18 +173,20 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   const title = extractTitle(cleanText);
   const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText);
 
+  // 1. SAVE TO WEBSITE (FIREBASE) FIRST
   const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
   
   try {
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
-    const adOwnerId = env.ADMIN_UID || "admin_bot";
     
-    // ============================================
-    // ✅ PROTECTION 2: UNIFIED DOCUMENT ID
-    // ============================================
-    const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
-    const docId = `ad_${message.chat.id}_${textHash}`; 
+    // ✅ FIXED: All ads are now permanently linked to your Admin UID
+    const adOwnerId = "q7zMj6aMAvgx97OCwqlYRVbSQgX2"; 
+    
+    // ✅ FIXED: Uses tg_chatID_messageID to prevent duplicate database entries
+    const docId = message.media_group_id 
+      ? `tg_${message.chat.id}_${message.media_group_id}` 
+      : `tg_${message.chat.id}_${message.message_id}`; 
       
     const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
 
@@ -192,16 +196,16 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       if (checkRes.ok) {
         const existingData = await checkRes.json();
         
-        // Final safeguard against fast retries
-        if (existingData.fields?.createdAt?.timestampValue) {
+        // Strict duplicate check for webhook retries
+        if (!message.media_group_id && existingData.fields?.createdAt?.timestampValue) {
           const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
-          if (Date.now() - createdTime < 300000) { 
-            console.log("⏭️ Ignored: Duplicate text detected on website.");
+          if (Date.now() - createdTime < 30000) { 
+            console.log("⏭️ Ignored: Duplicate webhook retry detected.");
             return; 
           }
         }
 
-        // Merge images (for albums)
+        // Merge images for albums
         if (existingData.fields?.images?.arrayValue?.values) {
           const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
           allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
@@ -213,7 +217,6 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       fields: {
         title: { stringValue: title },
         description: { stringValue: cleanText },
-        textHash: { stringValue: textHash },
         price: { stringValue: formattedPrice },
         rawPrice: { integerValue: rawPrice },
         phone: { stringValue: "0911680790" },
@@ -223,7 +226,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
         images: { arrayValue: { values: allImages.map((url) => ({ stringValue: url })) } },
         status: { stringValue: "available" },
         source: { stringValue: "telegram" },
-        userId: { stringValue: adOwnerId },
+        userId: { stringValue: adOwnerId }, // ✅ Linked to your profile
         views: { integerValue: "0" },
         createdAt: { timestampValue: new Date().toISOString() }
       }
@@ -260,19 +263,20 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
 
   let messageHandled = false;
 
-  // Try editing
+  // 2. TRY TO EDIT
   try {
     if (isPhoto) {
       await callTelegram("editMessageCaption", { chat_id: chatId, message_id: message.message_id, caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
     } else {
       await callTelegram("editMessageText", { chat_id: chatId, message_id: message.message_id, text: safeSubstring(newPostText, 4096), entities: [] }, env);
     }
+    console.log("✅ Edited in place");
     messageHandled = true;
   } catch (editErr) {
     console.log("⚠️ Edit failed. Deleting & Reposting...", editErr.message);
   }
 
-  // Fallback: Delete & Repost
+  // 3. IF EDIT FAILED, DELETE AND REPOST
   if (!messageHandled) {
     try {
       if (messageIds.length === 1) {
@@ -291,7 +295,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     } catch (repostErr) {}
   }
 
-  // Send to Repost Channel
+  // 4. SEND TO REPOST CHANNEL
   if (env.REPOST_CHANNEL_ID) {
     try {
       if (isPhoto) {
@@ -358,9 +362,7 @@ function cleanTheText(text) {
     .replace(/https?:\/\/\S+/gi, "")
     .replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "")
     .replace(/@[a-zA-Z0-9_]{2,}/g, "")
-    // ✅ SAFE PHONE REMOVAL (Does not delete prices like 950000000)
-    .replace(/(?:\+251|251|0)\s*[97]\d(?:[\s.-]?\d){7}\b/gi, "")
-    .replace(/(?:\b(?:tel|phone|call|ስልክ|ደውል)\b[\s:.]*)[97]\d(?:[\s.-]?\d){7}\b/gi, "")
+    .replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}\b/gi, "")
     .replace(EMOJI, "")
     .replace(/[*_~`|]/g, "")
     .replace(/[ \t]+/g, " ")
