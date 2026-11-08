@@ -1,9 +1,8 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
- * Features:
- * - Saves all ads under Admin UID (q7zMj6aMAvgx97OCwqlYRVbSQgX2)
- * - Prevents duplicate posts using tg_chatID_messageID
- * - Strips AI/Premium emojis without breaking text
+ * Features: 
+ * - Fixed multiple images (albums) upload
+ * - Fixed Album sending using sendMediaGroup
  */
 
 const albumCache = new Map();
@@ -179,11 +178,8 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   try {
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
+    const adOwnerId = "q7zMj6aMAvgx97OCwqlYRVbSQgX2"; // Your Admin UID
     
-    // ✅ FIXED: All ads are now permanently linked to your Admin UID
-    const adOwnerId = "q7zMj6aMAvgx97OCwqlYRVbSQgX2"; 
-    
-    // ✅ FIXED: Uses tg_chatID_messageID to prevent duplicate database entries
     const docId = message.media_group_id 
       ? `tg_${message.chat.id}_${message.media_group_id}` 
       : `tg_${message.chat.id}_${message.message_id}`; 
@@ -195,8 +191,6 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       const checkRes = await fetch(fbUrl, { headers: { Authorization: `Bearer ${token}` } });
       if (checkRes.ok) {
         const existingData = await checkRes.json();
-        
-        // Strict duplicate check for webhook retries
         if (!message.media_group_id && existingData.fields?.createdAt?.timestampValue) {
           const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
           if (Date.now() - createdTime < 30000) { 
@@ -204,8 +198,6 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
             return; 
           }
         }
-
-        // Merge images for albums
         if (existingData.fields?.images?.arrayValue?.values) {
           const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
           allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
@@ -226,7 +218,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
         images: { arrayValue: { values: allImages.map((url) => ({ stringValue: url })) } },
         status: { stringValue: "available" },
         source: { stringValue: "telegram" },
-        userId: { stringValue: adOwnerId }, // ✅ Linked to your profile
+        userId: { stringValue: adOwnerId },
         views: { integerValue: "0" },
         createdAt: { timestampValue: new Date().toISOString() }
       }
@@ -257,26 +249,26 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   newPostText += `━━━━━━━━━━━━━━━\n\n`;
   newPostText += `${hashtag}`;
 
-  const isPhoto = message.photo && message.photo.length > 0;
   const chatId = message.chat.id;
-  const lastPhotoFileId = isPhoto ? message.photo[message.photo.length - 1].file_id : null;
+  const isAlbum = imageFileIds.length > 1;
 
+  // 2. TRY TO EDIT (Only if it's a single photo or text)
   let messageHandled = false;
-
-  // 2. TRY TO EDIT
-  try {
-    if (isPhoto) {
-      await callTelegram("editMessageCaption", { chat_id: chatId, message_id: message.message_id, caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
-    } else {
-      await callTelegram("editMessageText", { chat_id: chatId, message_id: message.message_id, text: safeSubstring(newPostText, 4096), entities: [] }, env);
+  if (!isAlbum) {
+    try {
+      if (imageFileIds.length === 1) {
+        await callTelegram("editMessageCaption", { chat_id: chatId, message_id: message.message_id, caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
+      } else {
+        await callTelegram("editMessageText", { chat_id: chatId, message_id: message.message_id, text: safeSubstring(newPostText, 4096), entities: [] }, env);
+      }
+      console.log("✅ Edited in place");
+      messageHandled = true;
+    } catch (editErr) {
+      console.log("⚠️ Edit failed. Will Delete & Repost.", editErr.message);
     }
-    console.log("✅ Edited in place");
-    messageHandled = true;
-  } catch (editErr) {
-    console.log("⚠️ Edit failed. Deleting & Reposting...", editErr.message);
   }
 
-  // 3. IF EDIT FAILED, DELETE AND REPOST
+  // 3. IF EDIT FAILED OR IT'S AN ALBUM, DELETE AND REPOST
   if (!messageHandled) {
     try {
       if (messageIds.length === 1) {
@@ -287,23 +279,45 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     } catch (delErr) {}
 
     try {
-      if (isPhoto) {
-        await callTelegram("sendPhoto", { chat_id: chatId, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
+      if (isAlbum) {
+        // ✅ Send as Media Group (Allows multiple images)
+        const mediaGroup = imageFileIds.map((fileId, index) => ({
+          type: "photo",
+          media: fileId,
+          caption: index === 0 ? safeSubstring(newPostText, 1024) : undefined, // Caption only on first image
+          caption_entities: []
+        }));
+        await callTelegram("sendMediaGroup", { chat_id: chatId, media: mediaGroup }, env);
+      } else if (imageFileIds.length === 1) {
+        await callTelegram("sendPhoto", { chat_id: chatId, photo: imageFileIds[0], caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
       } else {
         await callTelegram("sendMessage", { chat_id: chatId, text: safeSubstring(newPostText, 4096), entities: [] }, env);
       }
-    } catch (repostErr) {}
+      console.log("✅ Sent clean message to main chat");
+    } catch (repostErr) {
+      console.error("❌ Repost failed:", repostErr.message);
+    }
   }
 
   // 4. SEND TO REPOST CHANNEL
   if (env.REPOST_CHANNEL_ID) {
     try {
-      if (isPhoto) {
-        await callTelegram("sendPhoto", { chat_id: env.REPOST_CHANNEL_ID, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
+      if (isAlbum) {
+        const mediaGroup = imageFileIds.map((fileId, index) => ({
+          type: "photo",
+          media: fileId,
+          caption: index === 0 ? safeSubstring(newPostText, 1024) : undefined,
+          caption_entities: []
+        }));
+        await callTelegram("sendMediaGroup", { chat_id: env.REPOST_CHANNEL_ID, media: mediaGroup }, env);
+      } else if (imageFileIds.length === 1) {
+        await callTelegram("sendPhoto", { chat_id: env.REPOST_CHANNEL_ID, photo: imageFileIds[0], caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
       } else {
         await callTelegram("sendMessage", { chat_id: env.REPOST_CHANNEL_ID, text: safeSubstring(newPostText, 4096), entities: [] }, env);
       }
-    } catch (chErr) {}
+    } catch (chErr) {
+      console.error("❌ Channel repost failed:", chErr.message);
+    }
   }
 }
 
@@ -334,24 +348,34 @@ function parseMathematicalPrice(text) {
   return { formattedPrice: "0", rawPrice: "0" };
 }
 
+// ✅ FIXED: Sequential uploading so Telegram doesn't block multiple requests
 async function uploadImagesToCloudinary(fileIds, env) {
   if (!fileIds || fileIds.length === 0) return [];
-  const uploadPromises = fileIds.map(async (fileId) => {
+  const results = [];
+  
+  for (const fileId of fileIds) {
     try {
       const fileRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`);
       const fileInfo = await fileRes.json();
-      if (!fileInfo.ok || !fileInfo.result?.file_path) return null;
+      if (!fileInfo.ok || !fileInfo.result?.file_path) continue;
+      
       const tgFileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileInfo.result.file_path}`;
       const formData = new FormData();
       formData.append("file", tgFileUrl);
       formData.append("upload_preset", env.CLOUDINARY_UPLOAD_PRESET);
+      
       const cloudRes = await fetch(`https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/image/upload`, { method: "POST", body: formData });
       const cloudData = await cloudRes.json();
-      return cloudData.secure_url || null;
-    } catch (err) { return null; }
-  });
-  const results = await Promise.all(uploadPromises);
-  return results.filter(Boolean);
+      
+      if (cloudData.secure_url) {
+        results.push(cloudData.secure_url);
+      }
+    } catch (err) {
+      console.error("Upload error for fileId:", fileId, err.message);
+    }
+  }
+  
+  return results;
 }
 
 function cleanTheText(text) {
