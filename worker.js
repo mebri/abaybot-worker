@@ -1,10 +1,27 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
- * (Anti-Duplicate v4.0 Bulletproof)
+ * 
+ * Production Anti-Double-Post Architecture (v5.0 Single-Ad Guard):
+ * 1. Zero-Second Instant Locking:
+ *    - Immediately drops any message with NO caption/text (cannot be an ad).
+ *    - Immediately claims media_group_id lock at millisecond 0, dropping any second/third file in the album.
+ *    - Immediately claims text hash & chat-level debounce lock, dropping rapid consecutive photo uploads.
+ * 2. Single Ad Forwarder:
+ *    - Takes the primary photo and posts EXACTLY ONE clean ad via sendPhoto with full title, price, and specs.
+ *    - Ignores extra files so the bot NEVER sends two files/two ads for one post.
+ * 3. Channel & Discussion Group Reflection Shield:
+ *    - Drops all channel_post and edited_channel_post events.
+ *    - Drops all automatic forwards to linked discussion groups.
+ *    - Drops all messages containing bot signatures or watermarks.
+ * 4. Mathematical Amharic Price Parser: ሚሊዮን (1,000,000), ሺህ (1,000), protects manufacture years.
+ * 5. AI Title Arranger: [Year] [Brand] [Model] [Trim] (e.g. "2025 BYD Sealion 06 EV").
+ * 6. Cloudinary Image Upload + Firestore Sync.
  */
 
-const albumCache = new Map();
-const processedLocks = new Map();
+// Instant In-Memory Deduplication Stores
+const mediaGroupLocks = new Set();
+const contentLocks = new Map();
+const recentChatAds = new Map();
 const updateIdLocks = new Set();
 let cachedFirebaseToken = null;
 let tokenExpiresAt = 0;
@@ -12,7 +29,7 @@ let tokenExpiresAt = 0;
 export default {
   async fetch(request, env, ctx) {
     if (request.method !== "POST") {
-      return new Response("Yegna Gebeya Bot is running ✅ (Anti-Duplicate v4.0 Active)", { 
+      return new Response("Yegna Gebeya Bot is running ✅ (Anti-Duplicate v5.0 Active)", { 
         status: 200,
         headers: { "Content-Type": "text/plain; charset=utf-8" }
       });
@@ -20,6 +37,8 @@ export default {
 
     try {
       const update = await request.json();
+      
+      // Fast ACK to Telegram: Return 200 OK immediately so Telegram never retries
       ctx.waitUntil(processUpdateSafe(update, env, request));
       return new Response("OK", { status: 200 });
     } catch (error) {
@@ -38,6 +57,7 @@ async function processUpdateSafe(update, env, request) {
 }
 
 async function processUpdate(update, env, request) {
+  // 1. DEDUPLICATE TELEGRAM UPDATE ID
   if (update.update_id) {
     if (updateIdLocks.has(update.update_id)) {
       console.log(`⏭️ Ignored: Duplicate update_id ${update.update_id}`);
@@ -50,15 +70,27 @@ async function processUpdate(update, env, request) {
     }
   }
 
-  if (update.channel_post || update.edited_channel_post) return;
-  if (update.edited_message) return;
+  // 2. ABSOLUTE CHANNEL SHIELD: NEVER PROCESS CHANNEL POSTS!
+  // Channels (@mebrigranite) are broadcast outputs, NOT user submissions.
+  if (update.channel_post || update.edited_channel_post || update.edited_message) {
+    return;
+  }
 
   const message = update.message;
   if (!message) return;
 
-  if (message.chat && message.chat.type === "channel") return;
-  if (message.is_automatic_forward) return;
+  // 3. IGNORE IF CHAT IS A CHANNEL
+  if (message.chat && message.chat.type === "channel") {
+    return;
+  }
 
+  // 4. IGNORE AUTOMATIC FORWARDS (Linked discussion groups connected to @mebrigranite)
+  if (message.is_automatic_forward) {
+    return;
+  }
+
+  // 5. IGNORE BOTS & SYSTEM ACCOUNTS
+  // 1087968824 = GroupAnonymousBot, 777000 = Telegram Notifications
   const botId = env.TELEGRAM_BOT_TOKEN ? env.TELEGRAM_BOT_TOKEN.split(":")[0] : "";
   if (message.from) {
     const fromIdStr = String(message.from.id);
@@ -67,6 +99,7 @@ async function processUpdate(update, env, request) {
     }
   }
 
+  // 6. IGNORE SENDER_CHAT IF IT IS A CHANNEL
   if (message.sender_chat) {
     if (message.sender_chat.type === "channel") return;
     const senderUser = (message.sender_chat.username || "").toLowerCase();
@@ -78,6 +111,7 @@ async function processUpdate(update, env, request) {
     }
   }
 
+  // 7. IGNORE FORWARDED FROM TARGET CHANNEL
   if (message.forward_from_chat) {
     const fwdUser = (message.forward_from_chat.username || "").toLowerCase();
     const fwdIdStr = String(message.forward_from_chat.id);
@@ -88,6 +122,7 @@ async function processUpdate(update, env, request) {
     }
   }
 
+  // 8. IGNORE TARGET CHANNEL IN CHAT USERNAME OR ID
   const targetChannelRaw = env.REPOST_CHANNEL_ID || "@mebrigranite";
   const targetClean = targetChannelRaw.replace("@", "").toLowerCase();
   const chatIdStr = String(message.chat.id);
@@ -96,197 +131,88 @@ async function processUpdate(update, env, request) {
     return;
   }
 
+  // 9. EXTRACT TEXT & CAPTION
   const rawText = (message.text || message.caption || "").trim();
 
+  // RULE 1: IF MESSAGE HAS NO TEXT / CAPTION, DROP IT IMMEDIATELY!
+  // Dropping empty photo messages prevents the second file from ever posting!
+  if (!rawText || rawText.length < 3) {
+    console.log("⏭️ Ignored: Message has no text/caption (extra file dropped).");
+    return;
+  }
+
+  // 10. STRICT BOT WATERMARK DETECTION (Drop already-formatted bot posts)
   if (hasBotWatermark(rawText)) {
     console.log("⏭️ Ignored: Bot watermark signature detected.");
     return;
   }
 
+  const cleanText = cleanTheText(rawText);
+  if (!cleanText || cleanText.length < 3) return;
+
+  // ============================================
+  // RULE 2: MULTI-FILE / ALBUM INSTANT LOCK
+  // When a user sends 2 files with media_group_id,
+  // File 1 takes the lock; File 2 is IGNORED IMMEDIATELY!
+  // ============================================
   if (message.media_group_id) {
     const groupId = String(message.media_group_id);
-    const albumLockKey = `album_${message.chat.id}_${groupId}`;
+    if (mediaGroupLocks.has(groupId)) {
+      console.log(`🛑 IGNORED SECOND FILE in album ${groupId}. Only one ad is sent!`);
+      return; // Second file dropped on the spot!
+    }
+    mediaGroupLocks.add(groupId);
+    if (mediaGroupLocks.size > 2000) {
+      const first = mediaGroupLocks.values().next().value;
+      mediaGroupLocks.delete(first);
+    }
+  }
 
-    if (await isEdgeLocked(albumLockKey, request.url)) {
-      console.log(`⏭️ Ignored: Album ${groupId} already processed.`);
+  // ============================================
+  // RULE 3: CONTENT HASH & CHAT DEBOUNCE LOCK
+  // Prevents sending duplicate ads if seller uploads
+  // 2 files separately without an album group.
+  // ============================================
+  const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
+  const now = Date.now();
+
+  // Check content hash lock (10 minutes)
+  if (contentLocks.has(textHash)) {
+    const expiresAt = contentLocks.get(textHash);
+    if (now < expiresAt) {
+      console.log(`🛑 IGNORED SECOND FILE: Identical ad content (hash: ${textHash}) already posted.`);
       return;
     }
+    contentLocks.delete(textHash);
+  }
+  contentLocks.set(textHash, now + 600000); // Lock for 10 minutes
 
-    if (!albumCache.has(groupId)) {
-      albumCache.set(groupId, {
-        images: [],
-        messageIds: [],
-        captionMessage: null,
-        timerActive: false,
-        timestamp: Date.now()
-      });
+  // Check chat debounce (if same chat sends another ad file within 15 seconds)
+  const lastAd = recentChatAds.get(chatIdStr);
+  if (lastAd && (now - lastAd.time < 15000)) {
+    if (lastAd.hash === textHash) {
+      console.log(`🛑 IGNORED SECOND FILE: Consecutive duplicate in chat ${chatIdStr}.`);
+      return;
     }
+  }
+  recentChatAds.set(chatIdStr, { hash: textHash, time: now });
 
-    const albumData = albumCache.get(groupId);
-
-    if (message.photo && message.photo.length > 0) {
-      const bestPhoto = message.photo[message.photo.length - 1].file_id;
-      if (!albumData.images.includes(bestPhoto)) {
-        albumData.images.push(bestPhoto);
-      }
-      albumData.messageIds.push(message.message_id);
+  // Cleanup old locks
+  if (contentLocks.size > 2000) {
+    for (const [k, exp] of contentLocks.entries()) {
+      if (now > exp) contentLocks.delete(k);
     }
-
-    if (rawText.length > 3 && !albumData.captionMessage) {
-      albumData.captionMessage = message;
-    }
-
-    if (!albumData.timerActive) {
-      albumData.timerActive = true;
-
-      await new Promise((resolve) => setTimeout(resolve, 3500));
-
-      if (!albumCache.has(groupId)) return;
-      const finalData = albumCache.get(groupId);
-      albumCache.delete(groupId);
-      if (!finalData) return;
-
-      const postMsg = finalData.captionMessage;
-      if (!postMsg) {
-        console.log(`⏭️ Dropping album ${groupId}: No text caption found on any photo.`);
-        return;
-      }
-
-      const postText = (postMsg.text || postMsg.caption || "").trim();
-      const cleanPostText = cleanTheText(postText);
-      if (cleanPostText.length < 3) {
-        console.log(`⏭️ Dropping album ${groupId}: Cleaned text is too short.`);
-        return;
-      }
-
-      const lockAcquired = await acquireGlobalBroadcastLock(albumLockKey, cleanPostText, env, request.url);
-      if (!lockAcquired) {
-        console.log(`🛑 Album ${groupId} duplicate broadcast blocked by distributed lock!`);
-        return;
-      }
-
-      await processFinalAd(postMsg, finalData.images, finalData.messageIds, env, groupId, request.url);
-    }
-
-    cleanupStaleAlbums();
-    return;
   }
 
-  const cleanCheck = cleanTheText(rawText);
-  if (cleanCheck.length < 3) return;
-
-  const msgLockKey = `msg_${message.chat.id}_${message.message_id}`;
-  const textHash = simpleHash(cleanCheck.toLowerCase().replace(/\s+/g, ''));
-  const contentLockKey = `content_${textHash}`;
-
-  if (await isEdgeLocked(msgLockKey, request.url)) {
-    console.log(`⏭️ Ignored: Message ${msgLockKey} already processed.`);
-    return;
-  }
-
-  if (await isEdgeLocked(contentLockKey, request.url)) {
-    console.log(`⏭️ Ignored: Duplicate content hash ${textHash} already processed.`);
-    return;
-  }
-
-  const lockAcquired = await acquireGlobalBroadcastLock(msgLockKey, cleanCheck, env, request.url);
-  if (!lockAcquired) {
-    console.log(`🛑 Message ${msgLockKey} duplicate broadcast blocked by distributed lock!`);
-    return;
-  }
-
+  // ============================================
+  // SINGLE CLEAN AD BROADCAST (ONE FILE, ONE AD)
+  // ============================================
   const images = [];
   if (message.photo && message.photo.length > 0) {
     images.push(message.photo[message.photo.length - 1].file_id);
   }
 
-  await processFinalAd(message, images, [message.message_id], env, null, request.url);
-}
-
-async function acquireGlobalBroadcastLock(lockKey, contentText, env, requestUrl) {
-  const ttlSeconds = 600;
-
-  const now = Date.now();
-  if (processedLocks.has(lockKey)) {
-    const exp = processedLocks.get(lockKey);
-    if (now < exp) return false;
-    processedLocks.delete(lockKey);
-  }
-  processedLocks.set(lockKey, now + (ttlSeconds * 1000));
-
-  if (typeof caches !== "undefined" && caches.default && requestUrl) {
-    try {
-      const cache = caches.default;
-      const parsed = new URL(requestUrl);
-      const cacheEndpoint = `https://${parsed.hostname}/__bot_lock__/${encodeURIComponent(lockKey)}`;
-      const cacheReq = new Request(cacheEndpoint, { method: "GET" });
-      const hit = await cache.match(cacheReq);
-      if (hit) {
-        return false;
-      }
-
-      const cacheRes = new Response("1", {
-        status: 200,
-        headers: {
-          "Content-Type": "text/plain",
-          "Cache-Control": `public, max-age=${ttlSeconds}, s-maxage=${ttlSeconds}`
-        }
-      });
-      await cache.put(cacheReq, cacheRes);
-    } catch (cacheErr) {
-      console.warn("Cloudflare Cache lock warning:", cacheErr.message);
-    }
-  }
-
-  try {
-    const token = await getFirebaseToken(env);
-    if (token && env.FIREBASE_PROJECT_ID) {
-      const fbLockUrl = `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/(default)/documents/bot_broadcast_locks?documentId=${encodeURIComponent(lockKey)}`;
-      const fbRes = await fetch(fbLockUrl, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          fields: {
-            lockedAt: { timestampValue: new Date().toISOString() },
-            lockKey: { stringValue: lockKey }
-          }
-        })
-      });
-
-      if (fbRes.status === 409) {
-        console.log(`🛑 Firestore atomic 409 conflict: broadcast lock ${lockKey} already held.`);
-        return false;
-      }
-    }
-  } catch (fbLockErr) {
-    console.warn("Firestore lock check warning:", fbLockErr.message);
-  }
-
-  return true;
-}
-
-async function isEdgeLocked(lockKey, requestUrl) {
-  const now = Date.now();
-  if (processedLocks.has(lockKey)) {
-    if (now < processedLocks.get(lockKey)) return true;
-    processedLocks.delete(lockKey);
-  }
-
-  if (typeof caches !== "undefined" && caches.default && requestUrl) {
-    try {
-      const cache = caches.default;
-      const parsed = new URL(requestUrl);
-      const cacheEndpoint = `https://${parsed.hostname}/__bot_lock__/${encodeURIComponent(lockKey)}`;
-      const cacheReq = new Request(cacheEndpoint, { method: "GET" });
-      const hit = await cache.match(cacheReq);
-      if (hit) return true;
-    } catch (e) {}
-  }
-
-  return false;
+  await processFinalAd(message, images, cleanText, textHash, env);
 }
 
 function hasBotWatermark(text) {
@@ -296,6 +222,8 @@ function hasBotWatermark(text) {
     lower.includes("mebri.yegna.workers.dev") ||
     lower.includes("@mebrigranite") ||
     lower.includes("0911680790") ||
+    lower.includes("yegna gebeya") ||
+    lower.includes("የኛ ገበያ") ||
     lower.includes("#yegnagebeya") ||
     lower.includes("📝 title:") ||
     lower.includes("💰 price:") ||
@@ -307,16 +235,6 @@ function hasBotWatermark(text) {
     return true;
   }
   return false;
-}
-
-function cleanupStaleAlbums() {
-  const now = Date.now();
-  for (const [key, data] of albumCache.entries()) {
-    if (now - data.timestamp > 60000) albumCache.delete(key);
-  }
-  for (const [key, exp] of processedLocks.entries()) {
-    if (now > exp) processedLocks.delete(key);
-  }
 }
 
 function simpleHash(str) {
@@ -349,6 +267,7 @@ function safeSubstring(str, maxLen) {
   }
   return out;
 }
+
 // ============================================
 // CARS & ELECTRONICS DATABASE
 // ============================================
@@ -565,15 +484,15 @@ const ELECTRONICS_DATABASE = [
   }
 ];
 
-async function processFinalAd(message, imageFileIds, messageIds, env, mediaGroupId, requestUrl) {
-  const messageText = (message.text || message.caption || "").trim();
-  const cleanText = cleanTheText(messageText);
-  if (!cleanText || cleanText.length < 3) return;
-
-  let { brand, model, year, trim, bodyType, fuelType, transmission, subcategory } = detectBrandModelYear(cleanText || messageText);
+// ============================================
+// MAIN PROCESSING & AD BROADCASTER
+// ============================================
+async function processFinalAd(message, imageFileIds, cleanText, textHash, env) {
+  let { brand, model, year, trim, bodyType, fuelType, transmission, subcategory } = detectBrandModelYear(cleanText);
   const category = detectCategory(cleanText, brand);
   if (!subcategory) subcategory = bodyType || "Vehicles";
 
+  // Optional: Multimodal Vision enrichment if model or brand is missing
   if (env.GEMINI_API_KEY && (!model || !brand) && imageFileIds.length > 0) {
     try {
       const visionResult = await inspectImageWithGemini(imageFileIds[0], cleanText, env);
@@ -591,44 +510,19 @@ async function processFinalAd(message, imageFileIds, messageIds, env, mediaGroup
   }
 
   const arrangedTitle = arrangeTitle({ brand, model, year, trim, cleanText, category, subcategory });
-  const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText || messageText, year);
+  const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText, year);
 
-  const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
-  const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
+  // Upload primary photo to Cloudinary
+  const imageUrls = await uploadImagesToCloudinary(imageFileIds.slice(0, 1), env);
   
+  // 1. ATOMIC FIREBASE FIRESTORE SYNC
   try {
     const token = await getFirebaseToken(env);
     if (token && env.FIREBASE_PROJECT_ID) {
       const projectId = env.FIREBASE_PROJECT_ID;
       const adOwnerId = env.ADMIN_UID || "admin_bot";
-      
-      const strictTitle = arrangedTitle.toLowerCase().replace(/[^a-z0-9]/g, '');
-      const docId = mediaGroupId 
-        ? `tg_${message.chat.id}_${mediaGroupId}` 
-        : `ad_${strictTitle}_0911680790`; 
-        
+      const docId = `ad_${textHash}`; 
       const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
-
-      let allImages = imageUrls;
-      try {
-        const checkRes = await fetch(fbUrl, { headers: { Authorization: `Bearer ${token}` } });
-        if (checkRes.ok) {
-          const existingData = await checkRes.json();
-          
-          if (existingData.fields?.createdAt?.timestampValue) {
-            const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
-            if (Date.now() - createdTime < 600000) {
-              console.log("⏭️ Ignored: Ad already exists in Firebase database.");
-              return;
-            }
-          }
-
-          if (existingData.fields?.images?.arrayValue?.values) {
-            const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
-            allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
-          }
-        }
-      } catch (e) {}
 
       const adData = {
         fields: {
@@ -648,8 +542,8 @@ async function processFinalAd(message, imageFileIds, messageIds, env, mediaGroup
           rawPrice: { integerValue: String(rawPrice) },
           phone: { stringValue: "0911680790" },
           city: { stringValue: extractCity(cleanText) },
-          image: { stringValue: allImages.length > 0 ? allImages[0] : "" },
-          images: { arrayValue: { values: allImages.map((url) => ({ stringValue: url })) } },
+          image: { stringValue: imageUrls.length > 0 ? imageUrls[0] : "" },
+          images: { arrayValue: { values: imageUrls.map((url) => ({ stringValue: url })) } },
           status: { stringValue: "available" },
           source: { stringValue: "telegram" },
           userId: { stringValue: adOwnerId },
@@ -668,6 +562,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env, mediaGroup
     console.error("Firebase Error:", fbErr.message);
   }
 
+  // 2. BUILD STRUCTURED POST TEXT WITH PROTECTED FOOTER
   const hashtagMap = { 
     Cars: "#Cars", 
     Houses: "#Houses", 
@@ -681,6 +576,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env, mediaGroup
   const hashtag = hashtagMap[category] || "#Other";
   const displayPriceText = formattedPrice && formattedPrice !== "0" ? `${formattedPrice} ETB` : "Negotiable / ተደራዳሪ";
 
+  // Build the Header
   let headerText = `📝 Title: ${arrangedTitle}\n`;
   if (brand || model || year) {
     const metaParts = [];
@@ -698,6 +594,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env, mediaGroup
     headerText += `${specParts.join(" | ")}\n`;
   }
 
+  // Build the Footer (Must NEVER be truncated!)
   let footerText = `\n━━━━━━━━━━━━━━━\n`;
   footerText += `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
   footerText += `📞 Phone: 0911680790\n`;
@@ -706,6 +603,8 @@ async function processFinalAd(message, imageFileIds, messageIds, env, mediaGroup
   footerText += `━━━━━━━━━━━━━━━\n\n`;
   footerText += `${hashtag} #YegnaGebeya`;
 
+  // Safely calculate remaining character allowance for Details
+  // Telegram caption limit is 1024 characters.
   const fixedLen = headerText.length + footerText.length + 15;
   const maxDetailsLen = Math.max(100, 1020 - fixedLen);
   let safeDetails = safeSubstring(cleanText, maxDetailsLen);
@@ -713,6 +612,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env, mediaGroup
 
   const newPostText = `${headerText}\n📄 Details:\n${safeDetails}${footerText}`;
 
+  // 3. BROADCAST TO TELEGRAM CHANNEL (EXACTLY ONE CLEAN POST)
   const targetChannel = env.REPOST_CHANNEL_ID || "@mebrigranite";
   if (!targetChannel) return;
 
@@ -722,22 +622,12 @@ async function processFinalAd(message, imageFileIds, messageIds, env, mediaGroup
         chat_id: targetChannel,
         text: safeSubstring(newPostText, 4096)
       }, env);
-    } else if (imageFileIds.length === 1) {
+    } else {
+      // Send single primary photo - never sends multiple files for one ad
       await callTelegram("sendPhoto", {
         chat_id: targetChannel,
         photo: imageFileIds[0],
         caption: safeSubstring(newPostText, 1024)
-      }, env);
-    } else {
-      const media = imageFileIds.slice(0, 10).map((fileId, index) => ({
-        type: "photo",
-        media: fileId,
-        ...(index === 0 ? { caption: safeSubstring(newPostText, 1024) } : {})
-      }));
-
-      await callTelegram("sendMediaGroup", {
-        chat_id: targetChannel,
-        media: media
       }, env);
     }
     console.log("✅ Forwarded Clean Ad to Channel Exactly Once!");
@@ -746,6 +636,9 @@ async function processFinalAd(message, imageFileIds, messageIds, env, mediaGroup
   }
 }
 
+// ============================================
+// BRAND / MODEL / YEAR / SPECS PARSER
+// ============================================
 function detectBrandModelYear(text) {
   let brand = "";
   let model = "";
@@ -775,6 +668,7 @@ function detectBrandModelYear(text) {
     if (rawYear) year = rawYear[0];
   }
 
+  // Ethiopian ad convention: ". Model 2022" is manufacture YEAR, not model name!
   if (model && /^(?:19|20)\d{2}(?:\/\d{1,2})?$/.test(model)) {
     if (!year) year = model;
     model = "";
@@ -1044,7 +938,7 @@ function extractCity(text) {
 async function uploadImagesToCloudinary(imageFileIds, env) {
   if (!env.CLOUDINARY_CLOUD_NAME || !env.CLOUDINARY_UPLOAD_PRESET || !imageFileIds || imageFileIds.length === 0) return [];
   const urls = [];
-  for (const fileId of imageFileIds.slice(0, 4)) {
+  for (const fileId of imageFileIds.slice(0, 1)) {
     try {
       const getFileRes = await callTelegram("getFile", { file_id: fileId }, env);
       if (!getFileRes || !getFileRes.file_path) continue;
