@@ -1,10 +1,10 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * 
- * Production Anti-Double-Post Architecture (v6.0 Channel Aggregator):
+ * Production Anti-Double-Post Architecture (v6.1 Channel Aggregator):
  * 1. Dual Ingestion: Listens to both SOURCE Channel posts (channel_post) and group/private messages.
  * 2. Multi-Photo Album Aggregator:
- *    - Collects ALL photos belonging to a media_group_id across incoming webhook updates.
+ *    - Collects ALL photos belonging to a media_group_id in local albumStore during the 3s window.
  *    - Broadcasts ALL photos together in a single Telegram `sendMediaGroup`.
  * 3. Atomic Single-Broadcast Lock:
  *    - Guarantees that only ONE execution ever broadcasts the album to the target channel.
@@ -12,10 +12,12 @@
  * 4. Absolute Loopback Shield:
  *    - Strictly ignores posts originating from the target channel (@mebrigranite).
  *    - Strictly ignores automatic forwards in linked discussion groups.
- *    - Strictly ignores any post containing official bot watermark signatures.
- * 5. Mathematical Amharic Price Parser: ሚሊዮን (1,000,000), ሺህ (1,000), protects manufacture years.
- * 6. AI Title Arranger: [Year] [Brand] [Model] [Trim] (e.g. "2025 BYD Sealion 06 EV").
- * 7. Cloudinary Upload + Firestore Sync.
+ *    - Strictly ignores official bot signature watermarks (without false-positive brand text blocks).
+ * 5. Resilient Media Uploader:
+ *    - Individual try/catch blocks per photo prevent single file failures from breaking uploads.
+ * 6. Mathematical Amharic Price Parser: ሚሊዮን (1,000,000), ሺህ (1,000), protects manufacture years.
+ * 7. AI Title Arranger: [Year] [Brand] [Model] [Trim] (e.g. "2025 BYD Sealion 06 EV").
+ * 8. Cloudinary Upload + Firestore Sync.
  */
 
 // In-Memory Aggregators & Deduplication Stores
@@ -28,7 +30,7 @@ let tokenExpiresAt = 0;
 export default {
   async fetch(request, env, ctx) {
     if (request.method !== "POST") {
-      return new Response("Yegna Gebeya Bot is running ✅ (Channel Aggregator v6.0 Active)", { 
+      return new Response("Yegna Gebeya Bot is running ✅ (Channel Aggregator v6.1 Active)", { 
         status: 200,
         headers: { "Content-Type": "text/plain; charset=utf-8" }
       });
@@ -168,9 +170,6 @@ async function processUpdate(update, env, request) {
       album.captionMsg = message;
     }
 
-    // Append to distributed edge cache so sibling isolates also share image IDs
-    await appendPhotoToEdgeCache(groupId, message.photo?.[message.photo.length - 1]?.file_id, rawText, request.url);
-
     // Single coordinator timer: collects ALL photos arriving across webhook requests
     if (!album.timerStarted) {
       album.timerStarted = true;
@@ -192,18 +191,13 @@ async function processUpdate(update, env, request) {
       }
       completedLocks.add(albumBroadcastKey);
 
+      // Rely directly on local album store which collected all images in this window
       const finalAlbumData = albumStore.get(groupId) || album;
       albumStore.delete(groupId);
 
-      // Merge photos from edge cache to ensure 100% of images are included
-      const cachedData = await getAlbumFromEdgeCache(groupId, request.url);
-      let allImages = [...finalAlbumData.images];
-      if (cachedData && cachedData.images) {
-        allImages = Array.from(new Set([...allImages, ...cachedData.images]));
-      }
-
-      const postMsg = finalAlbumData.captionMsg || (cachedData?.caption ? { caption: cachedData.caption } : message);
-      const postText = finalAlbumData.caption || cachedData?.caption || rawText;
+      const allImages = finalAlbumData.images || [];
+      const postMsg = finalAlbumData.captionMsg || message;
+      const postText = finalAlbumData.caption || rawText;
 
       const cleanText = cleanTheText(postText);
       if (cleanText.length < 3) {
@@ -247,55 +241,8 @@ async function processUpdate(update, env, request) {
 }
 
 // ============================================
-// EDGE CACHE MULTI-PHOTO SHARING & LOCKING
+// EDGE DISTRIBUTED BROADCAST LOCKING
 // ============================================
-async function appendPhotoToEdgeCache(groupId, fileId, caption, requestUrl) {
-  if (typeof caches === "undefined" || !caches.default || !requestUrl) return;
-  try {
-    const cache = caches.default;
-    const parsed = new URL(requestUrl);
-    const endpoint = `https://${parsed.hostname}/__album_data__/${encodeURIComponent(groupId)}`;
-    const cacheReq = new Request(endpoint, { method: "GET" });
-
-    let data = { images: [], caption: "" };
-    const hit = await cache.match(cacheReq);
-    if (hit) {
-      try { data = await hit.json(); } catch (e) {}
-    }
-
-    if (fileId && !data.images.includes(fileId)) {
-      data.images.push(fileId);
-    }
-    if (caption && caption.length > 3 && !data.caption) {
-      data.caption = caption;
-    }
-
-    const res = new Response(JSON.stringify(data), {
-      status: 200,
-      headers: {
-        "Content-Type": "application/json",
-        "Cache-Control": "public, max-age=60, s-maxage=60"
-      }
-    });
-    await cache.put(cacheReq, res);
-  } catch (err) {}
-}
-
-async function getAlbumFromEdgeCache(groupId, requestUrl) {
-  if (typeof caches === "undefined" || !caches.default || !requestUrl) return null;
-  try {
-    const cache = caches.default;
-    const parsed = new URL(requestUrl);
-    const endpoint = `https://${parsed.hostname}/__album_data__/${encodeURIComponent(groupId)}`;
-    const cacheReq = new Request(endpoint, { method: "GET" });
-    const hit = await cache.match(cacheReq);
-    if (hit) {
-      return await hit.json();
-    }
-  } catch (err) {}
-  return null;
-}
-
 async function claimEdgeLock(key, ttlSeconds = 600, requestUrl = null) {
   if (completedLocks.has(key)) return false;
 
@@ -347,8 +294,6 @@ function hasBotWatermark(text) {
     lower.includes("mebri.yegna.workers.dev") ||
     lower.includes("@mebrigranite") ||
     lower.includes("0911680790") ||
-    lower.includes("yegna gebeya") ||
-    lower.includes("የኛ ገበያ") ||
     lower.includes("#yegnagebeya") ||
     lower.includes("📝 title:") ||
     lower.includes("💰 price:") ||
@@ -1092,7 +1037,6 @@ async function uploadImagesToCloudinary(imageFileIds, env) {
       const getFileRes = await callTelegram("getFile", { file_id: fileId }, env);
       if (!getFileRes || !getFileRes.file_path) continue;
       const tgFileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${getFileRes.file_path}`;
-
       const form = new FormData();
       form.append("file", tgFileUrl);
       form.append("upload_preset", env.CLOUDINARY_UPLOAD_PRESET);
@@ -1103,7 +1047,7 @@ async function uploadImagesToCloudinary(imageFileIds, env) {
       const data = await uploadRes.json();
       if (data.secure_url) urls.push(data.secure_url);
     } catch (e) {
-      console.warn("Cloudinary upload skip:", e.message);
+      console.warn("Cloudinary upload skip for", fileId, ":", e.message);
     }
   }
   return urls;
