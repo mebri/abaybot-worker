@@ -1,7 +1,7 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * 
- * Production Anti-Double-Post Architecture (v6.1 Channel Aggregator):
+ * Production Anti-Double-Post Architecture (v6.2):
  * 1. Dual Ingestion: Listens to both SOURCE Channel posts (channel_post) and group/private messages.
  * 2. Multi-Photo Album Aggregator:
  *    - Collects ALL photos belonging to a media_group_id in local albumStore during the 3s window.
@@ -9,10 +9,8 @@
  * 3. Atomic Single-Broadcast Lock:
  *    - Guarantees that only ONE execution ever broadcasts the album to the target channel.
  *    - Zero duplicate posts even under high webhook concurrency.
- * 4. Absolute Loopback Shield:
- *    - Strictly ignores posts originating from the target channel (@mebrigranite).
- *    - Strictly ignores automatic forwards in linked discussion groups.
- *    - Strictly ignores official bot signature watermarks (without false-positive brand text blocks).
+ * 4. Official Bot Watermark:
+ *    - Strict loopback prevention that protects bot watermark signatures.
  * 5. Resilient Media Uploader:
  *    - Individual try/catch blocks per photo prevent single file failures from breaking uploads.
  * 6. Mathematical Amharic Price Parser: ሚሊዮን (1,000,000), ሺህ (1,000), protects manufacture years.
@@ -30,7 +28,7 @@ let tokenExpiresAt = 0;
 export default {
   async fetch(request, env, ctx) {
     if (request.method !== "POST") {
-      return new Response("Yegna Gebeya Bot is running ✅ (Channel Aggregator v6.1 Active)", { 
+      return new Response("Yegna Gebeya Bot is running ✅ (Channel Aggregator v6.2 Active)", { 
         status: 200,
         headers: { "Content-Type": "text/plain; charset=utf-8" }
       });
@@ -177,24 +175,7 @@ async function processUpdate(update, env, request) {
       // Wait 3.0 seconds to collect ALL photos in the album from the channel
       await new Promise((resolve) => setTimeout(resolve, 3000));
 
-      // Check if another isolate already broadcasted
-      if (completedLocks.has(albumBroadcastKey)) {
-        albumStore.delete(groupId);
-        return;
-      }
-
-      // Check edge lock before broadcasting
-      const locked = await claimEdgeLock(albumBroadcastKey, 600, request.url);
-      if (!locked) {
-        albumStore.delete(groupId);
-        return;
-      }
-      completedLocks.add(albumBroadcastKey);
-
-      // Rely directly on local album store which collected all images in this window
       const finalAlbumData = albumStore.get(groupId) || album;
-      albumStore.delete(groupId);
-
       const allImages = finalAlbumData.images || [];
       const postMsg = finalAlbumData.captionMsg || message;
       const postText = finalAlbumData.caption || rawText;
@@ -202,8 +183,24 @@ async function processUpdate(update, env, request) {
       const cleanText = cleanTheText(postText);
       if (cleanText.length < 3) {
         console.log(`⏭️ Dropping album ${groupId}: No valid text caption found.`);
+        albumStore.delete(groupId);
         return;
       }
+
+      // Check if another isolate already broadcasted
+      if (completedLocks.has(albumBroadcastKey)) {
+        albumStore.delete(groupId);
+        return;
+      }
+
+      // Claim edge lock right before broadcasting
+      const locked = await claimEdgeLock(albumBroadcastKey, 600, request.url);
+      if (!locked) {
+        albumStore.delete(groupId);
+        return;
+      }
+      completedLocks.add(albumBroadcastKey);
+      albumStore.delete(groupId);
 
       console.log(`🚀 Broadcasting album ${groupId} with ALL ${allImages.length} images to channel!`);
       await processFinalAd(postMsg, allImages, cleanText, env, groupId);
@@ -294,13 +291,14 @@ function hasBotWatermark(text) {
     lower.includes("mebri.yegna.workers.dev") ||
     lower.includes("@mebrigranite") ||
     lower.includes("0911680790") ||
+    lower.includes("yegna gebeya") ||
+    lower.includes("የኛ ገበያ") ||
     lower.includes("#yegnagebeya") ||
     lower.includes("📝 title:") ||
     lower.includes("💰 price:") ||
     lower.includes("📂 category:") ||
     lower.includes("website: mebri") ||
-    lower.includes("✈️ telegram: @mebrigranite") ||
-    /#(cars|houses|rentals|electronics|furniture|clothes|labor|ምንአለሽ_ተራ|other)\b/i.test(text)
+    lower.includes("✈️ telegram: @mebrigranite")
   ) {
     return true;
   }
@@ -676,7 +674,7 @@ async function processFinalAd(message, imageFileIds, cleanText, env, mediaGroupI
     headerText += `${specParts.join(" | ")}\n`;
   }
 
-  // Build the Footer (Must NEVER be truncated!)
+  // Build the Footer (Contains your official watermark)
   let footerText = `\n━━━━━━━━━━━━━━━\n`;
   footerText += `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
   footerText += `📞 Phone: 0911680790\n`;
@@ -685,8 +683,7 @@ async function processFinalAd(message, imageFileIds, cleanText, env, mediaGroupI
   footerText += `━━━━━━━━━━━━━━━\n\n`;
   footerText += `${hashtag} #YegnaGebeya`;
 
-  // Safely calculate remaining character allowance for Details
-  // Telegram caption limit is 1024 characters.
+  // Safely calculate remaining character allowance for Details (Telegram caption limit is 1024)
   const fixedLen = headerText.length + footerText.length + 15;
   const maxDetailsLen = Math.max(100, 1020 - fixedLen);
   let safeDetails = safeSubstring(cleanText, maxDetailsLen);
@@ -695,24 +692,25 @@ async function processFinalAd(message, imageFileIds, cleanText, env, mediaGroupI
   const newPostText = `${headerText}\n📄 Details:\n${safeDetails}${footerText}`;
 
   // 3. BROADCAST TO TELEGRAM CHANNEL
-  // Posts ALL collected images from the channel album as ONE media group!
   const targetChannel = env.REPOST_CHANNEL_ID || "@mebrigranite";
   if (!targetChannel) return;
 
   try {
     if (imageFileIds.length === 0) {
+      // Text-only ad
       await callTelegram("sendMessage", {
         chat_id: targetChannel,
         text: safeSubstring(newPostText, 4096)
       }, env);
     } else if (imageFileIds.length === 1) {
+      // Single photo ad
       await callTelegram("sendPhoto", {
         chat_id: targetChannel,
         photo: imageFileIds[0],
         caption: safeSubstring(newPostText, 1024)
       }, env);
     } else {
-      // Broadcast ALL images (up to 10 photos) together in a single media group!
+      // Multi-photo album ad (posts all images together in ONE post)
       const media = imageFileIds.slice(0, 10).map((fileId, index) => ({
         type: "photo",
         media: fileId,
@@ -762,7 +760,6 @@ function detectBrandModelYear(text) {
     if (rawYear) year = rawYear[0];
   }
 
-  // Ethiopian ad convention: ". Model 2022" is manufacture YEAR, not model name!
   if (model && /^(?:19|20)\d{2}(?:\/\d{1,2})?$/.test(model)) {
     if (!year) year = model;
     model = "";
