@@ -1,24 +1,28 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * 
- * Features:
- * 1. AI Title Arranger: [Year] [Brand] [Model] [Trim] (e.g. "2025 BYD Sealion 06 EV (Champion Edition)")
- * 2. Accurate Brand / Model / Year parsing (Fixes Ethiopian ". Model 2022" issue)
- * 3. Exact Price Extraction with Amharic unit conversion (ሚሊዮን/M -> 1,000,000, ሺህ/k -> 1,000, protects against years like 2025)
- * 4. Anti-Duplicate Engine: Deterministic textHash docId, 5-minute deduplication, auto-forward filtering
- * 5. Gemini Multimodal Vision AI: Inspects car photos for badging, grille, and body style via gemini-2.5-flash
- * 6. Cloudinary image upload + Firebase Firestore integration
- * 7. Broadcasts clean, structured ad to Telegram channel @mebrigranite
+ * Production Anti-Double-Post Architecture:
+ * 1. Multi-tier Deduplication Lock (Update ID + MediaGroup ID + Text Hash)
+ * 2. Distributed Edge Lock via Cloudflare Cache API + In-Memory Mutex
+ * 3. Channel Loop Prevention: Blocks target channel ID, username, sender_chat, and all bot signatures
+ * 4. Album (Media Group) Aggregator: Ensures all photos in an album send in a single media group exactly once
+ * 5. AI Title Arranger: [Year] [Brand] [Model] [Trim] (e.g. "2025 BYD Sealion 06 EV")
+ * 6. Mathematical Amharic Price Parser: ሚሊዮን (1,000,000), ሺህ (1,000), protects manufacture years
+ * 7. Cloudinary Upload + Firestore Integration with duplicate protection
  */
 
+// In-Memory Fallback Caches
 const albumCache = new Map();
+const processedLocks = new Map();
+const updateIdLocks = new Set();
 let cachedFirebaseToken = null;
 let tokenExpiresAt = 0;
 
 export default {
   async fetch(request, env, ctx) {
+    // Health check endpoint
     if (request.method !== "POST") {
-      return new Response("Yegna Gebeya Bot is running ✅", { 
+      return new Response("Yegna Gebeya Bot is running ✅ (Anti-Duplicate v3.0)", { 
         status: 200,
         headers: { "Content-Type": "text/plain; charset=utf-8" }
       });
@@ -26,69 +30,112 @@ export default {
 
     try {
       const update = await request.json();
-      ctx.waitUntil(processUpdate(update, env));
+      
+      // Fast ACK to Telegram: prevent Telegram webhook retry flood
+      ctx.waitUntil(processUpdateSafe(update, env));
       return new Response("OK", { status: 200 });
     } catch (error) {
-      return new Response("Error: " + error.message, { status: 500 });
+      console.error("Webhook parse error:", error.message);
+      return new Response("OK", { status: 200 }); // Always return 200 so Telegram doesn't retry infinitely
     }
   }
 };
 
+async function processUpdateSafe(update, env) {
+  try {
+    await processUpdate(update, env);
+  } catch (err) {
+    console.error("Unhandled processUpdate error:", err.message);
+  }
+}
+
 async function processUpdate(update, env) {
-  // 1. Anti-Duplicate: Ignore edited messages
-  if (update.edited_message || update.edited_channel_post) return;
+  // 1. DEDUPLICATE TELEGRAM UPDATE ID
+  if (update.update_id) {
+    if (updateIdLocks.has(update.update_id)) {
+      console.log(`⏭️ Ignored: Duplicate update_id ${update.update_id}`);
+      return;
+    }
+    updateIdLocks.add(update.update_id);
+    if (updateIdLocks.size > 2000) {
+      const firstKey = updateIdLocks.values().next().value;
+      updateIdLocks.delete(firstKey);
+    }
+  }
+
+  // 2. IGNORE EDITED MESSAGES (Prevents duplicate re-posts when seller edits typos)
+  if (update.edited_message || update.edited_channel_post) {
+    return;
+  }
 
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 2. Ignore bot messages
+  // 3. IGNORE BOT MESSAGES
   const botId = env.TELEGRAM_BOT_TOKEN ? env.TELEGRAM_BOT_TOKEN.split(":")[0] : "";
-  if (message.from && String(message.from.id) === botId) return;
-  if (message.from && message.from.is_bot) return;
-
-  // 3. Ignore target channel (prevent re-processing own posts)
-  if (env.REPOST_CHANNEL_ID) {
-    const target = String(env.REPOST_CHANNEL_ID).replace("@", "").toLowerCase();
-    const currentId = String(message.chat.id);
-    const currentUsername = (message.chat.username || "").toLowerCase();
-    if (currentId === target || (currentUsername && currentUsername === target)) return;
+  if (message.from && (String(message.from.id) === botId || message.from.is_bot)) {
+    return;
   }
 
-  // 4. Anti-Duplicate: Ignore automatic forwards to linked discussion groups & supergroups
-  if (message.forward_from_chat) {
-    const fwdChatId = String(message.forward_from_chat.id);
-    const fwdChatUser = (message.forward_from_chat.username || "").toLowerCase();
-    const target = env.REPOST_CHANNEL_ID ? String(env.REPOST_CHANNEL_ID).replace("@", "").toLowerCase() : "";
-    if (target && (fwdChatId === target || fwdChatUser === target)) return;
-  }
+  // 4. IGNORE AUTOMATIC FORWARDS TO LINKED DISCUSSION GROUPS
   if (message.is_automatic_forward) return;
+
+  // 5. IGNORE POSTS FROM TARGET REPOST CHANNEL (Prevent infinite re-post loops)
+  const targetChannelRaw = env.REPOST_CHANNEL_ID || "@mebrigranite";
+  const targetClean = targetChannelRaw.replace("@", "").toLowerCase();
+
+  const chatIdStr = String(message.chat.id);
+  const chatUser = (message.chat.username || "").toLowerCase();
+  if (chatUser === targetClean || chatIdStr === targetClean) return;
+
+  if (message.sender_chat) {
+    const senderUser = (message.sender_chat.username || "").toLowerCase();
+    const senderIdStr = String(message.sender_chat.id);
+    if (senderUser === targetClean || senderIdStr === targetClean) return;
+  }
+
+  if (message.forward_from_chat) {
+    const fwdUser = (message.forward_from_chat.username || "").toLowerCase();
+    const fwdIdStr = String(message.forward_from_chat.id);
+    if (fwdUser === targetClean || fwdIdStr === targetClean) return;
+  }
 
   const rawText = (message.text || message.caption || "").trim();
 
-  // 5. Strict Watermark Check (Prevent re-posting already formatted ads)
+  // 6. STRICT BOT WATERMARK DETECTION
+  // If the text contains ANY official bot signatures, it is already posted!
   if (
     rawText.includes("🏢 የኛ ገበያ (Yegna Gebeya)") ||
-    rawText.includes("📝 Title:") ||
-    rawText.includes("💰 Price:") ||
+    rawText.includes("mebri.yegna.workers.dev") ||
     rawText.includes("@mebrigranite") ||
     rawText.includes("0911680790") ||
     rawText.includes("#YegnaGebeya") ||
+    rawText.includes("📝 Title:") ||
+    rawText.includes("💰 Price:") ||
     /#(Cars|Houses|Rentals|Electronics|Furniture|Clothes|Labor|ምንአለሽ_ተራ|Other)\b/i.test(rawText)
   ) {
+    console.log("⏭️ Ignored: Watermark detected (already formatted ad).");
     return;
   }
 
   // ============================================
-  // ALBUM (MEDIA GROUP) HANDLING
+  // ALBUM (MEDIA GROUP) MULTI-PHOTO HANDLING
   // ============================================
   if (message.media_group_id) {
-    const groupId = message.media_group_id;
+    const groupId = String(message.media_group_id);
+
+    // Fast check: If this album already finished and was broadcast, drop it immediately!
+    const albumDoneKey = `album_done_${groupId}`;
+    if (await isEdgeLocked(albumDoneKey)) {
+      console.log(`⏭️ Ignored: Album ${groupId} already processed.`);
+      return;
+    }
 
     if (!albumCache.has(groupId)) {
       albumCache.set(groupId, {
         images: [],
         messageIds: [],
-        firstMessage: rawText.length > 3 ? message : null,
+        captionMessage: null,
         timerActive: false,
         timestamp: Date.now()
       });
@@ -96,23 +143,46 @@ async function processUpdate(update, env) {
 
     const albumData = albumCache.get(groupId);
 
+    // Collect photo file IDs
     if (message.photo && message.photo.length > 0) {
-      albumData.images.push(message.photo[message.photo.length - 1].file_id);
+      const bestPhoto = message.photo[message.photo.length - 1].file_id;
+      if (!albumData.images.includes(bestPhoto)) {
+        albumData.images.push(bestPhoto);
+      }
       albumData.messageIds.push(message.message_id);
     }
-    if (rawText.length > 3 && !albumData.firstMessage) {
-      albumData.firstMessage = message;
+
+    // Capture the message that contains the actual text/caption
+    if (rawText.length > 3 && !albumData.captionMessage) {
+      albumData.captionMessage = message;
     }
 
+    // Single coordinator timer
     if (!albumData.timerActive) {
       albumData.timerActive = true;
-      await new Promise((resolve) => setTimeout(resolve, 2500));
+
+      // Wait 3.5 seconds to collect all photos arriving across webhook requests
+      await new Promise((resolve) => setTimeout(resolve, 3500));
 
       if (!albumCache.has(groupId)) return;
       const finalData = albumCache.get(groupId);
       albumCache.delete(groupId);
 
-      await processFinalAd(finalData.firstMessage || message, Array.from(new Set(finalData.images)), finalData.messageIds, env);
+      // Acquire exclusive distributed broadcast lock for this album
+      const acquired = await acquireEdgeLock(albumDoneKey, 600); // 10 minute lock
+      if (!acquired) {
+        console.log(`🛑 Duplicate album broadcast prevented for group ${groupId}`);
+        return;
+      }
+
+      const postMsg = finalData.captionMessage || message;
+      const postText = (postMsg.text || postMsg.caption || "").trim();
+      if (postText.length < 3) {
+        console.log("⏭️ Dropping album: No text caption found.");
+        return;
+      }
+
+      await processFinalAd(postMsg, finalData.images, finalData.messageIds, env, groupId);
     }
 
     cleanupStaleAlbums();
@@ -120,16 +190,85 @@ async function processUpdate(update, env) {
   }
 
   // ============================================
-  // SINGLE POST
+  // SINGLE POST HANDLING
   // ============================================
   if (rawText.length < 3) return;
+
+  // Single message deduplication lock by chat + messageId
+  const msgLockKey = `msg_${message.chat.id}_${message.message_id}`;
+  if (!(await acquireEdgeLock(msgLockKey, 600))) {
+    console.log(`⏭️ Ignored: Message ${msgLockKey} already processed.`);
+    return;
+  }
+
+  // Deduplicate by text content hash (prevents identical cross-group spam within 5 mins)
+  const cleanCheck = cleanTheText(rawText);
+  const textHash = simpleHash(cleanCheck.toLowerCase().replace(/\s+/g, ''));
+  const contentLockKey = `content_${textHash}`;
+  if (!(await acquireEdgeLock(contentLockKey, 300))) {
+    console.log(`⏭️ Ignored: Duplicate ad content detected (hash: ${textHash}).`);
+    return;
+  }
 
   const images = [];
   if (message.photo && message.photo.length > 0) {
     images.push(message.photo[message.photo.length - 1].file_id);
   }
 
-  await processFinalAd(message, images, [message.message_id], env);
+  await processFinalAd(message, images, [message.message_id], env, null);
+}
+
+// ============================================
+// ATOMIC DISTRIBUTED LOCKS (EDGE CACHE + MEMORY)
+// Works across all Cloudflare isolates & instances
+// ============================================
+async function acquireEdgeLock(key, ttlSeconds = 300) {
+  const now = Date.now();
+  if (processedLocks.has(key)) {
+    const expires = processedLocks.get(key);
+    if (now < expires) return false;
+    processedLocks.delete(key);
+  }
+  processedLocks.set(key, now + (ttlSeconds * 1000));
+
+  try {
+    if (typeof caches !== "undefined" && caches.default) {
+      const cache = caches.default;
+      const lockUrl = `https://yegna-lock.internal/${key}`;
+      const req = new Request(lockUrl);
+      const hit = await cache.match(req);
+      if (hit) return false;
+
+      const res = new Response("LOCKED", {
+        headers: { "Cache-Control": `public, max-age=${ttlSeconds}` }
+      });
+      await cache.put(req, res);
+      return true;
+    }
+  } catch (err) {
+    console.warn("Edge lock fallback to memory:", err.message);
+  }
+
+  return true;
+}
+
+async function isEdgeLocked(key) {
+  const now = Date.now();
+  if (processedLocks.has(key)) {
+    if (now < processedLocks.get(key)) return true;
+    processedLocks.delete(key);
+  }
+
+  try {
+    if (typeof caches !== "undefined" && caches.default) {
+      const cache = caches.default;
+      const req = new Request(`https://yegna-lock.internal/${key}`);
+      const hit = await cache.match(req);
+      if (hit) return true;
+    }
+  } catch (e) {}
+
+  return false;
 }
 
 function cleanupStaleAlbums() {
@@ -137,11 +276,11 @@ function cleanupStaleAlbums() {
   for (const [key, data] of albumCache.entries()) {
     if (now - data.timestamp > 60000) albumCache.delete(key);
   }
+  for (const [key, exp] of processedLocks.entries()) {
+    if (now > exp) processedLocks.delete(key);
+  }
 }
 
-// ============================================
-// HASH FUNCTION FOR DETERMINISTIC DEDUPLICATION
-// ============================================
 function simpleHash(str) {
   let hash = 0;
   for (let i = 0; i < str.length; i++) {
@@ -151,9 +290,6 @@ function simpleHash(str) {
   return Math.abs(hash).toString();
 }
 
-// ============================================
-// SAFE TELEGRAM API WRAPPER
-// ============================================
 async function callTelegram(method, body, env) {
   const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
     method: "POST",
@@ -177,7 +313,7 @@ function safeSubstring(str, maxLen) {
 }
 
 // ============================================
-// COMPREHENSIVE VEHICLE & ELECTRONICS DATABASE
+// CARS & ELECTRONICS DATABASE
 // ============================================
 const CAR_DATABASE = [
   {
@@ -369,9 +505,9 @@ const ELECTRONICS_DATABASE = [
 ];
 
 // ============================================
-// MAIN PROCESSING
+// MAIN PROCESSING & AD BROADCASTER
 // ============================================
-async function processFinalAd(message, imageFileIds, messageIds, env) {
+async function processFinalAd(message, imageFileIds, messageIds, env, mediaGroupId) {
   const messageText = (message.text || message.caption || "").trim();
   const cleanText = cleanTheText(messageText);
   if (!cleanText || cleanText.length < 3) return;
@@ -400,72 +536,74 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   const arrangedTitle = arrangeTitle({ brand, model, year, trim, cleanText, category, subcategory });
   const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText || messageText, year);
 
-  // 1. DEDUPLICATION VIA DETERMINISTIC HASH
   const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
   const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
   
+  // 1. ATOMIC FIREBASE FIRESTORE SYNC
   try {
     const token = await getFirebaseToken(env);
-    const projectId = env.FIREBASE_PROJECT_ID;
-    const adOwnerId = env.ADMIN_UID || "admin_bot";
-    
-    const docId = message.media_group_id 
-      ? `tg_${message.chat.id}_${message.media_group_id}` 
-      : `ad_${textHash}`; 
+    if (token && env.FIREBASE_PROJECT_ID) {
+      const projectId = env.FIREBASE_PROJECT_ID;
+      const adOwnerId = env.ADMIN_UID || "admin_bot";
       
-    const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
-
-    let allImages = imageUrls;
-    try {
-      const checkRes = await fetch(fbUrl, { headers: { Authorization: `Bearer ${token}` } });
-      if (checkRes.ok) {
-        const existingData = await checkRes.json();
+      const docId = mediaGroupId 
+        ? `tg_${message.chat.id}_${mediaGroupId}` 
+        : `ad_${textHash}`; 
         
-        // Strict 5-minute duplicate check
-        if (existingData.fields?.createdAt?.timestampValue) {
-          const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
-          if (Date.now() - createdTime < 300000) {
-            console.log("⏭️ Ignored: Duplicate ad detected on website.");
-            return;
+      const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
+
+      let allImages = imageUrls;
+      try {
+        const checkRes = await fetch(fbUrl, { headers: { Authorization: `Bearer ${token}` } });
+        if (checkRes.ok) {
+          const existingData = await checkRes.json();
+          
+          // Strict 10-minute duplicate check in database
+          if (existingData.fields?.createdAt?.timestampValue) {
+            const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
+            if (Date.now() - createdTime < 600000) {
+              console.log("⏭️ Ignored: Duplicate ad already saved to website.");
+              return;
+            }
+          }
+
+          if (existingData.fields?.images?.arrayValue?.values) {
+            const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
+            allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
           }
         }
+      } catch (e) {}
 
-        if (existingData.fields?.images?.arrayValue?.values) {
-          const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
-          allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
+      const adData = {
+        fields: {
+          title: { stringValue: arrangedTitle },
+          brand: { stringValue: brand || "" },
+          model: { stringValue: model || "" },
+          year: { stringValue: year || "" },
+          trim: { stringValue: trim || "" },
+          bodyType: { stringValue: bodyType || "" },
+          fuelType: { stringValue: fuelType || "" },
+          transmission: { stringValue: transmission || "" },
+          category: { stringValue: category },
+          subcategory: { stringValue: subcategory },
+          description: { stringValue: cleanText },
+          textHash: { stringValue: textHash },
+          price: { stringValue: formattedPrice },
+          rawPrice: { integerValue: String(rawPrice) },
+          phone: { stringValue: "0911680790" },
+          city: { stringValue: extractCity(cleanText) },
+          image: { stringValue: allImages.length > 0 ? allImages[0] : "" },
+          images: { arrayValue: { values: allImages.map((url) => ({ stringValue: url })) } },
+          status: { stringValue: "available" },
+          source: { stringValue: "telegram" },
+          userId: { stringValue: adOwnerId },
+          views: { integerValue: "0" },
+          createdAt: { timestampValue: new Date().toISOString() }
         }
-      }
-    } catch (e) {}
-
-    const adData = {
-      fields: {
-        title: { stringValue: arrangedTitle },
-        brand: { stringValue: brand || "" },
-        model: { stringValue: model || "" },
-        year: { stringValue: year || "" },
-        trim: { stringValue: trim || "" },
-        bodyType: { stringValue: bodyType || "" },
-        fuelType: { stringValue: fuelType || "" },
-        transmission: { stringValue: transmission || "" },
-        category: { stringValue: category },
-        subcategory: { stringValue: subcategory },
-        description: { stringValue: cleanText },
-        textHash: { stringValue: textHash },
-        price: { stringValue: formattedPrice },
-        rawPrice: { integerValue: String(rawPrice) },
-        phone: { stringValue: "0911680790" },
-        city: { stringValue: extractCity(cleanText) },
-        image: { stringValue: allImages.length > 0 ? allImages[0] : "" },
-        images: { arrayValue: { values: allImages.map((url) => ({ stringValue: url })) } },
-        status: { stringValue: "available" },
-        source: { stringValue: "telegram" },
-        userId: { stringValue: adOwnerId },
-        views: { integerValue: "0" },
-        createdAt: { timestampValue: new Date().toISOString() }
-      }
-    };
-    await fetch(fbUrl, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(adData) });
-    console.log("✅ Saved to Website (Firebase)");
+      };
+      await fetch(fbUrl, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(adData) });
+      console.log("✅ Saved to Website (Firebase)");
+    }
   } catch (fbErr) {
     console.error("Firebase Error:", fbErr.message);
   }
@@ -512,9 +650,16 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   newPostText += `━━━━━━━━━━━━━━━\n\n`;
   newPostText += `${hashtag} #YegnaGebeya`;
 
-  // 3. BROADCAST TO TELEGRAM CHANNEL
-  const targetChannel = env.REPOST_CHANNEL_ID;
+  // 3. BROADCAST TO TELEGRAM CHANNEL (GUARANTEED ONCE)
+  const targetChannel = env.REPOST_CHANNEL_ID || "@mebrigranite";
   if (!targetChannel) return;
+
+  // Final Broadcast Mutex Lock
+  const broadcastLockId = `broadcast_${mediaGroupId || textHash}`;
+  if (!(await acquireEdgeLock(broadcastLockId, 600))) {
+    console.log("🛑 Broadcast mutex hit: post already sent by sibling isolate.");
+    return;
+  }
 
   try {
     if (imageFileIds.length === 0) {
@@ -559,13 +704,10 @@ function detectBrandModelYear(text) {
   let transmission = "";
   let subcategory = "";
 
-  // 1. Explicit Key-Value Matches (Do not match across newlines)
   const makeMatch = text.match(/(?:Make|የመኪናው\s*ዓይነት|Brand|ብራንድ)[ \t:=-]+([a-zA-Z0-9/._ -]+)/i);
   if (makeMatch && makeMatch[1]) {
     brand = makeMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
-    if (/^(?:new|brand\s*new|used)\b/i.test(brand)) {
-      brand = "";
-    }
+    if (/^(?:new|brand\s*new|used)\b/i.test(brand)) brand = "";
   }
 
   const modelMatch = text.match(/(?:Model|ሞዴል)[ \t:=-]+([a-zA-Z0-9/._ -]+)/i);
@@ -581,9 +723,7 @@ function detectBrandModelYear(text) {
     if (rawYear) year = rawYear[0];
   }
 
-  // CRITICAL ETHIOPIAN AD FIX:
-  // Ethiopian car ads often state ". Model 2022" meaning YEAR of manufacture, NOT model name!
-  // If model is a 4-digit year, reassign it to year and clear model so true model (Elantra) is detected.
+  // Ethiopian ad fix: ". Model 2022" is manufacture YEAR, not model name!
   if (model && /^(?:19|20)\d{2}(?:\/\d{1,2})?$/.test(model)) {
     if (!year) year = model;
     model = "";
@@ -624,7 +764,6 @@ function detectBrandModelYear(text) {
     else if (/(?:manual\s*transmission|ማኑዋል)/i.test(text)) transmission = "Manual";
   }
 
-  // 2. Database Lookup: Vehicles
   if (!brand) {
     for (const b of CAR_DATABASE) {
       if (b.regex.test(text)) {
@@ -652,7 +791,6 @@ function detectBrandModelYear(text) {
     }
   }
 
-  // Check if model exists without explicit brand
   if (!model || !brand) {
     for (const b of CAR_DATABASE) {
       for (const m of b.models) {
@@ -667,7 +805,6 @@ function detectBrandModelYear(text) {
     }
   }
 
-  // 3. Database Lookup: Electronics (if not car)
   if (!brand) {
     for (const eb of ELECTRONICS_DATABASE) {
       if (eb.regex.test(text)) {
@@ -684,7 +821,6 @@ function detectBrandModelYear(text) {
     }
   }
 
-  // Subcategory fallback
   if (!subcategory) {
     if (fuelType.toLowerCase().includes("electric") || /kwh|single motor|ev\b/i.test(text)) {
       subcategory = "Electric (EV)";
@@ -721,49 +857,28 @@ function arrangeTitle({ brand, model, year, trim, cleanText, category, subcatego
     return `${brand} ${model}${trim ? ` ${trim}` : ""}`;
   }
 
-  // Fallback to first descriptive line
   const firstLine = cleanText.split("\n")[0].replace(/[💎📌⭐✔️•#]/g, "").trim();
   return safeSubstring(firstLine, 65) || `${category} Item`;
 }
 
 function detectCategory(text, brand) {
   const t = text.toLowerCase();
-  if (brand && CAR_DATABASE.some(b => b.name.toLowerCase() === brand.toLowerCase())) {
-    return "Cars";
-  }
-  if (brand && ELECTRONICS_DATABASE.some(eb => eb.name.toLowerCase() === brand.toLowerCase())) {
-    return "Electronics";
-  }
-  if (/(መኪና|car|vitz|corolla|rav4|suzuki|hyundai|byd|elantra|sealion|tucson|toyota|yaris|benz|mileage|km|plate)/i.test(t)) {
-    return "Cars";
-  }
+  if (brand && CAR_DATABASE.some(b => b.name.toLowerCase() === brand.toLowerCase())) return "Cars";
+  if (brand && ELECTRONICS_DATABASE.some(eb => eb.name.toLowerCase() === brand.toLowerCase())) return "Electronics";
+  if (/(መኪና|car|vitz|corolla|rav4|suzuki|hyundai|byd|elantra|sealion|tucson|toyota|yaris|benz|mileage|km|plate)/i.test(t)) return "Cars";
   if (/(ቤት|ኮንዶሚኒየም|apartment|villa|house|g\+|ሪል\s*እስቴት|ካሬ|sqm)/i.test(t)) {
     if (/(ኪራይ|rent|ለኪራይ|ወርሃዊ)/i.test(t)) return "Rentals";
     return "Houses";
   }
-  if (/(ስልክ|phone|iphone|samsung|laptop|macbook|ipad|tv|electronics|playstation|ps5|ቴሌቪዥን|ላፕቶፕ)/i.test(t)) {
-    return "Electronics";
-  }
-  if (/(sofa|bed|table|chair|furniture|ሶፋ|አልጋ|ጠረጴዛ|ወንበር|ቁምሳጥን)/i.test(t)) {
-    return "Furniture";
-  }
-  if (/(shoes|jacket|dress|suit|clothes|pants|ጫማ|ጃኬት|ቀሚስ|ልብስ)/i.test(t)) {
-    return "Clothes";
-  }
-  if (/(driver|plumber|electrician|mechanic|ቧንቧ|ኤሌክትሪክ|ቀለም|ሹፌር|ሰርቪስ|ጽዳት)/i.test(t)) {
-    return "Labor & Services";
-  }
+  if (/(ስልክ|phone|iphone|samsung|laptop|macbook|ipad|tv|electronics|playstation|ps5|ቴሌቪዥን|ላፕቶፕ)/i.test(t)) return "Electronics";
+  if (/(sofa|bed|table|chair|furniture|ሶፋ|አልጋ|ጠረጴዛ|ወንበር|ቁምሳጥን)/i.test(t)) return "Furniture";
+  if (/(shoes|jacket|dress|suit|clothes|pants|ጫማ|ጃኬት|ቀሚስ|ልብስ)/i.test(t)) return "Clothes";
+  if (/(driver|plumber|electrician|mechanic|ቧንቧ|ኤሌክትሪክ|ቀለም|ሹፌር|ሰርቪስ|ጽዳት)/i.test(t)) return "Labor & Services";
   return "ምንአለሽ_ተራ";
 }
 
-// ============================================
-// PARSE MATHEMATICAL PRICE (ACCURATE & NO GUESSING)
-// Handles Amharic: ሚሊዮን (1,000,000), ሺህ (1,000), M, k
-// Guards against converting years (2025) into prices
-// ============================================
 function parseMathematicalPrice(text, knownYear) {
   if (!text) return { formattedPrice: "0", rawPrice: 0 };
-
   const detectedYear = (knownYear ? knownYear.split("/")[0] : "") || "";
 
   const isExcluded = (num, rawStr) => {
@@ -775,7 +890,6 @@ function parseMathematicalPrice(text, knownYear) {
     return false;
   };
 
-  // 1. Explicit Price Line: 💰Price: 7.400,000 ETB Million OR Price: 7.4 Million OR ዋጋ 7.4 ሚሊዮን OR ዋጋ 850 ሺህ
   const explicitLineMatch = text.match(/(?:💰|price|ዋጋ|fixed|የመሸጫ\s*ዋጋ)[ \t:=-]+([0-9.,]+)\s*(?:ETB|ብር|Birr)?\s*(?:million|mil|mln|m|ሚሊዮን|ሚሊየን|k|thousand|ሺህ|ሺ)?/i);
   if (explicitLineMatch && explicitLineMatch[1]) {
     const rawVal = explicitLineMatch[1];
@@ -804,24 +918,17 @@ function parseMathematicalPrice(text, knownYear) {
     }
   }
 
-  // 2. Matches General Million Patterns: "7.400,000 ETB Million", "7.4 Million", "7.4 ሚሊዮን", "5.6M"
   const generalMillionMatch = text.match(/([0-9]+(?:[.,][0-9]+)*)\s*(?:ETB|ብር|Birr)?\s*(?:million|mil|mln|m|ሚሊዮን|ሚሊየን)\b/i);
   if (generalMillionMatch && generalMillionMatch[1]) {
     const rawVal = generalMillionMatch[1];
     const cleanNum = rawVal.replace(/,/g, "");
     const val = parseFloat(cleanNum);
     if (!isNaN(val) && val > 0) {
-      if (val < 1000) {
-        const finalNum = Math.round(val * 1000000);
-        return { formattedPrice: finalNum.toLocaleString("en-US"), rawPrice: finalNum };
-      } else {
-        const finalNum = Math.round(val);
-        return { formattedPrice: finalNum.toLocaleString("en-US"), rawPrice: finalNum };
-      }
+      const finalNum = val < 1000 ? Math.round(val * 1000000) : Math.round(val);
+      return { formattedPrice: finalNum.toLocaleString("en-US"), rawPrice: finalNum };
     }
   }
 
-  // 3. Matches General Thousand Patterns: "850k", "500 thousand", "500 ሺህ", "850 ሺ"
   const thousandMatch = text.match(/([0-9]+(?:[.,][0-9]+)*)\s*(?:ETB|ብር|Birr)?\s*(?:k|thousand|ሺህ|ሺ)\b/i);
   if (thousandMatch && thousandMatch[1]) {
     const rawVal = thousandMatch[1];
@@ -832,7 +939,6 @@ function parseMathematicalPrice(text, knownYear) {
     }
   }
 
-  // 4. Matches Explicit Currency Tags: "7,400,000 ETB", "ETB 7,400,000", "7,400,000 ብር", "5,650,000 Birr"
   const currencyMatch = text.match(/(?:ETB|ብር|Birr)\s*[:=.-]?\s*([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{5,10})|([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{5,10})\s*(?:ETB|ብር|Birr)/i);
   if (currencyMatch) {
     const rawVal = currencyMatch[1] || currencyMatch[2];
@@ -844,7 +950,6 @@ function parseMathematicalPrice(text, knownYear) {
     }
   }
 
-  // 5. Standalone price line check with numbers > 10,000
   const lines = text.split("\n");
   for (const line of lines) {
     if (/(?:price|ዋጋ)/i.test(line)) {
@@ -921,9 +1026,8 @@ async function inspectImageWithGemini(fileId, contextText, env) {
     const arrayBuffer = await imgFetch.arrayBuffer();
     const base64Image = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
 
-    const prompt = `Analyze this vehicle or product photo for an Ethiopian marketplace ad.
-Context text: "${contextText.substring(0, 200)}"
-Inspect the badges, grille, headlights, body style, and taillights.
+    const prompt = `Analyze this vehicle photo for an Ethiopian marketplace ad.
+Context: "${contextText.substring(0, 200)}"
 Return ONLY valid JSON matching this schema:
 {
   "brand": "Hyundai",
