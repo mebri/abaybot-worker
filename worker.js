@@ -1,8 +1,6 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
- * Features: 
- * - Fixed multiple images (albums) upload
- * - Fixed Album sending using sendMediaGroup
+ * Features: Strict Deduplication using Text Hash for Database ID
  */
 
 const albumCache = new Map();
@@ -28,7 +26,7 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 1. Ignore target channel (prevents infinite loops)
+  // 1. Ignore target channel
   if (env.REPOST_CHANNEL_ID) {
     const target = String(env.REPOST_CHANNEL_ID).replace("@", "").toLowerCase();
     const currentId = String(message.chat.id);
@@ -178,11 +176,12 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   try {
     const token = await getFirebaseToken(env);
     const projectId = env.FIREBASE_PROJECT_ID;
-    const adOwnerId = "q7zMj6aMAvgx97OCwqlYRVbSQgX2"; // Your Admin UID
+    const adOwnerId = "q7zMj6aMAvgx97OCwqlYRVbSQgX2"; 
     
-    const docId = message.media_group_id 
-      ? `tg_${message.chat.id}_${message.media_group_id}` 
-      : `tg_${message.chat.id}_${message.message_id}`; 
+    // ✅ FIXED: Use the Text Hash as the Document ID. 
+    // Even if the user posts the exact same text twice in different groups, it will overwrite the same doc.
+    const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
+    const docId = `ad_${textHash}`; 
       
     const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
 
@@ -191,13 +190,17 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       const checkRes = await fetch(fbUrl, { headers: { Authorization: `Bearer ${token}` } });
       if (checkRes.ok) {
         const existingData = await checkRes.json();
-        if (!message.media_group_id && existingData.fields?.createdAt?.timestampValue) {
+        
+        // If the document already exists and was created less than 10 minutes ago, ignore it completely.
+        if (existingData.fields?.createdAt?.timestampValue) {
           const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
-          if (Date.now() - createdTime < 30000) { 
-            console.log("⏭️ Ignored: Duplicate webhook retry detected.");
+          if (Date.now() - createdTime < 600000) { 
+            console.log("⏭️ Ignored: Duplicate text detected on website (within 10 mins).");
             return; 
           }
         }
+
+        // If it's an album update, merge the images
         if (existingData.fields?.images?.arrayValue?.values) {
           const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
           allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
@@ -252,7 +255,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   const chatId = message.chat.id;
   const isAlbum = imageFileIds.length > 1;
 
-  // 2. TRY TO EDIT (Only if it's a single photo or text)
+  // 2. TRY TO EDIT
   let messageHandled = false;
   if (!isAlbum) {
     try {
@@ -261,14 +264,11 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       } else {
         await callTelegram("editMessageText", { chat_id: chatId, message_id: message.message_id, text: safeSubstring(newPostText, 4096), entities: [] }, env);
       }
-      console.log("✅ Edited in place");
       messageHandled = true;
-    } catch (editErr) {
-      console.log("⚠️ Edit failed. Will Delete & Repost.", editErr.message);
-    }
+    } catch (editErr) {}
   }
 
-  // 3. IF EDIT FAILED OR IT'S AN ALBUM, DELETE AND REPOST
+  // 3. IF EDIT FAILED OR ALBUM, DELETE AND REPOST
   if (!messageHandled) {
     try {
       if (messageIds.length === 1) {
@@ -280,11 +280,10 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
 
     try {
       if (isAlbum) {
-        // ✅ Send as Media Group (Allows multiple images)
         const mediaGroup = imageFileIds.map((fileId, index) => ({
           type: "photo",
           media: fileId,
-          caption: index === 0 ? safeSubstring(newPostText, 1024) : undefined, // Caption only on first image
+          caption: index === 0 ? safeSubstring(newPostText, 1024) : undefined,
           caption_entities: []
         }));
         await callTelegram("sendMediaGroup", { chat_id: chatId, media: mediaGroup }, env);
@@ -293,10 +292,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       } else {
         await callTelegram("sendMessage", { chat_id: chatId, text: safeSubstring(newPostText, 4096), entities: [] }, env);
       }
-      console.log("✅ Sent clean message to main chat");
-    } catch (repostErr) {
-      console.error("❌ Repost failed:", repostErr.message);
-    }
+    } catch (repostErr) {}
   }
 
   // 4. SEND TO REPOST CHANNEL
@@ -315,9 +311,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       } else {
         await callTelegram("sendMessage", { chat_id: env.REPOST_CHANNEL_ID, text: safeSubstring(newPostText, 4096), entities: [] }, env);
       }
-    } catch (chErr) {
-      console.error("❌ Channel repost failed:", chErr.message);
-    }
+    } catch (chErr) {}
   }
 }
 
@@ -348,7 +342,6 @@ function parseMathematicalPrice(text) {
   return { formattedPrice: "0", rawPrice: "0" };
 }
 
-// ✅ FIXED: Sequential uploading so Telegram doesn't block multiple requests
 async function uploadImagesToCloudinary(fileIds, env) {
   if (!fileIds || fileIds.length === 0) return [];
   const results = [];
@@ -370,9 +363,7 @@ async function uploadImagesToCloudinary(fileIds, env) {
       if (cloudData.secure_url) {
         results.push(cloudData.secure_url);
       }
-    } catch (err) {
-      console.error("Upload error for fileId:", fileId, err.message);
-    }
+    } catch (err) {}
   }
   
   return results;
