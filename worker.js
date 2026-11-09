@@ -1,6 +1,6 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
- * Features: Strict Deduplication using Text Hash for Database ID
+ * Features: Strict Duplicate check using Firebase Query
  */
 
 const albumCache = new Map();
@@ -169,6 +169,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   const category = detectCategory(cleanText);
   const title = extractTitle(cleanText);
   const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText);
+  const phone = "0911680790"; // Admin phone
 
   // 1. SAVE TO WEBSITE (FIREBASE) FIRST
   const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
@@ -178,43 +179,62 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     const projectId = env.FIREBASE_PROJECT_ID;
     const adOwnerId = "q7zMj6aMAvgx97OCwqlYRVbSQgX2"; 
     
-    // ✅ FIXED: Use the Text Hash as the Document ID. 
-    // Even if the user posts the exact same text twice in different groups, it will overwrite the same doc.
-    const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
-    const docId = `ad_${textHash}`; 
-      
+    // ✅ FIXED: Use a unique ID based on message ID
+    const docId = `ad_tg_${message.chat.id}_${message.message_id}`; 
     const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
 
-    let allImages = imageUrls;
-    try {
-      const checkRes = await fetch(fbUrl, { headers: { Authorization: `Bearer ${token}` } });
-      if (checkRes.ok) {
-        const existingData = await checkRes.json();
-        
-        // If the document already exists and was created less than 10 minutes ago, ignore it completely.
-        if (existingData.fields?.createdAt?.timestampValue) {
-          const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
-          if (Date.now() - createdTime < 600000) { 
-            console.log("⏭️ Ignored: Duplicate text detected on website (within 10 mins).");
-            return; 
+    // ✅ CHECK 1: Does this exact document already exist?
+    const checkRes = await fetch(fbUrl, { headers: { Authorization: `Bearer ${token}` } });
+    if (checkRes.ok) {
+      console.log("⏭️ Ignored: This exact message ID already exists in the database.");
+      return;
+    }
+
+    // ✅ CHECK 2: Has an ad with this exact title been created in the last 10 minutes?
+    const queryUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents:runQuery`;
+    const queryBody = {
+      structuredQuery: {
+        from: [{ collectionId: "ads" }],
+        where: {
+          compositeFilter: {
+            op: "AND",
+            filters: [
+              { fieldFilter: { field: { fieldPath: "title" }, op: "EQUAL", value: { stringValue: title } } },
+              { fieldFilter: { field: { fieldPath: "userId" }, op: "EQUAL", value: { stringValue: adOwnerId } } }
+            ]
           }
-        }
-
-        // If it's an album update, merge the images
-        if (existingData.fields?.images?.arrayValue?.values) {
-          const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
-          allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
-        }
+        },
+        limit: 1
       }
-    } catch (e) {}
+    };
 
+    const queryRes = await fetch(queryUrl, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(queryBody)
+    });
+    
+    const queryData = await queryRes.json();
+    if (queryData && queryData[0] && queryData[0].document) {
+      const existingAd = queryData[0].document;
+      const createdAtStr = existingAd.fields.createdAt.timestampValue;
+      const createdAt = new Date(createdAtStr).getTime();
+      
+      if (Date.now() - createdAt < 600000) { // 10 minutes
+        console.log("⏭️ Ignored: Duplicate title detected on website (within 10 mins).");
+        return;
+      }
+    }
+
+    // ✅ PROCEED TO SAVE
+    let allImages = imageUrls;
     const adData = {
       fields: {
         title: { stringValue: title },
         description: { stringValue: cleanText },
         price: { stringValue: formattedPrice },
         rawPrice: { integerValue: rawPrice },
-        phone: { stringValue: "0911680790" },
+        phone: { stringValue: phone },
         city: { stringValue: extractCity(cleanText) },
         category: { stringValue: category },
         image: { stringValue: allImages.length > 0 ? allImages[0] : "" },
@@ -246,7 +266,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   newPostText += `📄 Details:\n${safeDetails}\n\n`;
   newPostText += `━━━━━━━━━━━━━━━\n`;
   newPostText += `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
-  newPostText += `📞 Phone: 0911680790\n`;
+  newPostText += `📞 Phone: ${phone}\n`;
   newPostText += `🌐 Website: mebri.yegna.workers.dev\n`;
   newPostText += `✈️ Telegram: @mebrigranite\n`;
   newPostText += `━━━━━━━━━━━━━━━\n\n`;
