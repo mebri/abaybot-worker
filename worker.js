@@ -1,5 +1,5 @@
 /**
- * Yegna Gebeya Telegram Bot - Cloudflare Worker (workers.jsx)
+ * Yegna Gebeya Telegram Bot - Cloudflare Worker (worker.js)
  * 
  * Production Anti-Double-Post Architecture:
  * 1. Multi-tier Deduplication Lock (Update ID + MediaGroup ID + Text Hash)
@@ -223,7 +223,6 @@ async function processUpdate(update, env) {
 // Works across all Cloudflare isolates & instances
 // ============================================
 async function acquireEdgeLock(key, ttlSeconds = 300) {
-  // 1. In-memory check first
   const now = Date.now();
   if (processedLocks.has(key)) {
     const expires = processedLocks.get(key);
@@ -232,7 +231,6 @@ async function acquireEdgeLock(key, ttlSeconds = 300) {
   }
   processedLocks.set(key, now + (ttlSeconds * 1000));
 
-  // 2. Cloudflare Cache API (distributed per edge datacenter)
   try {
     if (typeof caches !== "undefined" && caches.default) {
       const cache = caches.default;
