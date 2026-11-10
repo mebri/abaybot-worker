@@ -1,9 +1,8 @@
 /**
- * Yegna Gebeya Telegram Bot - Bulletproof Final
+ * Yegna Gebeya Telegram Bot - Restored Emoji Breaker
  */
 
 const albumCache = new Map();
-const processedMessages = new Set();
 
 export default {
   async fetch(request, env, ctx) {
@@ -23,29 +22,20 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 1. Double-Post Shield (Ignores the same message if Telegram retries)
-  if (processedMessages.has(message.message_id)) return;
-  processedMessages.add(message.message_id);
-  if (processedMessages.size > 1000) processedMessages.clear();
-
-  // 2. Environment Variable Check
+  // 1. Environment Variable Check
   if (!env.TELEGRAM_BOT_TOKEN || !env.REPOST_CHANNEL_ID) {
     await sendErrorToChat(message.chat.id, "❌ MISSING ENV VARS\n\nAdd TELEGRAM_BOT_TOKEN and REPOST_CHANNEL_ID in Cloudflare.", env);
     return;
   }
 
   try {
-    // 3. Ignore target channel (prevents bot from reposting its own posts)
-    const target = String(env.REPOST_CHANNEL_ID).replace("@", "").toLowerCase();
-    if (String(message.chat.id) === target || (message.chat.username || "").toLowerCase() === target) return;
-
-    // 4. Ignore bot messages
+    // 2. Ignore bot messages (Stops the bot from replying to itself)
     const botId = env.TELEGRAM_BOT_TOKEN.split(":")[0];
     if (message.from && (String(message.from.id) === botId || message.from.is_bot)) return;
 
     const rawText = (message.text || message.caption || "").trim();
 
-    // 5. Strict Watermark Check (Prevents double-processing)
+    // 3. Strict Watermark Check (Stops the bot from double-cleaning)
     if (
       rawText.includes("🏢 የኛ ገበያ (Yegna Gebeya)") ||
       rawText.includes("📝 Title:") ||
@@ -57,7 +47,7 @@ async function processUpdate(update, env) {
       return;
     }
 
-    // 6. ALBUM HANDLING
+    // 4. ALBUM HANDLING
     if (message.media_group_id) {
       const groupId = message.media_group_id;
       if (!albumCache.has(groupId)) {
@@ -76,19 +66,19 @@ async function processUpdate(update, env) {
         if (!albumCache.has(groupId)) return;
         const finalData = albumCache.get(groupId);
         albumCache.delete(groupId);
-        await processFinalAd(finalData.firstMessage || message, Array.from(new Set(finalData.images)), env);
+        await processFinalAd(finalData.firstMessage || message, Array.from(new Set(finalData.images)), finalData.messageIds, env);
       }
       cleanupStaleAlbums();
       return;
     }
 
-    // 7. SINGLE POST
+    // 5. SINGLE POST
     if (rawText.length < 3) return;
     const images = [];
     if (message.photo && message.photo.length > 0) {
       images.push(message.photo[message.photo.length - 1].file_id);
     }
-    await processFinalAd(message, images, env);
+    await processFinalAd(message, images, [message.message_id], env);
 
   } catch (globalError) {
     console.error("GLOBAL CRASH:", globalError);
@@ -96,7 +86,7 @@ async function processUpdate(update, env) {
   }
 }
 
-async function processFinalAd(message, imageFileIds, env) {
+async function processFinalAd(message, imageFileIds, messageIds, env) {
   const messageText = (message.text || message.caption || "").trim();
   const cleanText = cleanTheText(messageText);
   if (!cleanText || cleanText.length < 3) return;
@@ -104,6 +94,7 @@ async function processFinalAd(message, imageFileIds, env) {
   const category = detectCategory(cleanText);
   const title = extractTitle(cleanText);
   const { formattedPrice } = parseMathematicalPrice(cleanText);
+  const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
 
   const hashtagMap = { Cars: "#Cars", Houses: "#Houses", Rentals: "#Rentals", Electronics: "#Electronics", Furniture: "#Furniture", Clothes: "#Clothes", "Labor & Services": "#Labor", "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ" };
   const hashtag = hashtagMap[category] || "#Other";
@@ -123,58 +114,80 @@ async function processFinalAd(message, imageFileIds, env) {
   newPostText += `━━━━━━━━━━━━━━━\n\n`;
   newPostText += `${hashtag}`;
 
+  const chatId = message.chat.id;
   const isPhoto = imageFileIds.length > 0;
-  let postedSuccessfully = false;
+  const lastPhotoFileId = isPhoto ? imageFileIds[0] : null;
+  let messageHandled = false;
 
-  // 8. POST TO TELEGRAM CHANNEL (With Fallback)
+  // ✅ 1. TRY TO EDIT IN PLACE (This breaks the Premium Emojis)
   try {
     if (isPhoto) {
-      await callTelegram("sendPhoto", {
-        chat_id: env.REPOST_CHANNEL_ID,
-        photo: imageFileIds[0],
+      await callTelegram("editMessageCaption", {
+        chat_id: chatId,
+        message_id: message.message_id,
         caption: safeSubstring(newPostText, 1024),
-        caption_entities: [] // Strips Premium Emojis
+        caption_entities: [] // CRUCIAL: Strips premium entities and forces fallback
       }, env);
     } else {
-      await callTelegram("sendMessage", {
-        chat_id: env.REPOST_CHANNEL_ID,
+      await callTelegram("editMessageText", {
+        chat_id: chatId,
+        message_id: message.message_id,
         text: safeSubstring(newPostText, 4096),
-        entities: [] // Strips Premium Emojis
+        entities: [] // CRUCIAL: Strips premium entities and forces fallback
       }, env);
     }
-    postedSuccessfully = true;
-    console.log("✅ Posted to Telegram Channel!");
-  } catch (err) {
-    console.error("Photo Post Failed, trying text only:", err.message);
-    // FALLBACK: If photo fails, try sending just the text
-    try {
-      await callTelegram("sendMessage", {
-        chat_id: env.REPOST_CHANNEL_ID,
-        text: safeSubstring(newPostText, 4096),
-        entities: []
-      }, env);
-      postedSuccessfully = true;
-    } catch (fallbackErr) {
-      await sendErrorToChat(message.chat.id, `❌ TELEGRAM POST FAILED\n\nError: ${fallbackErr.message}\n\nMake sure the bot is an Admin in the channel!`, env);
-      return;
-    }
+    console.log("✅ Edited in place successfully.");
+    messageHandled = true;
+  } catch (editErr) {
+    console.log("⚠️ Edit failed. Deleting & Reposting...", editErr.message);
   }
 
-  // 9. DELETE ORIGINAL MESSAGE (Optional: if it works, great. If not, ignore)
-  if (postedSuccessfully) {
+  // ✅ 2. IF EDIT FAILED, DELETE AND REPOST
+  if (!messageHandled) {
     try {
-      await callTelegram("deleteMessage", { chat_id: message.chat.id, message_id: message.message_id }, env);
+      if (messageIds.length === 1) {
+        await callTelegram("deleteMessage", { chat_id: chatId, message_id: messageIds[0] }, env);
+      } else {
+        await callTelegram("deleteMessages", { chat_id: chatId, message_ids: messageIds }, env);
+      }
     } catch (delErr) {
-      console.log("Could not delete original (needs admin rights):", delErr.message);
+      console.log("⚠️ Could not delete original:", delErr.message);
+    }
+
+    try {
+      if (isPhoto) {
+        await callTelegram("sendPhoto", { chat_id: chatId, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
+      } else {
+        await callTelegram("sendMessage", { chat_id: chatId, text: safeSubstring(newPostText, 4096), entities: [] }, env);
+      }
+      console.log("✅ Sent clean message.");
+    } catch (repostErr) {
+      console.error("❌ Failed to send clean message:", repostErr.message);
     }
   }
 
-  // 10. SAVE TO FIREBASE (Silent fail, does not block Telegram)
+  // ✅ 3. SEND TO REPOST CHANNEL (If the test wasn't done in the channel itself)
+  const targetChannel = env.REPOST_CHANNEL_ID;
+  const isTargetChannel = String(chatId) === String(targetChannel) || (message.chat.username || "").toLowerCase() === String(targetChannel).replace("@", "").toLowerCase();
+  
+  if (targetChannel && !isTargetChannel) {
+    try {
+      if (isPhoto) {
+        await callTelegram("sendPhoto", { chat_id: targetChannel, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
+      } else {
+        await callTelegram("sendMessage", { chat_id: targetChannel, text: safeSubstring(newPostText, 4096), entities: [] }, env);
+      }
+    } catch (chErr) {
+      console.error("Channel Repost Error:", chErr.message);
+    }
+  }
+
+  // ✅ 4. SAVE TO FIREBASE (Wrapped in try/catch so it never blocks the bot)
   try {
     const token = await getFirebaseToken(env);
     if (token) {
       const projectId = env.FIREBASE_PROJECT_ID;
-      const docId = message.media_group_id ? `tg_${message.chat.id}_${message.media_group_id}` : `ad_${simpleHash(cleanText)}`;
+      const docId = message.media_group_id ? `tg_${chatId}_${message.media_group_id}` : `ad_${textHash}`;
       const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
       
       const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
