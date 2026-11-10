@@ -1,5 +1,5 @@
 /**
- * Yegna Gebeya Telegram Bot - Absolute Final Fix
+ * Yegna Gebeya Telegram Bot - Ultimate Emoji Shield
  */
 
 const albumCache = new Map();
@@ -22,7 +22,7 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 1. Check if Environment Variables are set (This is usually why it crashes)
+  // Environment Variable Check
   if (!env.TELEGRAM_BOT_TOKEN || !env.REPOST_CHANNEL_ID) {
     await sendErrorToChat(message.chat.id, "❌ MISSING ENV VARS\n\nYou must add TELEGRAM_BOT_TOKEN and REPOST_CHANNEL_ID in Cloudflare Settings > Variables.", env);
     return;
@@ -86,8 +86,7 @@ async function processUpdate(update, env) {
 
   } catch (globalError) {
     console.error("GLOBAL CRASH:", globalError);
-    // This sends the exact error directly to your Telegram chat so you can see it
-    await sendErrorToChat(message.chat.id, `🚨 BOT CRASHED 🚨\n\nError: ${globalError.message}\n\nCheck Cloudflare Logs.`, env);
+    await sendErrorToChat(message.chat.id, `🚨 BOT CRASHED 🚨\n\nError: ${globalError.message}`, env);
   }
 }
 
@@ -100,7 +99,7 @@ async function processFinalAd(message, imageFileIds, env) {
   const title = extractTitle(cleanText);
   const { formattedPrice } = parseMathematicalPrice(cleanText);
 
-  // POST TO TELEGRAM FIRST (No Firebase blocking!)
+  // POST TO TELEGRAM FIRST
   const hashtagMap = { Cars: "#Cars", Houses: "#Houses", Rentals: "#Rentals", Electronics: "#Electronics", Furniture: "#Furniture", Clothes: "#Clothes", "Labor & Services": "#Labor", "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ" };
   const hashtag = hashtagMap[category] || "#Other";
   const displayPriceText = formattedPrice && formattedPrice !== "0" ? `${formattedPrice} ETB` : "Negotiable / ተደራዳሪ";
@@ -127,23 +126,25 @@ async function processFinalAd(message, imageFileIds, env) {
         chat_id: env.REPOST_CHANNEL_ID,
         photo: imageFileIds[0],
         caption: safeSubstring(newPostText, 1024),
-        caption_entities: []
+        caption_entities: [], // 👈 CRITICAL: Drops hidden premium emoji data
+        parse_mode: "HTML"     // 👈 CRITICAL: Forces clean HTML rendering
       }, env);
     } else {
       await callTelegram("sendMessage", {
         chat_id: env.REPOST_CHANNEL_ID,
         text: safeSubstring(newPostText, 4096),
-        entities: []
+        entities: [],          // 👈 CRITICAL: Drops hidden premium emoji data
+        parse_mode: "HTML"     // 👈 CRITICAL: Forces clean HTML rendering
       }, env);
     }
     console.log("✅ Posted to Telegram Channel!");
   } catch (err) {
     console.error("Telegram Post Failed:", err.message);
-    await sendErrorToChat(message.chat.id, `❌ TELEGRAM POST FAILED\n\nError: ${err.message}\n\nAre you sure the bot is an Admin in the channel?`, env);
-    return; // Stop here if Telegram failed
+    await sendErrorToChat(message.chat.id, `❌ TELEGRAM POST FAILED\n\nError: ${err.message}`, env);
+    return;
   }
 
-  // SAVE TO FIREBASE SECOND (If it fails, you still got the Telegram post)
+  // SAVE TO FIREBASE SECOND (Silent fail)
   try {
     const token = await getFirebaseToken(env);
     if (token) {
@@ -167,18 +168,16 @@ async function processFinalAd(message, imageFileIds, env) {
       console.log("✅ Saved to Website (Firebase)");
     }
   } catch (fbErr) {
-    console.log("Firebase Error (Ignored, Telegram already posted):", fbErr.message);
+    console.log("Firebase Error (Ignored):", fbErr.message);
   }
 }
 
 // ============================================
-// HELPERS
+// HELPERS & TEXT CLEANING
 // ============================================
 async function sendErrorToChat(chatId, text, env) {
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text: text })
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chat_id: chatId, text: text })
   });
 }
 
@@ -194,17 +193,20 @@ async function callTelegram(method, body, env) {
 function cleanTheText(text) {
   if (!text) return "";
   try {
+    // 1. Strip all Emojis (Including diamonds, stars, and flags)
     const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu;
+    
+    // 2. Strip Phone Numbers (Handles 0911..., +251..., etc.)
     const PHONE_ET = /(?:\+?251|0)?[\s.\-]*(?:9|7)\d(?:[\s.\-]?\d){8}/g;
 
     return text
-      .replace(/https?:\/\/\S+/gi, "")
-      .replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "")
-      .replace(/@[a-zA-Z0-9_]{2,}/g, "")
-      .replace(PHONE_ET, "")
-      .replace(EMOJI, "")
-      .replace(/[*_~`|]/g, "")
-      .replace(/[ \t]+/g, " ")
+      .replace(/https?:\/\/\S+/gi, "")                 // Strip URLs
+      .replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "")  // Strip Telegram links
+      .replace(/@[a-zA-Z0-9_]{2,}/g, "")               // Strip @usernames
+      .replace(PHONE_ET, "")                           // Strip phone numbers
+      .replace(EMOJI, "")                              // Strip emojis
+      .replace(/[*_~`|]/g, "")                         // Strip Markdown symbols
+      .replace(/[ \t]+/g, " ")                         // Normalize spaces
       .replace(/[ \t]+\n/g, "\n")
       .replace(/\n{3,}/g, "\n\n")
       .trim();
