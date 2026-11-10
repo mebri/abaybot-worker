@@ -1,10 +1,8 @@
 /**
- * Yegna Gebeya Telegram Bot - Cloudflare Worker
+ * Yegna Gebeya Telegram Bot - Absolute Final Fix
  */
 
 const albumCache = new Map();
-let cachedFirebaseToken = null;
-let tokenExpiresAt = 0;
 
 export default {
   async fetch(request, env, ctx) {
@@ -24,200 +22,85 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 1. Ignore target channel
-  if (env.REPOST_CHANNEL_ID) {
+  // 1. Check if Environment Variables are set (This is usually why it crashes)
+  if (!env.TELEGRAM_BOT_TOKEN || !env.REPOST_CHANNEL_ID) {
+    await sendErrorToChat(message.chat.id, "❌ MISSING ENV VARS\n\nYou must add TELEGRAM_BOT_TOKEN and REPOST_CHANNEL_ID in Cloudflare Settings > Variables.", env);
+    return;
+  }
+
+  try {
+    // Ignore target channel
     const target = String(env.REPOST_CHANNEL_ID).replace("@", "").toLowerCase();
-    const currentId = String(message.chat.id);
-    const currentUsername = (message.chat.username || "").toLowerCase();
-    if (currentId === target || (currentUsername && currentUsername === target)) return;
-  }
+    if (String(message.chat.id) === target || (message.chat.username || "").toLowerCase() === target) return;
 
-  // 2. Ignore bot messages
-  const botId = env.TELEGRAM_BOT_TOKEN.split(":")[0];
-  if (message.from && String(message.from.id) === botId) return;
-  if (message.from && message.from.is_bot) return;
+    // Ignore bot messages
+    const botId = env.TELEGRAM_BOT_TOKEN.split(":")[0];
+    if (message.from && (String(message.from.id) === botId || message.from.is_bot)) return;
 
-  const rawText = (message.text || message.caption || "").trim();
+    const rawText = (message.text || message.caption || "").trim();
 
-  // 3. Strict Watermark Check
-  if (
-    rawText.includes("🏢 የኛ ገበያ (Yegna Gebeya)") ||
-    rawText.includes("📝 Title:") ||
-    rawText.includes("💰 Price:") ||
-    rawText.includes("@mebrigranite") ||
-    rawText.includes("0911680790") ||
-    /#(Cars|Houses|Rentals|Electronics|Furniture|Clothes|Labor|ምንአለሽ_ተራ|Other)\b/i.test(rawText)
-  ) {
-    return;
-  }
-
-  // ============================================
-  // ALBUM HANDLING
-  // ============================================
-  if (message.media_group_id) {
-    const groupId = message.media_group_id;
-
-    if (!albumCache.has(groupId)) {
-      albumCache.set(groupId, {
-        images: [],
-        messageIds: [],
-        firstMessage: rawText.length > 3 ? message : null,
-        timerActive: false,
-        timestamp: Date.now()
-      });
+    // Watermark check
+    if (
+      rawText.includes("🏢 የኛ ገበያ (Yegna Gebeya)") ||
+      rawText.includes("📝 Title:") ||
+      rawText.includes("💰 Price:") ||
+      rawText.includes("@mebrigranite") ||
+      rawText.includes("0911680790") ||
+      /#(Cars|Houses|Rentals|Electronics|Furniture|Clothes|Labor|ምንአለሽ_ተራ|Other)\b/i.test(rawText)
+    ) {
+      return;
     }
 
-    const albumData = albumCache.get(groupId);
+    // ALBUM HANDLING
+    if (message.media_group_id) {
+      const groupId = message.media_group_id;
+      if (!albumCache.has(groupId)) {
+        albumCache.set(groupId, { images: [], messageIds: [], firstMessage: rawText.length > 3 ? message : null, timerActive: false, timestamp: Date.now() });
+      }
+      const albumData = albumCache.get(groupId);
+      if (message.photo && message.photo.length > 0) {
+        albumData.images.push(message.photo[message.photo.length - 1].file_id);
+        albumData.messageIds.push(message.message_id);
+      }
+      if (rawText.length > 3 && !albumData.firstMessage) albumData.firstMessage = message;
 
+      if (!albumData.timerActive) {
+        albumData.timerActive = true;
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+        if (!albumCache.has(groupId)) return;
+        const finalData = albumCache.get(groupId);
+        albumCache.delete(groupId);
+        await processFinalAd(finalData.firstMessage || message, Array.from(new Set(finalData.images)), env);
+      }
+      cleanupStaleAlbums();
+      return;
+    }
+
+    // SINGLE POST
+    if (rawText.length < 3) return;
+    const images = [];
     if (message.photo && message.photo.length > 0) {
-      albumData.images.push(message.photo[message.photo.length - 1].file_id);
-      albumData.messageIds.push(message.message_id);
+      images.push(message.photo[message.photo.length - 1].file_id);
     }
-    if (rawText.length > 3 && !albumData.firstMessage) {
-      albumData.firstMessage = message;
-    }
+    await processFinalAd(message, images, env);
 
-    if (!albumData.timerActive) {
-      albumData.timerActive = true;
-      await new Promise((resolve) => setTimeout(resolve, 2500));
-
-      if (!albumCache.has(groupId)) return;
-      const finalData = albumCache.get(groupId);
-      albumCache.delete(groupId);
-
-      await processFinalAd(finalData.firstMessage || message, Array.from(new Set(finalData.images)), finalData.messageIds, env);
-    }
-
-    cleanupStaleAlbums();
-    return;
+  } catch (globalError) {
+    console.error("GLOBAL CRASH:", globalError);
+    // This sends the exact error directly to your Telegram chat so you can see it
+    await sendErrorToChat(message.chat.id, `🚨 BOT CRASHED 🚨\n\nError: ${globalError.message}\n\nCheck Cloudflare Logs.`, env);
   }
-
-  // ============================================
-  // SINGLE POST
-  // ============================================
-  if (rawText.length < 3) return;
-
-  const images = [];
-  if (message.photo && message.photo.length > 0) {
-    images.push(message.photo[message.photo.length - 1].file_id);
-  }
-
-  await processFinalAd(message, images, [message.message_id], env);
 }
 
-// ============================================
-// HASH FUNCTION
-// ============================================
-function simpleHash(str) {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    hash = ((hash << 5) - hash) + str.charCodeAt(i);
-    hash = hash & hash;
-  }
-  return Math.abs(hash).toString();
-}
-
-// ============================================
-// SAFE TELEGRAM API WRAPPER
-// ============================================
-async function callTelegram(method, body, env) {
-  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || !data.ok) throw new Error(`${method} → ${data.description || res.statusText}`);
-  return data.result;
-}
-
-function safeSubstring(str, maxLen) {
-  if (!str) return "";
-  if (str.length <= maxLen) return str;
-  let out = "";
-  for (const ch of str) {
-    if (out.length + ch.length > maxLen) break;
-    out += ch;
-  }
-  return out;
-}
-
-// ============================================
-// MAIN PROCESSING
-// ============================================
-async function processFinalAd(message, imageFileIds, messageIds, env) {
+async function processFinalAd(message, imageFileIds, env) {
   const messageText = (message.text || message.caption || "").trim();
   const cleanText = cleanTheText(messageText);
   if (!cleanText || cleanText.length < 3) return;
 
   const category = detectCategory(cleanText);
   const title = extractTitle(cleanText);
-  const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText);
+  const { formattedPrice } = parseMathematicalPrice(cleanText);
 
-  // ✅ 1. SAVE TO WEBSITE (FIREBASE) FIRST (With Text Hash Duplicate Check)
-  const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
-  const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
-  
-  try {
-    const token = await getFirebaseToken(env);
-    const projectId = env.FIREBASE_PROJECT_ID;
-    const adOwnerId = env.ADMIN_UID || "admin_bot";
-    
-    // We use the Text Hash as the Document ID. If the same text is sent, it hits the same document.
-    const docId = message.media_group_id 
-      ? `tg_${message.chat.id}_${message.media_group_id}` 
-      : `ad_${textHash}`; 
-      
-    const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
-
-    let allImages = imageUrls;
-    try {
-      const checkRes = await fetch(fbUrl, { headers: { Authorization: `Bearer ${token}` } });
-      if (checkRes.ok) {
-        const existingData = await checkRes.json();
-        
-        // ✅ STRICT DUPLICATE CHECK: If it was created in the last 5 minutes, ignore it
-        if (existingData.fields?.createdAt?.timestampValue) {
-          const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
-          if (Date.now() - createdTime < 300000) { // 5 minutes
-            console.log("⏭️ Ignored: Duplicate text detected on website.");
-            return; // Stop processing, don't post to Telegram again
-          }
-        }
-
-        if (existingData.fields?.images?.arrayValue?.values) {
-          const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
-          allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
-        }
-      }
-    } catch (e) {}
-
-    const adData = {
-      fields: {
-        title: { stringValue: title },
-        description: { stringValue: cleanText },
-        textHash: { stringValue: textHash },
-        price: { stringValue: formattedPrice },
-        rawPrice: { integerValue: rawPrice },
-        phone: { stringValue: "0911680790" },
-        city: { stringValue: extractCity(cleanText) },
-        category: { stringValue: category },
-        image: { stringValue: allImages.length > 0 ? allImages[0] : "" },
-        images: { arrayValue: { values: allImages.map((url) => ({ stringValue: url })) } },
-        status: { stringValue: "available" },
-        source: { stringValue: "telegram" },
-        userId: { stringValue: adOwnerId },
-        views: { integerValue: "0" },
-        createdAt: { timestampValue: new Date().toISOString() }
-      }
-    };
-    await fetch(fbUrl, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(adData) });
-    console.log("✅ Saved to Website (Firebase)");
-  } catch (fbErr) {
-    console.error("Firebase Error:", fbErr.message);
-  }
-
-  // Build Message
+  // POST TO TELEGRAM FIRST (No Firebase blocking!)
   const hashtagMap = { Cars: "#Cars", Houses: "#Houses", Rentals: "#Rentals", Electronics: "#Electronics", Furniture: "#Furniture", Clothes: "#Clothes", "Labor & Services": "#Labor", "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ" };
   const hashtag = hashtagMap[category] || "#Other";
   const displayPriceText = formattedPrice && formattedPrice !== "0" ? `${formattedPrice} ETB` : "Negotiable / ተደራዳሪ";
@@ -236,101 +119,164 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   newPostText += `━━━━━━━━━━━━━━━\n\n`;
   newPostText += `${hashtag}`;
 
-  const isPhoto = message.photo && message.photo.length > 0;
-  const chatId = message.chat.id;
-  const lastPhotoFileId = isPhoto ? message.photo[message.photo.length - 1].file_id : null;
+  const isPhoto = imageFileIds.length > 0;
 
-  let messageHandled = false;
-
-  // ✅ 2. TRY TO EDIT (Force stripping hidden AI/Premium entities)
   try {
     if (isPhoto) {
-      await callTelegram("editMessageCaption", { 
-        chat_id: chatId, 
-        message_id: message.message_id, 
+      await callTelegram("sendPhoto", {
+        chat_id: env.REPOST_CHANNEL_ID,
+        photo: imageFileIds[0],
         caption: safeSubstring(newPostText, 1024),
-        caption_entities: [] // THIS IS CRUCIAL FOR PREMIUM EMOJIS
+        caption_entities: []
       }, env);
     } else {
-      await callTelegram("editMessageText", { 
-        chat_id: chatId, 
-        message_id: message.message_id, 
+      await callTelegram("sendMessage", {
+        chat_id: env.REPOST_CHANNEL_ID,
         text: safeSubstring(newPostText, 4096),
-        entities: [] // THIS IS CRUCIAL FOR PREMIUM EMOJIS
+        entities: []
       }, env);
     }
-    console.log("✅ Edited in place (First process completed).");
-    messageHandled = true;
-  } catch (editErr) {
-    console.log("⚠️ Edit failed. Deleting & Reposting...", editErr.message);
+    console.log("✅ Posted to Telegram Channel!");
+  } catch (err) {
+    console.error("Telegram Post Failed:", err.message);
+    await sendErrorToChat(message.chat.id, `❌ TELEGRAM POST FAILED\n\nError: ${err.message}\n\nAre you sure the bot is an Admin in the channel?`, env);
+    return; // Stop here if Telegram failed
   }
 
-  // ✅ 3. IF EDIT FAILED, DELETE AND REPOST
-  if (!messageHandled) {
-    try {
-      if (messageIds.length === 1) {
-        await callTelegram("deleteMessage", { chat_id: chatId, message_id: messageIds[0] }, env);
-      } else {
-        await callTelegram("deleteMessages", { chat_id: chatId, message_ids: messageIds }, env);
-      }
-      console.log("✅ Deleted original dirty post(s)");
-    } catch (delErr) {
-      console.log("⚠️ Could not delete original. Bot needs Admin delete rights:", delErr.message);
-    }
+  // SAVE TO FIREBASE SECOND (If it fails, you still got the Telegram post)
+  try {
+    const token = await getFirebaseToken(env);
+    if (token) {
+      const projectId = env.FIREBASE_PROJECT_ID;
+      const docId = message.media_group_id ? `tg_${message.chat.id}_${message.media_group_id}` : `ad_${simpleHash(cleanText)}`;
+      const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
+      
+      const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
 
-    try {
-      if (isPhoto) {
-        await callTelegram("sendPhoto", { chat_id: chatId, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
-      } else {
-        await callTelegram("sendMessage", { chat_id: chatId, text: safeSubstring(newPostText, 4096), entities: [] }, env);
-      }
-      console.log("✅ Sent clean message to main chat");
-    } catch (repostErr) {
-      console.error("❌ Failed to send clean message:", repostErr.message);
+      const adData = {
+        fields: {
+          title: { stringValue: title },
+          description: { stringValue: cleanText },
+          price: { stringValue: formattedPrice },
+          category: { stringValue: category },
+          image: { stringValue: imageUrls.length > 0 ? imageUrls[0] : "" },
+          createdAt: { timestampValue: new Date().toISOString() }
+        }
+      };
+      await fetch(fbUrl, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(adData) });
+      console.log("✅ Saved to Website (Firebase)");
     }
-  }
-
-  // ✅ 4. SEND TO REPOST CHANNEL
-  if (env.REPOST_CHANNEL_ID) {
-    try {
-      if (isPhoto) {
-        await callTelegram("sendPhoto", { chat_id: env.REPOST_CHANNEL_ID, photo: lastPhotoFileId, caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
-      } else {
-        await callTelegram("sendMessage", { chat_id: env.REPOST_CHANNEL_ID, text: safeSubstring(newPostText, 4096), entities: [] }, env);
-      }
-    } catch (chErr) {}
+  } catch (fbErr) {
+    console.log("Firebase Error (Ignored, Telegram already posted):", fbErr.message);
   }
 }
 
 // ============================================
 // HELPERS
 // ============================================
+async function sendErrorToChat(chatId, text, env) {
+  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text: text })
+  });
+}
+
+async function callTelegram(method, body, env) {
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.ok) throw new Error(`${method} → ${data.description || res.statusText}`);
+  return data.result;
+}
+
+function cleanTheText(text) {
+  if (!text) return "";
+  try {
+    const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu;
+    const PHONE_ET = /(?:\+?251|0)?[\s.\-]*(?:9|7)\d(?:[\s.\-]?\d){8}/g;
+
+    return text
+      .replace(/https?:\/\/\S+/gi, "")
+      .replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "")
+      .replace(/@[a-zA-Z0-9_]{2,}/g, "")
+      .replace(PHONE_ET, "")
+      .replace(EMOJI, "")
+      .replace(/[*_~`|]/g, "")
+      .replace(/[ \t]+/g, " ")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  } catch (err) {
+    return text;
+  }
+}
+
+function safeSubstring(str, maxLen) {
+  if (!str) return "";
+  if (str.length <= maxLen) return str;
+  let out = "";
+  for (const ch of str) {
+    if (out.length + ch.length > maxLen) break;
+    out += ch;
+  }
+  return out;
+}
+
+function simpleHash(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) - hash) + str.charCodeAt(i);
+    hash = hash & hash;
+  }
+  return Math.abs(hash).toString();
+}
+
+function detectCategory(text) {
+  const lowerText = text.toLowerCase();
+  if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|elantra|avante|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) return "Cars";
+  if (/(house|villa|condominium|condo|ቤት|ቪላ|ኮንዶሚኒየም)/i.test(lowerText)) return "Houses";
+  if (/(apartment|office|shop|አፓርታማ|ቢሮ|ሱቅ|መጋዘን)/i.test(lowerText)) return "Rentals";
+  if (/(iphone|samsung|tecno|infinix|phone|smartphone|laptop|computer|tv|camera|ስልክ|ሞባይል|ላፕቶፕ|ኮምፒውተር|ቲቪ|ቴሌቪዥን|ካሜራ)/i.test(lowerText)) return "Electronics";
+  if (/(sofa|bed|table|chair|furniture|cabinet|ሶፋ|አልጋ|ጠረጴዛ|ጠረንጴዛ|ወንበር|ቁምሳጥን|እቃ)/i.test(lowerText)) return "Furniture";
+  if (/(clothes|shoes|dress|shirt|pants|fashion|ልብስ|ጫማ|ቀሚስ|ሱሪ|ሸሚዝ)/i.test(lowerText)) return "Clothes";
+  if (/(construction|electrician|plumber|painter|cleaning|worker|ግንባታ|ኤሌክትሪሺያን|ቧንቧ|ቀለም|ጽዳት|ሰራተኛ|ሠራተኛ)/i.test(lowerText)) return "Labor & Services";
+  if (/(used|second-hand|ምንአለሽ ተራ|ያገለገለ)/i.test(lowerText)) return "ምንአለሽ_ተራ";
+  return "Other";
+}
+
+function extractTitle(text) {
+  const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 2);
+  let title = lines[0] || "New Listing";
+  if (/(urgent|አስቸኳይ|sale|ሽያጭ|for sale|የሚሸጥ)/i.test(title) && lines.length > 1) {
+    title = lines[1];
+  }
+  if (title.length > 55) title = safeSubstring(title, 55) + "…";
+  return title;
+}
+
 function parseMathematicalPrice(text) {
   const millionMatch = text.match(/([\d.]+)\s*(?:million|mil|mln|m|ሚሊዮን)\b/i);
   if (millionMatch) {
     const val = parseFloat(millionMatch[1]);
-    if (!isNaN(val) && val > 0 && val < 1000) return { formattedPrice: Math.round(val * 1000000).toLocaleString("en-US"), rawPrice: Math.round(val * 1000000).toString() };
+    if (!isNaN(val) && val > 0 && val < 1000) return { formattedPrice: Math.round(val * 1000000).toLocaleString("en-US") };
   }
   const thousandMatch = text.match(/([\d.]+)\s*(?:k|thousand|ሺህ|ሺ)\b/i);
   if (thousandMatch) {
     const val = parseFloat(thousandMatch[1]);
-    if (!isNaN(val) && val > 0 && val < 10000) return { formattedPrice: Math.round(val * 1000).toLocaleString("en-US"), rawPrice: Math.round(val * 1000).toString() };
+    if (!isNaN(val) && val > 0 && val < 10000) return { formattedPrice: Math.round(val * 1000).toLocaleString("en-US") };
   }
   const explicitMatch = text.match(/(?:price|peric|pris|ዋጋ|ETB|ብር|Birr)[\s:.]*([\d.,]+)/i);
   if (explicitMatch) {
     const num = parseInt(explicitMatch[1].replace(/[.,]/g, "").trim(), 10);
-    if (!isNaN(num) && num > 50) return { formattedPrice: num.toLocaleString("en-US"), rawPrice: num.toString() };
+    if (!isNaN(num) && num > 50) return { formattedPrice: num.toLocaleString("en-US") };
   }
-  const standaloneMatch = text.match(/\b(\d{1,3}(?:,\d{3})+|\d{4,9})\b/);
-  if (standaloneMatch) {
-    const num = parseInt(standaloneMatch[1].replace(/[.,]/g, "").trim(), 10);
-    if (!isNaN(num) && num >= 500) return { formattedPrice: num.toLocaleString("en-US"), rawPrice: num.toString() };
-  }
-  return { formattedPrice: "0", rawPrice: "0" };
+  return { formattedPrice: "0" };
 }
 
 async function uploadImagesToCloudinary(fileIds, env) {
-  if (!fileIds || fileIds.length === 0) return [];
+  if (!fileIds || fileIds.length === 0 || !env.CLOUDINARY_CLOUD_NAME) return [];
   const uploadPromises = fileIds.map(async (fileId) => {
     try {
       const fileRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${fileId}`);
@@ -349,70 +295,15 @@ async function uploadImagesToCloudinary(fileIds, env) {
   return results.filter(Boolean);
 }
 
-function cleanTheText(text) {
-  if (!text) return "";
-  
-  // ✅ HARD-CODED REGEX: Strips ALL standard and premium fallback emojis (including diamonds)
-  // without breaking on Amharic text.
-  const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu;
-  
-  return text
-    .replace(/https?:\/\/\S+/gi, "")
-    .replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "")
-    .replace(/@[a-zA-Z0-9_]{2,}/g, "")
-    .replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}\b/gi, "")
-    .replace(EMOJI, "")
-    .replace(/[*_~`|]/g, "")
-    .replace(/[ \t]+/g, " ")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-function detectCategory(text) {
-  const lowerText = text.toLowerCase();
-  if (/(car|toyota|suzuki|honda|bmw|benz|nissan|ford|hyundai|mazda|tucson|elantra|avante|vehicle|engine|mileage|km|መኪና|ሱዙኪ|ቶዮታ|ሆንዳ|ቢኤምደብሊው|ተሽከርካሪ|ሞተር)/i.test(lowerText)) return "Cars";
-  if (/(house|villa|condominium|condo|ቤት|ቪላ|ኮንዶሚኒየም)/i.test(lowerText)) return "Houses";
-  if (/(apartment|office|shop|አፓርታማ|ቢሮ|ሱቅ|መጋዘን)/i.test(lowerText)) return "Rentals";
-  if (/(iphone|samsung|tecno|infinix|phone|smartphone|laptop|computer|tv|camera|ስልክ|ሞባይል|ላፕቶፕ|ኮምፒውተር|ቲቪ|ቴሌቪዥን|ካሜራ)/i.test(lowerText)) return "Electronics";
-  if (/(sofa|bed|table|chair|furniture|cabinet|ሶፋ|አልጋ|ጠረጴዛ|ጠረንጴዛ|ወንበር|ቁምሳጥን|እቃ)/i.test(lowerText)) return "Furniture";
-  if (/(clothes|shoes|dress|shirt|pants|fashion|ልብስ|ጫማ|ቀሚስ|ሱሪ|ሸሚዝ)/i.test(lowerText)) return "Clothes";
-  if (/(construction|electrician|plumber|painter|cleaning|worker|ግንባታ|ኤሌክትሪሺያን|ቧንቧ|ቀለም|ጽዳት|ሰራተኛ|ሠራተኛ)/i.test(lowerText)) return "Labor & Services";
-  if (/(used|second-hand|ምንአለሽ ተራ|ያገለገለ)/i.test(lowerText)) return "ምንአለሽ_ተራ";
-  return "Other";
-}
-
-function extractCity(text) {
-  const lower = text.toLowerCase();
-  if (/(አዲስ አበባ|addis ababa|finfinne|bole|sarbet|cmc|gerji|piassa)/i.test(lower)) return "Addis Ababa";
-  if (/(hawassa|ሀዋሳ)/i.test(lower)) return "Hawassa";
-  if (/(adama|አዳማ|nazret)/i.test(lower)) return "Adama";
-  if (/(bahir dar|ባህር ዳር)/i.test(lower)) return "Bahir Dar";
-  if (/(dire dawa|ድሬዳዋ)/i.test(lower)) return "Dire Dawa";
-  return "Addis Ababa";
-}
-
-function extractTitle(text) {
-  const lines = text.split("\n").map((l) => l.trim()).filter((l) => l.length > 2);
-  let title = lines[0] || "New Listing";
-  if (/(urgent|አስቸኳይ|sale|ሽያጭ|for sale|የሚሸጥ)/i.test(title) && lines.length > 1) {
-    title = lines[1];
-  }
-  if (title.length > 55) title = safeSubstring(title, 55) + "…";
-  return title;
-}
-
 async function getFirebaseToken(env) {
   const now = Math.floor(Date.now() / 1000);
-  if (cachedFirebaseToken && tokenExpiresAt > now + 300) return cachedFirebaseToken;
-  const clientEmail = env.FIREBASE_CLIENT_EMAIL;
-  const privateKey = env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n");
+  if (!env.FIREBASE_CLIENT_EMAIL || !env.FIREBASE_PRIVATE_KEY) return "";
   const header = { alg: "RS256", typ: "JWT" };
-  const payload = { iss: clientEmail, scope: "https://www.googleapis.com/auth/datastore", aud: "https://oauth2.googleapis.com/token", iat: now, exp: now + 3600 };
-  const encHeader = base64UrlEncode(JSON.stringify(header));
-  const encPayload = base64UrlEncode(JSON.stringify(payload));
+  const payload = { iss: env.FIREBASE_CLIENT_EMAIL, scope: "https://www.googleapis.com/auth/datastore", aud: "https://oauth2.googleapis.com/token", iat: now, exp: now + 3600 };
+  const encHeader = btoa(JSON.stringify(header)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const encPayload = btoa(JSON.stringify(payload)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   const signingInput = `${encHeader}.${encPayload}`;
-  const pemContents = privateKey.replace("-----BEGIN PRIVATE KEY-----", "").replace("-----END PRIVATE KEY-----", "").replace(/\s/g, "");
+  const pemContents = env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n").replace("-----BEGIN PRIVATE KEY-----", "").replace("-----END PRIVATE KEY-----", "").replace(/\s/g, "");
   const binaryDer = Uint8Array.from(atob(pemContents), (c) => c.charCodeAt(0));
   const cryptoKey = await crypto.subtle.importKey("pkcs8", binaryDer, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
   const sigBuffer = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", cryptoKey, new TextEncoder().encode(signingInput));
@@ -423,17 +314,7 @@ async function getFirebaseToken(env) {
   const jwt = `${signingInput}.${signature}`;
   const tokRes = await fetch("https://oauth2.googleapis.com/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}` });
   const tokData = await tokRes.json();
-  if (!tokData.access_token) throw new Error("Token Error: " + JSON.stringify(tokData));
-  cachedFirebaseToken = tokData.access_token;
-  tokenExpiresAt = now + (tokData.expires_in || 3600);
-  return cachedFirebaseToken;
-}
-
-function base64UrlEncode(str) {
-  const bytes = new TextEncoder().encode(str);
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return tokData.access_token || "";
 }
 
 function cleanupStaleAlbums() {
