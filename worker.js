@@ -3,8 +3,8 @@
  */
 
 // In-Memory Caches
-const albumCache = new Map();
-const processedLocks = new Map();
+const albumStore = new Map(); // media_group_id -> { images: [], caption: "", captionMsg: null, timerStarted: false }
+const completedLocks = new Set(); 
 const updateIdLocks = new Set();
 let cachedFirebaseToken = null;
 let tokenExpiresAt = 0;
@@ -13,10 +13,25 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // ✅ SEARCH ENGINE API
+    // ✅ 1. HANDLE CORS (Required for your React app to talk to the bot)
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type",
+        }
+      });
+    }
+
+    // ✅ 2. SEARCH API (Must be before the Telegram check)
     if (url.pathname === "/api/search" && request.method === "GET") {
       const query = url.searchParams.get("q") || "";
-      if (!query) return new Response(JSON.stringify({ internal: [], external: [] }), { headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
+      if (!query) {
+        return new Response(JSON.stringify({ internal: [], external: [] }), {
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+      }
 
       const internal = await searchFirebaseAds(query, env);
       const external = await searchExternalMarketplaces(query, env);
@@ -26,7 +41,7 @@ export default {
       });
     }
 
-    // EXISTING TELEGRAM BOT LOGIC
+    // ✅ 3. BLOCK ALL OTHER GET REQUESTS
     if (request.method !== "POST") {
       return new Response("Yegna Gebeya Bot is running ✅", { 
         status: 200,
@@ -34,6 +49,7 @@ export default {
       });
     }
 
+    // ✅ 4. TELEGRAM BOT LOGIC
     try {
       const update = await request.json();
       ctx.waitUntil(processUpdateSafe(update, env, request));
@@ -106,7 +122,7 @@ async function searchExternalMarketplaces(query, env) {
 }
 
 // ==========================================
-// YOUR EXISTING BOT LOGIC (UNTOUCHED)
+// TELEGRAM BOT LOGIC
 // ==========================================
 async function processUpdateSafe(update, env, request) {
   try {
@@ -120,9 +136,7 @@ async function processUpdate(update, env, request) {
   if (update.update_id) {
     if (updateIdLocks.has(update.update_id)) return;
     updateIdLocks.add(update.update_id);
-    if (updateIdLocks.size > 4000) {
-      updateIdLocks.delete(updateIdLocks.values().next().value);
-    }
+    if (updateIdLocks.size > 4000) updateIdLocks.delete(updateIdLocks.values().next().value);
   }
 
   const message = update.channel_post || update.message;
@@ -243,7 +257,10 @@ function hasBotWatermark(text) {
     lower.includes("0911680790") ||
     lower.includes("#yegnagebeya") ||
     lower.includes("📝 title:") ||
-    lower.includes("💰 price:")
+    lower.includes("💰 price:") ||
+    lower.includes("📂 category:") ||
+    lower.includes("website: mebri") ||
+    lower.includes("✈️ telegram: @mebrigranite")
   );
 }
 
@@ -276,8 +293,9 @@ function safeSubstring(str, maxLen) {
   return out;
 }
 
-// [Keep your CAR_DATABASE, ELECTRONICS_DATABASE, detectBrandModelYear, arrangeTitle, detectCategory, parseMathematicalPrice, cleanTheText, extractCity, uploadImagesToCloudinary, inspectImageWithGemini, getFirebaseToken, base64UrlEncode HERE as they were in your original file]
-
+// ==========================================
+// MAIN AD BROADCASTER
+// ==========================================
 async function processFinalAd(message, imageFileIds, cleanText, env, mediaGroupId = null) {
   let { brand, model, year, trim, bodyType, fuelType, transmission, subcategory } = detectBrandModelYear(cleanText);
   const category = detectCategory(cleanText, brand);
@@ -341,7 +359,10 @@ async function processFinalAd(message, imageFileIds, cleanText, env, mediaGroupI
     }
   } catch (fbErr) {}
 
-  const hashtagMap = { Cars: "#Cars", Houses: "#Houses", Rentals: "#Rentals", Electronics: "#Electronics", Furniture: "#Furniture", Clothes: "#Clothes", "Labor & Services": "#Labor", "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ" };
+  const hashtagMap = { 
+    Cars: "#Cars", Houses: "#Houses", Rentals: "#Rentals", Electronics: "#Electronics", Furniture: "#Furniture", 
+    Clothes: "#Clothes", "Labor & Services": "#Labor", "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ" 
+  };
   const hashtag = hashtagMap[category] || "#Other";
   const displayPriceText = formattedPrice && formattedPrice !== "0" ? `${formattedPrice} ETB` : "Negotiable / ተደራዳሪ";
 
@@ -359,11 +380,262 @@ async function processFinalAd(message, imageFileIds, cleanText, env, mediaGroupI
   const targetChannel = env.REPOST_CHANNEL_ID || "@mebrigranite";
 
   try {
-    if (imageFileIds.length === 0) await callTelegram("sendMessage", { chat_id: targetChannel, text: safeSubstring(newPostText, 4096) }, env);
-    else if (imageFileIds.length === 1) await callTelegram("sendPhoto", { chat_id: targetChannel, photo: imageFileIds[0], caption: safeSubstring(newPostText, 1024) }, env);
-    else {
+    if (imageFileIds.length === 0) {
+      await callTelegram("sendMessage", { chat_id: targetChannel, text: safeSubstring(newPostText, 4096) }, env);
+    } else if (imageFileIds.length === 1) {
+      await callTelegram("sendPhoto", { chat_id: targetChannel, photo: imageFileIds[0], caption: safeSubstring(newPostText, 1024) }, env);
+    } else {
       const media = imageFileIds.slice(0, 10).map((fileId, index) => ({ type: "photo", media: fileId, ...(index === 0 ? { caption: safeSubstring(newPostText, 1024) } : {}) }));
       await callTelegram("sendMediaGroup", { chat_id: targetChannel, media }, env);
     }
   } catch (err) {}
+}
+
+// ==========================================
+// BRAND / MODEL / YEAR / SPECS PARSER
+// ==========================================
+function detectBrandModelYear(text) {
+  let brand = "", model = "", year = "", trim = "", bodyType = "", fuelType = "", transmission = "", subcategory = "";
+
+  const makeMatch = text.match(/(?:Make|የመኪናው\s*ዓይነት|Brand|ብራንድ)[ \t:=-]+([a-zA-Z0-9/._ -]+)/i);
+  if (makeMatch && makeMatch[1]) {
+    brand = makeMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
+    if (/^(?:new|brand\s*new|used)\b/i.test(brand)) brand = "";
+  }
+
+  const modelMatch = text.match(/(?:Model|ሞዴል)[ \t:=-]+([a-zA-Z0-9/._ -]+)/i);
+  if (modelMatch && modelMatch[1]) model = modelMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
+
+  const yearMatch = text.match(/(?:Year|ዓመተ\s*ምህረት)[ \t:=-]+([0-9]{4}(?:\/[0-9]{1,2})?)/i);
+  if (yearMatch && yearMatch[1]) year = yearMatch[1].trim();
+  else {
+    const rawYear = text.match(/\b(199\d|200\d|201\d|202[0-9])(?:\/([0-9]{1,2}))?\b/);
+    if (rawYear) year = rawYear[0];
+  }
+
+  if (model && /^(?:19|20)\d{2}(?:\/\d{1,2})?$/.test(model)) {
+    if (!year) year = model;
+    model = "";
+  }
+
+  const trimMatch = text.match(/(?:Trim|ትሪም|Edition)[ \t:=-]+([a-zA-Z0-9/._ -]+)/i);
+  if (trimMatch && trimMatch[1]) trim = trimMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
+
+  const bodyMatch = text.match(/(?:Body\s*Type|የቦዲ\s*ዓይነት)[ \t:=-]+([a-zA-Z0-9/._ -]+)/i);
+  if (bodyMatch && bodyMatch[1]) bodyType = bodyMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
+
+  const fuelMatch = text.match(/(?:Fuel|ነዳጅ)[ \t:=-]+([a-zA-Z0-9/._ -]+)/i);
+  if (fuelMatch && fuelMatch[1]) fuelType = fuelMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
+  else if (/(?:electric|ኤሌክትሪክ|ev\b|battery|ባትሪ)/i.test(text)) fuelType = "Electric";
+  else if (/(?:benzin|petrol|ቤንዚን)/i.test(text)) fuelType = "Petrol / Benzin";
+  else if (/(?:diesel|ናፍጣ)/i.test(text)) fuelType = "Diesel";
+  else if (/(?:hybrid|ሃይብሪድ)/i.test(text)) fuelType = "Hybrid";
+
+  const transMatch = text.match(/(?:Transmission|ማስተላለፊያ)[ \t:=-]+([a-zA-Z0-9/._ -]+)/i);
+  if (transMatch && transMatch[1]) {
+    const candidate = transMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
+    if (/(?:automatic|ኦቶማቲክ)/i.test(candidate)) transmission = "Automatic";
+    else if (/(?:manual|ማኑዋል)/i.test(candidate)) transmission = "Manual";
+    else if (candidate.length < 20 && !/^(?:19|20)\d{2}/.test(candidate)) transmission = candidate;
+  }
+  if (!transmission) {
+    if (/(?:automatic\s*transmission|ኦቶማቲክ)/i.test(text)) transmission = "Automatic";
+    else if (/(?:manual\s*transmission|ማኑዋል)/i.test(text)) transmission = "Manual";
+  }
+
+  // (Simplified CAR_DATABASE logic for space)
+  if (!brand) {
+    if (/\b(byd|ባይድ)\b/i.test(text)) brand = "BYD";
+    else if (/\b(toyota|ቶዮታ)\b/i.test(text)) brand = "Toyota";
+    else if (/\b(suzuki|ሱዙኪ)\b/i.test(text)) brand = "Suzuki";
+    else if (/\b(hyundai|ሂዩንዳይ)\b/i.test(text)) brand = "Hyundai";
+  }
+
+  if (!subcategory && bodyType) {
+    if (bodyType.toLowerCase().includes("suv") || /suv/i.test(text)) subcategory = "SUV / Crossover";
+    else if (bodyType.toLowerCase().includes("sedan") || /sedan/i.test(text)) subcategory = "Sedan";
+  }
+
+  return { brand, model, year, trim, bodyType, fuelType, transmission, subcategory };
+}
+
+function arrangeTitle({ brand, model, year, trim, cleanText, category, subcategory }) {
+  if (category === "Cars") {
+    const cleanYear = year ? year.split("/")[0] : "";
+    if (brand && model) {
+      const parts = [];
+      if (cleanYear) parts.push(cleanYear);
+      parts.push(brand);
+      parts.push(model);
+      if (trim && !model.toLowerCase().includes(trim.toLowerCase())) parts.push(`(${trim})`);
+      return parts.join(" ");
+    }
+    if (brand) return [cleanYear, brand, subcategory !== "Vehicles" ? subcategory : ""].filter(Boolean).join(" ");
+  }
+  const firstLine = cleanText.split("\n")[0].replace(/[💎📌⭐✔️•#]/g, "").trim();
+  return safeSubstring(firstLine, 65) || `${category} Item`;
+}
+
+function detectCategory(text, brand) {
+  const t = text.toLowerCase();
+  if (brand && ["byd", "toyota", "suzuki", "hyundai"].includes(brand.toLowerCase())) return "Cars";
+  if (/(መኪና|car|vitz|corolla|rav4|suzuki|hyundai|byd|elantra|sealion|tucson|toyota|yaris|benz|mileage|km|plate)/i.test(t)) return "Cars";
+  if (/(ቤት|ኮንዶሚኒየም|apartment|villa|house|g\+|ሪል\s*እስቴት|ካሬ|sqm)/i.test(t)) return /(ኪራይ|rent|ለኪራይ|ወርሃዊ)/i.test(t) ? "Rentals" : "Houses";
+  if (/(ስልክ|phone|iphone|samsung|laptop|macbook|ipad|tv|electronics|playstation|ps5|ቴሌቪዥን|ላፕቶፕ)/i.test(t)) return "Electronics";
+  if (/(sofa|bed|table|chair|furniture|ሶፋ|አልጋ|ጠረጴዛ|ወንበር|ቁምሳጥን)/i.test(t)) return "Furniture";
+  if (/(shoes|jacket|dress|suit|clothes|pants|ጫማ|ጃኬት|ቀሚስ|ልብስ)/i.test(t)) return "Clothes";
+  if (/(driver|plumber|electrician|mechanic|ቧንቧ|ኤሌክትሪክ|ቀለም|ሹፌር|ሰርቪስ|ጽዳት)/i.test(t)) return "Labor & Services";
+  return "ምንአለሽ_ተራ";
+}
+
+function parseMathematicalPrice(text, knownYear) {
+  if (!text) return { formattedPrice: "0", rawPrice: 0 };
+  const detectedYear = (knownYear ? knownYear.split("/")[0] : "") || "";
+  const isExcluded = (num, rawStr) => {
+    if (detectedYear && (num.toString() === detectedYear || rawStr.includes(detectedYear))) return true;
+    if (num >= 1970 && num <= 2035) {
+      const yearPattern = new RegExp(`(?:year|ዓመተ|model|ሞዴል|month|ወር)?\\s*${num}`, "i");
+      if (yearPattern.test(text)) return true;
+    }
+    return false;
+  };
+
+  const explicitLineMatch = text.match(/(?:💰|price|ዋጋ|fixed|የመሸጫ\s*ዋጋ)[ \t:=-]+([0-9.,]+)\s*(?:ETB|ብር|Birr)?\s*(?:million|mil|mln|m|ሚሊዮን|ሚሊየን|k|thousand|ሺህ|ሺ)?/i);
+  if (explicitLineMatch && explicitLineMatch[1]) {
+    const rawVal = explicitLineMatch[1];
+    const isMillion = /(?:million|mil|mln|m|ሚሊዮን|ሚሊየን)/i.test(explicitLineMatch[0]);
+    const isThousand = /(?:k|thousand|ሺህ|ሺ)/i.test(explicitLineMatch[0]);
+    if (isMillion) {
+      const val = parseFloat(rawVal.replace(/,/g, ""));
+      if (!isNaN(val) && val > 0) { const f = val < 1000 ? Math.round(val * 1000000) : Math.round(val); return { formattedPrice: f.toLocaleString("en-US"), rawPrice: f }; }
+    } else if (isThousand) {
+      const val = parseFloat(rawVal.replace(/,/g, ""));
+      if (!isNaN(val) && val > 0) { const f = val < 10000 ? Math.round(val * 1000) : Math.round(val); return { formattedPrice: f.toLocaleString("en-US"), rawPrice: f }; }
+    } else {
+      const num = parseInt(rawVal.replace(/[.,]/g, ""), 10);
+      if (!isNaN(num) && num > 100 && !isExcluded(num, rawVal)) return { formattedPrice: num.toLocaleString("en-US"), rawPrice: num };
+    }
+  }
+
+  const generalMillionMatch = text.match(/([0-9]+(?:[.,][0-9]+)*)\s*(?:ETB|ብር|Birr)?\s*(?:million|mil|mln|m|ሚሊዮን|ሚሊየን)\b/i);
+  if (generalMillionMatch && generalMillionMatch[1]) {
+    const val = parseFloat(generalMillionMatch[1].replace(/,/g, ""));
+    if (!isNaN(val) && val > 0) { const f = val < 1000 ? Math.round(val * 1000000) : Math.round(val); return { formattedPrice: f.toLocaleString("en-US"), rawPrice: f }; }
+  }
+
+  const thousandMatch = text.match(/([0-9]+(?:[.,][0-9]+)*)\s*(?:ETB|ብር|Birr)?\s*(?:k|thousand|ሺህ|ሺ)\b/i);
+  if (thousandMatch && thousandMatch[1]) {
+    const val = parseFloat(thousandMatch[1].replace(/,/g, ""));
+    if (!isNaN(val) && val > 0 && val < 10000) { const f = Math.round(val * 1000); return { formattedPrice: f.toLocaleString("en-US"), rawPrice: f }; }
+  }
+
+  const currencyMatch = text.match(/(?:ETB|ብር|Birr)\s*[:=.-]?\s*([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{5,10})|([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{5,10})\s*(?:ETB|ብር|Birr)/i);
+  if (currencyMatch) {
+    const rawVal = currencyMatch[1] || currencyMatch[2];
+    if (rawVal) {
+      const num = parseInt(rawVal.replace(/[.,]/g, ""), 10);
+      if (!isNaN(num) && num > 100 && !isExcluded(num, rawVal)) return { formattedPrice: num.toLocaleString("en-US"), rawPrice: num };
+    }
+  }
+
+  return { formattedPrice: "0", rawPrice: 0 };
+}
+
+function cleanTheText(text) {
+  if (!text) return "";
+  const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu;
+  return text
+    .replace(/https?:\/\/\S+/gi, "")
+    .replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "")
+    .replace(/@[a-zA-Z0-9_]{2,}/g, "")
+    .replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}\b/gi, "")
+    .replace(EMOJI, "")
+    .replace(/[*_~`|]/g, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function extractCity(text) {
+  const lower = text.toLowerCase();
+  if (/(አዲስ አበባ|addis ababa|finfinne|bole|sarbet|cmc|gerji|piassa|ayat|summit)/i.test(lower)) return "Addis Ababa";
+  if (/(hawassa|ሀዋሳ)/i.test(lower)) return "Hawassa";
+  if (/(adama|አዳማ|nazret)/i.test(lower)) return "Adama";
+  if (/(bahir dar|ባህር ዳር)/i.test(lower)) return "Bahir Dar";
+  if (/(dire dawa|ድሬዳዋ)/i.test(lower)) return "Dire Dawa";
+  return "Addis Ababa";
+}
+
+async function uploadImagesToCloudinary(imageFileIds, env) {
+  if (!env.CLOUDINARY_CLOUD_NAME || !env.CLOUDINARY_UPLOAD_PRESET || !imageFileIds || imageFileIds.length === 0) return [];
+  const urls = [];
+  for (const fileId of imageFileIds.slice(0, 4)) {
+    try {
+      const getFileRes = await callTelegram("getFile", { file_id: fileId }, env);
+      if (!getFileRes || !getFileRes.file_path) continue;
+      const tgFileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${getFileRes.file_path}`;
+      const form = new FormData();
+      form.append("file", tgFileUrl);
+      form.append("upload_preset", env.CLOUDINARY_UPLOAD_PRESET);
+      const uploadRes = await fetch(`https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/image/upload`, { method: "POST", body: form });
+      const data = await uploadRes.json();
+      if (data.secure_url) urls.push(data.secure_url);
+    } catch (e) {}
+  }
+  return urls;
+}
+
+async function inspectImageWithGemini(fileId, contextText, env) {
+  if (!env.GEMINI_API_KEY) return null;
+  try {
+    const fileRes = await callTelegram("getFile", { file_id: fileId }, env);
+    if (!fileRes?.file_path) return null;
+    const tgUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileRes.file_path}`;
+    const imgFetch = await fetch(tgUrl);
+    const arrayBuffer = await imgFetch.arrayBuffer();
+    const base64Image = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
+
+    const prompt = `Analyze this vehicle photo for an Ethiopian marketplace ad. Context: "${contextText.substring(0, 200)}". Return ONLY valid JSON matching this schema: {"brand": "Hyundai", "model": "Elantra", "year": "2022", "trim": "", "bodyType": "Sedan", "subcategory": "Sedan"}`;
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: "image/jpeg", data: base64Image } }] }],
+        generationConfig: { response_mime_type: "application/json" }
+      })
+    });
+    const data = await res.json();
+    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    return raw ? JSON.parse(raw) : null;
+  } catch (err) { return null; }
+}
+
+async function getFirebaseToken(env) {
+  const now = Math.floor(Date.now() / 1000);
+  if (cachedFirebaseToken && tokenExpiresAt > now + 300) return cachedFirebaseToken;
+  const clientEmail = env.FIREBASE_CLIENT_EMAIL;
+  const privateKey = (env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
+  if (!clientEmail || !privateKey) return "";
+
+  const header = { alg: "RS256", typ: "JWT" };
+  const payload = { iss: clientEmail, scope: "https://www.googleapis.com/auth/datastore", aud: "https://oauth2.googleapis.com/token", iat: now, exp: now + 3600 };
+  const encHeader = btoa(JSON.stringify(header)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const encPayload = btoa(JSON.stringify(payload)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const signingInput = `${encHeader}.${encPayload}`;
+  const pemContents = privateKey.replace("-----BEGIN PRIVATE KEY-----", "").replace("-----END PRIVATE KEY-----", "").replace(/\s/g, "");
+  const binaryDer = Uint8Array.from(atob(pemContents), (c) => c.charCodeAt(0));
+  const cryptoKey = await crypto.subtle.importKey("pkcs8", binaryDer, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
+  const sigBuffer = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", cryptoKey, new TextEncoder().encode(signingInput));
+  const sigBytes = new Uint8Array(sigBuffer);
+  let binary = "";
+  for (let i = 0; i < sigBytes.length; i++) binary += String.fromCharCode(sigBytes[i]);
+  const signature = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const jwt = `${signingInput}.${signature}`;
+  const tokRes = await fetch("https://oauth2.googleapis.com/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}` });
+  const tokData = await tokRes.json();
+  if (!tokData.access_token) throw new Error("Token Error: " + JSON.stringify(tokData));
+  cachedFirebaseToken = tokData.access_token;
+  tokenExpiresAt = now + (tokData.expires_in || 3600);
+  return cachedFirebaseToken;
 }
