@@ -1,8 +1,9 @@
 /**
- * Yegna Gebeya Telegram Bot - Ultimate Emoji Shield
+ * Yegna Gebeya Telegram Bot - Bulletproof Final
  */
 
 const albumCache = new Map();
+const processedMessages = new Set();
 
 export default {
   async fetch(request, env, ctx) {
@@ -22,24 +23,29 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // Environment Variable Check
+  // 1. Double-Post Shield (Ignores the same message if Telegram retries)
+  if (processedMessages.has(message.message_id)) return;
+  processedMessages.add(message.message_id);
+  if (processedMessages.size > 1000) processedMessages.clear();
+
+  // 2. Environment Variable Check
   if (!env.TELEGRAM_BOT_TOKEN || !env.REPOST_CHANNEL_ID) {
-    await sendErrorToChat(message.chat.id, "❌ MISSING ENV VARS\n\nYou must add TELEGRAM_BOT_TOKEN and REPOST_CHANNEL_ID in Cloudflare Settings > Variables.", env);
+    await sendErrorToChat(message.chat.id, "❌ MISSING ENV VARS\n\nAdd TELEGRAM_BOT_TOKEN and REPOST_CHANNEL_ID in Cloudflare.", env);
     return;
   }
 
   try {
-    // Ignore target channel
+    // 3. Ignore target channel (prevents bot from reposting its own posts)
     const target = String(env.REPOST_CHANNEL_ID).replace("@", "").toLowerCase();
     if (String(message.chat.id) === target || (message.chat.username || "").toLowerCase() === target) return;
 
-    // Ignore bot messages
+    // 4. Ignore bot messages
     const botId = env.TELEGRAM_BOT_TOKEN.split(":")[0];
     if (message.from && (String(message.from.id) === botId || message.from.is_bot)) return;
 
     const rawText = (message.text || message.caption || "").trim();
 
-    // Watermark check
+    // 5. Strict Watermark Check (Prevents double-processing)
     if (
       rawText.includes("🏢 የኛ ገበያ (Yegna Gebeya)") ||
       rawText.includes("📝 Title:") ||
@@ -51,7 +57,7 @@ async function processUpdate(update, env) {
       return;
     }
 
-    // ALBUM HANDLING
+    // 6. ALBUM HANDLING
     if (message.media_group_id) {
       const groupId = message.media_group_id;
       if (!albumCache.has(groupId)) {
@@ -76,7 +82,7 @@ async function processUpdate(update, env) {
       return;
     }
 
-    // SINGLE POST
+    // 7. SINGLE POST
     if (rawText.length < 3) return;
     const images = [];
     if (message.photo && message.photo.length > 0) {
@@ -99,7 +105,6 @@ async function processFinalAd(message, imageFileIds, env) {
   const title = extractTitle(cleanText);
   const { formattedPrice } = parseMathematicalPrice(cleanText);
 
-  // POST TO TELEGRAM FIRST
   const hashtagMap = { Cars: "#Cars", Houses: "#Houses", Rentals: "#Rentals", Electronics: "#Electronics", Furniture: "#Furniture", Clothes: "#Clothes", "Labor & Services": "#Labor", "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ" };
   const hashtag = hashtagMap[category] || "#Other";
   const displayPriceText = formattedPrice && formattedPrice !== "0" ? `${formattedPrice} ETB` : "Negotiable / ተደራዳሪ";
@@ -119,32 +124,52 @@ async function processFinalAd(message, imageFileIds, env) {
   newPostText += `${hashtag}`;
 
   const isPhoto = imageFileIds.length > 0;
+  let postedSuccessfully = false;
 
+  // 8. POST TO TELEGRAM CHANNEL (With Fallback)
   try {
     if (isPhoto) {
       await callTelegram("sendPhoto", {
         chat_id: env.REPOST_CHANNEL_ID,
         photo: imageFileIds[0],
         caption: safeSubstring(newPostText, 1024),
-        caption_entities: [], // 👈 CRITICAL: Drops hidden premium emoji data
-        parse_mode: "HTML"     // 👈 CRITICAL: Forces clean HTML rendering
+        caption_entities: [] // Strips Premium Emojis
       }, env);
     } else {
       await callTelegram("sendMessage", {
         chat_id: env.REPOST_CHANNEL_ID,
         text: safeSubstring(newPostText, 4096),
-        entities: [],          // 👈 CRITICAL: Drops hidden premium emoji data
-        parse_mode: "HTML"     // 👈 CRITICAL: Forces clean HTML rendering
+        entities: [] // Strips Premium Emojis
       }, env);
     }
+    postedSuccessfully = true;
     console.log("✅ Posted to Telegram Channel!");
   } catch (err) {
-    console.error("Telegram Post Failed:", err.message);
-    await sendErrorToChat(message.chat.id, `❌ TELEGRAM POST FAILED\n\nError: ${err.message}`, env);
-    return;
+    console.error("Photo Post Failed, trying text only:", err.message);
+    // FALLBACK: If photo fails, try sending just the text
+    try {
+      await callTelegram("sendMessage", {
+        chat_id: env.REPOST_CHANNEL_ID,
+        text: safeSubstring(newPostText, 4096),
+        entities: []
+      }, env);
+      postedSuccessfully = true;
+    } catch (fallbackErr) {
+      await sendErrorToChat(message.chat.id, `❌ TELEGRAM POST FAILED\n\nError: ${fallbackErr.message}\n\nMake sure the bot is an Admin in the channel!`, env);
+      return;
+    }
   }
 
-  // SAVE TO FIREBASE SECOND (Silent fail)
+  // 9. DELETE ORIGINAL MESSAGE (Optional: if it works, great. If not, ignore)
+  if (postedSuccessfully) {
+    try {
+      await callTelegram("deleteMessage", { chat_id: message.chat.id, message_id: message.message_id }, env);
+    } catch (delErr) {
+      console.log("Could not delete original (needs admin rights):", delErr.message);
+    }
+  }
+
+  // 10. SAVE TO FIREBASE (Silent fail, does not block Telegram)
   try {
     const token = await getFirebaseToken(env);
     if (token) {
@@ -173,7 +198,7 @@ async function processFinalAd(message, imageFileIds, env) {
 }
 
 // ============================================
-// HELPERS & TEXT CLEANING
+// HELPERS
 // ============================================
 async function sendErrorToChat(chatId, text, env) {
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -193,20 +218,17 @@ async function callTelegram(method, body, env) {
 function cleanTheText(text) {
   if (!text) return "";
   try {
-    // 1. Strip all Emojis (Including diamonds, stars, and flags)
     const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu;
-    
-    // 2. Strip Phone Numbers (Handles 0911..., +251..., etc.)
     const PHONE_ET = /(?:\+?251|0)?[\s.\-]*(?:9|7)\d(?:[\s.\-]?\d){8}/g;
 
     return text
-      .replace(/https?:\/\/\S+/gi, "")                 // Strip URLs
-      .replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "")  // Strip Telegram links
-      .replace(/@[a-zA-Z0-9_]{2,}/g, "")               // Strip @usernames
-      .replace(PHONE_ET, "")                           // Strip phone numbers
-      .replace(EMOJI, "")                              // Strip emojis
-      .replace(/[*_~`|]/g, "")                         // Strip Markdown symbols
-      .replace(/[ \t]+/g, " ")                         // Normalize spaces
+      .replace(/https?:\/\/\S+/gi, "")
+      .replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "")
+      .replace(/@[a-zA-Z0-9_]{2,}/g, "")
+      .replace(PHONE_ET, "")
+      .replace(EMOJI, "")
+      .replace(/[*_~`|]/g, "")
+      .replace(/[ \t]+/g, " ")
       .replace(/[ \t]+\n/g, "\n")
       .replace(/\n{3,}/g, "\n\n")
       .trim();
