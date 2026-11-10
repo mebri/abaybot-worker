@@ -162,190 +162,124 @@ function cleanupStaleAlbums() {
 
 async function processFinalAd(message, imageFileIds, messageIds, env) {
   const messageText = (message.text || message.caption || "").trim();
-  const cleanText = cleanTheText(messageText);
-  if (!cleanText || cleanText.length < 3) return;
-
-  let { brand, model, year, trim, bodyType, fuelType, transmission, subcategory } =
-    detectBrandModelYear(cleanText || messageText);
-  const category = detectCategory(cleanText, brand);
-  if (!subcategory) subcategory = bodyType || "Vehicles";
-
-  if (env.GEMINI_API_KEY && (!model || !brand) && imageFileIds.length > 0) {
-    try {
-      const visionResult = await inspectImageWithGemini(imageFileIds[0], cleanText, env);
-      if (visionResult) {
-        if (!brand && visionResult.brand) brand = visionResult.brand;
-        if (!model && visionResult.model) model = visionResult.model;
-        if (!year && visionResult.year) year = visionResult.year;
-        if (!trim && visionResult.trim) trim = visionResult.trim;
-        if (visionResult.bodyType && !bodyType) bodyType = visionResult.bodyType;
-        if (visionResult.subcategory && (!subcategory || subcategory === "Vehicles")) {
-          subcategory = visionResult.subcategory;
-        }
-      }
-    } catch (vErr) {
-      console.warn("Vision enrichment skipped:", vErr.message);
-    }
-  }
-
-  const arrangedTitle = arrangeTitle({ brand, model, year, trim, cleanText, category, subcategory });
-  const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText || messageText, year);
-
-  const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ""));
-  const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
-
+  
   try {
-    const token = await getFirebaseToken(env);
-    const projectId = env.FIREBASE_PROJECT_ID;
-    const adOwnerId = env.ADMIN_UID || "admin_bot";
+    // 1. Clean text and extract data
+    const cleanText = cleanTheText(messageText);
+    if (!cleanText || cleanText.length < 3) return;
 
-    const docId = message.media_group_id
-      ? `tg_${message.chat.id}_${message.media_group_id}`
-      : `ad_${message.chat.id}_${textHash}`;
+    let { brand, model, year, trim, bodyType, fuelType, transmission, subcategory } =
+      detectBrandModelYear(cleanText);
+    const category = detectCategory(cleanText, brand);
+    if (!subcategory) subcategory = bodyType || "Vehicles";
 
-    const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
+    const arrangedTitle = arrangeTitle({ brand, model, year, trim, cleanText, category, subcategory });
+    const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText, year);
+    const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ""));
 
-    let allImages = imageUrls;
-    let existingCreatedAt = null;
-
-    try {
-      const checkRes = await fetch(fbUrl, { headers: { Authorization: `Bearer ${token}` } });
-      if (checkRes.ok) {
-        const existingData = await checkRes.json();
-
-        if (existingData.fields?.createdAt?.timestampValue) {
-          existingCreatedAt = existingData.fields.createdAt.timestampValue;
-          const createdTime = new Date(existingCreatedAt).getTime();
-          if (Date.now() - createdTime < 3600000) {
-            console.log("⏭️ Ignored: Duplicate ad (1h window) detected on website.");
-            return;
-          }
-        }
-
-        if (existingData.fields?.images?.arrayValue?.values) {
-          const existingUrls = existingData.fields.images.arrayValue.values.map((v) => v.stringValue);
-          allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
-        }
-      }
-    } catch (e) {}
-
-    const adData = {
-      fields: {
-        title: { stringValue: arrangedTitle },
-        brand: { stringValue: brand || "" },
-        model: { stringValue: model || "" },
-        year: { stringValue: year || "" },
-        trim: { stringValue: trim || "" },
-        bodyType: { stringValue: bodyType || "" },
-        fuelType: { stringValue: fuelType || "" },
-        transmission: { stringValue: transmission || "" },
-        category: { stringValue: category },
-        subcategory: { stringValue: subcategory },
-        description: { stringValue: cleanText },
-        textHash: { stringValue: textHash },
-        price: { stringValue: formattedPrice },
-        rawPrice: { integerValue: String(rawPrice) },
-        phone: { stringValue: "0911680790" },
-        city: { stringValue: extractCity(cleanText) },
-        image: { stringValue: allImages.length > 0 ? allImages[0] : "" },
-        images: { arrayValue: { values: allImages.map((url) => ({ stringValue: url })) } },
-        status: { stringValue: "available" },
-        source: { stringValue: "telegram" },
-        userId: { stringValue: adOwnerId },
-        views: { integerValue: "0" },
-        createdAt: { timestampValue: existingCreatedAt || new Date().toISOString() }
-      }
+    // 2. Build the formatted message (Watermark/Footer Intact)
+    const hashtagMap = {
+      Cars: "#Cars", Houses: "#Houses", Rentals: "#Rentals", Electronics: "#Electronics",
+      Furniture: "#Furniture", Clothes: "#Clothes", "Labor & Services": "#Labor", "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ"
     };
+    const hashtag = hashtagMap[category] || "#Other";
+    const displayPriceText = formattedPrice && formattedPrice !== "0" ? `${formattedPrice} ETB` : "Negotiable / ተደራዳሪ";
 
-    await fetch(fbUrl, {
-      method: "PATCH",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(adData)
-    });
-    console.log("✅ Saved to Website (Firebase)");
-  } catch (fbErr) {
-    console.error("Firebase Error:", fbErr.message);
-  }
+    let newPostText = `📝 Title: ${arrangedTitle}\n`;
+    if (brand || model || year) {
+      const metaParts = [];
+      if (brand) metaParts.push(`Make: ${brand}`);
+      if (model) metaParts.push(`Model: ${model}`);
+      if (year) metaParts.push(`Year: ${year}`);
+      newPostText += `🏷️ ${metaParts.join(" | ")}\n`;
+    }
+    newPostText += `📂 Category: ${category}${subcategory ? ` › ${subcategory}` : ""}\n`;
+    newPostText += `💰 Price: ${displayPriceText}\n`;
+    if (transmission || fuelType) {
+      const specParts = [];
+      if (transmission) specParts.push(`⚙️ ${transmission}`);
+      if (fuelType) specParts.push(`⛽ ${fuelType}`);
+      newPostText += `${specParts.join(" | ")}\n`;
+    }
 
-  const hashtagMap = {
-    Cars: "#Cars",
-    Houses: "#Houses",
-    Rentals: "#Rentals",
-    Electronics: "#Electronics",
-    Furniture: "#Furniture",
-    Clothes: "#Clothes",
-    "Labor & Services": "#Labor",
-    "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ"
-  };
-  const hashtag = hashtagMap[category] || "#Other";
-  const displayPriceText =
-    formattedPrice && formattedPrice !== "0"
-      ? `${formattedPrice} ETB`
-      : "Negotiable / ተደራዳሪ";
+    // Footer (Watermark)
+    let footerText = `\n━━━━━━━━━━━━━━━\n`;
+    footerText += `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
+    footerText += `📞 Phone: 0911680790\n`;
+    footerText += `🌐 Website: mebri.yegna.workers.dev\n`;
+    footerText += `✈️ Telegram: @mebrigranite\n`;
+    footerText += `━━━━━━━━━━━━━━━\n\n`;
+    footerText += `${hashtag} #YegnaGebeya`;
 
-  // Format the Header
-  let newPostText = `📝 Title: ${arrangedTitle}\n`;
-  if (brand || model || year) {
-    const metaParts = [];
-    if (brand) metaParts.push(`Make: ${brand}`);
-    if (model) metaParts.push(`Model: ${model}`);
-    if (year) metaParts.push(`Year: ${year}`);
-    newPostText += `🏷️ ${metaParts.join(" | ")}\n`;
-  }
-  newPostText += `📂 Category: ${category}${subcategory ? ` › ${subcategory}` : ""}\n`;
-  newPostText += `💰 Price: ${displayPriceText}\n`;
-  if (transmission || fuelType) {
-    const specParts = [];
-    if (transmission) specParts.push(`⚙️ ${transmission}`);
-    if (fuelType) specParts.push(`⛽ ${fuelType}`);
-    newPostText += `${specParts.join(" | ")}\n`;
-  }
+    // Safely truncate Details so the Footer is never cut off
+    const fixedLen = newPostText.length + footerText.length + 15;
+    const maxDetailsLen = Math.max(100, 1020 - fixedLen);
+    let safeDetails = safeSubstring(cleanText, maxDetailsLen);
+    if (cleanText.length > maxDetailsLen) safeDetails = safeDetails.trimEnd() + "…";
 
-  // Format the Footer (Watermark Preserved)
-  let footerText = `\n━━━━━━━━━━━━━━━\n`;
-  footerText += `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
-  footerText += `📞 Phone: 0911680790\n`;
-  footerText += `🌐 Website: mebri.yegna.workers.dev\n`;
-  footerText += `✈️ Telegram: @mebrigranite\n`;
-  footerText += `━━━━━━━━━━━━━━━\n\n`;
-  footerText += `${hashtag} #YegnaGebeya`;
+    newPostText += `\n📄 Details:\n${safeDetails}${footerText}`;
 
-  // Safely truncate Details so the Footer is never cut off
-  const fixedLen = newPostText.length + footerText.length + 15;
-  const maxDetailsLen = Math.max(100, 1020 - fixedLen);
-  let safeDetails = safeSubstring(cleanText, maxDetailsLen);
-  if (cleanText.length > maxDetailsLen) safeDetails = safeDetails.trimEnd() + "…";
+    // 3. POST TO TELEGRAM FIRST (Bypasses Firebase crashes)
+    const targetChannel = env.REPOST_CHANNEL_ID;
+    if (!targetChannel) {
+       await callTelegram("sendMessage", { chat_id: message.chat.id, text: "ERROR: REPOST_CHANNEL_ID is missing in Cloudflare Environment Variables!" }, env);
+       return;
+    }
 
-  newPostText += `\n📄 Details:\n${safeDetails}${footerText}`;
-
-  const targetChannel = env.REPOST_CHANNEL_ID;
-  if (!targetChannel) return;
-
-  try {
     if (imageFileIds.length === 0) {
-      await callTelegram("sendMessage", {
-        chat_id: targetChannel,
-        text: safeSubstring(newPostText, 4096)
-      }, env);
+      await callTelegram("sendMessage", { chat_id: targetChannel, text: safeSubstring(newPostText, 4096) }, env);
     } else if (imageFileIds.length === 1) {
-      await callTelegram("sendPhoto", {
-        chat_id: targetChannel,
-        photo: imageFileIds[0],
-        caption: safeSubstring(newPostText, 1024)
-      }, env);
+      await callTelegram("sendPhoto", { chat_id: targetChannel, photo: imageFileIds[0], caption: safeSubstring(newPostText, 1024) }, env);
     } else {
       const media = imageFileIds.slice(0, 10).map((fileId, index) => ({
-        type: "photo",
-        media: fileId,
-        ...(index === 0 ? { caption: safeSubstring(newPostText, 1024) } : {})
+        type: "photo", media: fileId, ...(index === 0 ? { caption: safeSubstring(newPostText, 1024) } : {})
       }));
-      await callTelegram("sendMediaGroup", { chat_id: targetChannel, media }, env);
+      await callTelegram("sendMediaGroup", { chat_id: targetChannel, media: media }, env);
     }
     console.log("✅ Forwarded Clean Ad to Channel!");
-  } catch (err) {
-    console.error("Broadcast Error:", err.message);
+
+    // 4. SAVE TO FIREBASE SECOND (Errors won't block Telegram)
+    try {
+      const token = await getFirebaseToken(env);
+      if (token && env.FIREBASE_PROJECT_ID) {
+        const projectId = env.FIREBASE_PROJECT_ID;
+        const docId = message.media_group_id ? `tg_${message.chat.id}_${message.media_group_id}` : `ad_${message.chat.id}_${textHash}`;
+        const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
+        
+        // Upload images for Firebase (Cloudinary)
+        let imageUrls = [];
+        if (imageFileIds.length > 0) {
+          imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
+        }
+
+        const adData = {
+          fields: {
+            title: { stringValue: arrangedTitle },
+            brand: { stringValue: brand || "" },
+            model: { stringValue: model || "" },
+            year: { stringValue: year || "" },
+            category: { stringValue: category },
+            description: { stringValue: cleanText },
+            price: { stringValue: formattedPrice },
+            image: { stringValue: imageUrls.length > 0 ? imageUrls[0] : "" },
+            images: { arrayValue: { values: imageUrls.map((url) => ({ stringValue: url })) } },
+            status: { stringValue: "available" },
+            createdAt: { timestampValue: new Date().toISOString() }
+          }
+        };
+        await fetch(fbUrl, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(adData) });
+        console.log("✅ Saved to Website (Firebase)");
+      }
+    } catch (fbErr) {
+      console.log("Firebase Error:", fbErr.message);
+    }
+
+  } catch (error) {
+    // THIS REPLIES TO YOU IN TELEGRAM IF THE BOT FAILS
+    console.error("CRASH IN PROCESS FINAL AD:", error);
+    await callTelegram("sendMessage", {
+      chat_id: message.chat.id,
+      text: `🚨 BOT CRASHED 🚨\n\nError: ${error.message}\n\nCheck Cloudflare Logs for more details.`
+    }, env);
   }
 }
