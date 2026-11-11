@@ -1,36 +1,19 @@
 /**
- * Yegna Gebeya Telegram Bot - Cloudflare Worker
+ * Yegna Gebeya Telegram Bot - Cloudflare Worker (Single-File Complete Edition)
  * 
- * Production Complete Edition (v7.0 Unified Engine):
- * 1. Dual Ingestion:
- *    - Ingests both Channel posts (channel_post) and Group/Private messages (message).
- * 2. Multi-Photo Album Aggregator:
- *    - Collects ALL photos belonging to a media_group_id across concurrent webhooks.
- *    - Broadcasts ALL photos together as a single Telegram `sendMediaGroup` (up to 10 photos).
- * 3. Atomic Single-Broadcast Edge Lock:
- *    - Guarantees that only ONE worker isolate broadcasts the album / post.
- *    - Cloudflare Edge Cache locking + in-memory locks.
- * 4. Absolute Loopback & Watermark Shield:
- *    - Ignores posts originating from the target repost channel (@mebrigranite).
- *    - Ignores automatic forwards from channel to linked discussion groups.
- *    - Ignores any post containing official bot watermark signatures.
- * 5. Strict Firestore Duplicate Check:
- *    - Deduplicates via normalized text hash document IDs.
- *    - If created within the last 5 minutes, gracefully skips reposting.
- *    - Merges newly uploaded Cloudinary image URLs with existing ones.
- * 6. Dual-Mode Chat Clean:
- *    - First attempts in-place edit (editMessageCaption / editMessageText) with empty
- *      entities/caption_entities to strip hidden AI/Telegram Premium custom emojis.
- *    - If edit fails (e.g. lacking permission in user group), deletes dirty post(s)
- *      and reposts a pristine clean message to the source chat.
- * 7. Broadcast to Repost Channel:
- *    - Sends clean post (single photo, album, or text) to REPOST_CHANNEL_ID (@mebrigranite).
- * 8. Mathematical Amharic Price Parser:
- *    - Handles ሚሊዮን (million), ሺህ (k), Birr/ETB, explicit prices, protects manufacture years.
- * 9. AI Title Arranger & Ethiopian Brands DB:
- *    - [Year] [Brand] [Model] [Trim] (e.g., "2025 BYD Sealion 06 EV (Champion Edition)").
- * 10. Gemini Vision & Cloudinary Integration:
- *    - Auto image inspection fallback and Cloudinary CDN storage.
+ * 1. Dual Ingestion: Listens to Channel posts (channel_post) and Group/Private messages.
+ * 2. Multi-Photo Album Aggregator: Collects ALL photos belonging to a media_group_id over 
+ *    a 3-second window, broadcasting them as a single Telegram `sendMediaGroup` (up to 10 photos).
+ * 3. Edge Distributed Lock: Cloudflare `caches.default` prevents duplicate worker executions.
+ * 4. Loopback & Watermark Shield: Ignores posts from target channel (@mebrigranite) and bot signatures.
+ * 5. Strict Firestore Duplicate Check: Drops duplicates created within the last 5 minutes, 
+ *    merging new photo URLs with existing ones.
+ * 6. Dual-Mode Chat Clean: Attempts in-place edit with `caption_entities: []` to strip Telegram Premium
+ *    custom emojis; if edit fails, deletes original dirty posts and reposts cleanly.
+ * 7. Broadcast to Repost Channel: Posts clean formatted ad with media group to REPOST_CHANNEL_ID.
+ * 8. Mathematical Amharic Price Parser: ሚሊዮን (million), ሺህ (k), Birr, explicit prices; protects manufacture years.
+ * 9. AI Title Arranger & Brands DB: [Year] [Brand] [Model] [Trim] (e.g., "2025 BYD Sealion 06 EV (Champion Edition)").
+ * 10. Gemini Vision & Cloudinary: Cloudinary CDN upload + multimodal inspection fallback.
  */
 
 // In-Memory Aggregators & Deduplication Stores
@@ -43,7 +26,7 @@ let tokenExpiresAt = 0;
 export default {
   async fetch(request, env, ctx) {
     if (request.method !== "POST") {
-      return new Response("Yegna Gebeya Bot is running ✅ (Complete Engine v7.0 Active)", { 
+      return new Response("Yegna Gebeya Bot is running ✅ (Single-File Complete Engine v7.0 Active)", { 
         status: 200,
         headers: { "Content-Type": "text/plain; charset=utf-8" }
       });
