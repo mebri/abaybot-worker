@@ -113,6 +113,32 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
     }
   }
 
+  // ✅ SAVE TO FIREBASE FIRST (So it NEVER fails to reach the website)
+  try {
+    const token = await getFirebaseToken(env);
+    if (token) {
+      const projectId = env.FIREBASE_PROJECT_ID;
+      const docId = message.media_group_id ? `tg_${message.chat.id}_${message.media_group_id}` : `ad_${textHash}`;
+      const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
+      const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
+
+      const adData = {
+        fields: {
+          title: { stringValue: title },
+          description: { stringValue: cleanText }, // 👈 Saves the clean text
+          price: { stringValue: formattedPrice },
+          category: { stringValue: category },
+          image: { stringValue: imageUrls.length > 0 ? imageUrls[0] : "" },
+          createdAt: { timestampValue: new Date().toISOString() }
+        }
+      };
+      await fetch(fbUrl, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(adData) });
+      console.log("✅ Saved to Website!");
+    }
+  } catch (fbErr) {
+    console.log("Firebase Error (Ignored):", fbErr.message);
+  }
+
   const hashtagMap = { Cars: "#Cars", Houses: "#Houses", Rentals: "#Rentals", Electronics: "#Electronics", Furniture: "#Furniture", Clothes: "#Clothes", "Labor & Services": "#Labor", "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ" };
   const hashtag = hashtagMap[category] || "#Other";
   const displayPriceText = formattedPrice && formattedPrice !== "0" ? `${formattedPrice} ETB` : "Negotiable / ተደራዳሪ";
@@ -143,13 +169,13 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
         await callTelegram("editMessageCaption", {
           chat_id: chatId, message_id: message.message_id,
           caption: safeSubstring(newPostText, 1024), 
-          caption_entities: [] // 👈 STRIPS PREMIUM EMOJIS
+          caption_entities: [] // Strips premium emojis
         }, env);
       } else {
         await callTelegram("editMessageText", {
           chat_id: chatId, message_id: message.message_id,
           text: safeSubstring(newPostText, 4096), 
-          entities: [] // 👈 STRIPS PREMIUM EMOJIS
+          entities: [] // Strips premium emojis
         }, env);
       }
       messageHandled = true;
@@ -175,28 +201,6 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       }
     } catch (chErr) {}
   }
-
-  try {
-    const token = await getFirebaseToken(env);
-    if (token) {
-      const projectId = env.FIREBASE_PROJECT_ID;
-      const docId = message.media_group_id ? `tg_${chatId}_${message.media_group_id}` : `ad_${textHash}`;
-      const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
-      const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
-
-      const adData = {
-        fields: {
-          title: { stringValue: title },
-          description: { stringValue: cleanText },
-          price: { stringValue: formattedPrice },
-          category: { stringValue: category },
-          image: { stringValue: imageUrls.length > 0 ? imageUrls[0] : "" },
-          createdAt: { timestampValue: new Date().toISOString() }
-        }
-      };
-      await fetch(fbUrl, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(adData) });
-    }
-  } catch (fbErr) {}
 }
 
 // ============================================
@@ -218,22 +222,27 @@ async function callTelegram(method, body, env) {
 }
 
 // ============================================
-// 🛑 ONLY THIS FUNCTION WAS CHANGED TO KILL PREMIUM EMOJIS
+// 🛑 ONLY THIS FUNCTION WAS CHANGED
 // ============================================
 function cleanTheText(text) {
   if (!text) return "";
   try {
-    // This is the ULTIMATE V8 Emoji Regex. It physically rips out every single emoji.
-    // If there is no emoji character left, Telegram has no base to attach the Premium ID to.
-    const EMOJI = /[\p{Extended_Pictographic}\p{Emoji_Presentation}]/gu;
-    const PHONE_ET = /(?:\+?251|0)?[\s.\-]*(?:9|7)\d(?:[\s.\-]?\d){8}/g;
+    // 1. Remove URLs and Telegram links
+    let cleaned = text.replace(/https?:\/\/\S+/gi, "").replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "");
+    
+    // 2. Remove phone numbers
+    cleaned = cleaned.replace(/(?:\+?251|0)?[\s.\-]*(?:9|7)\d(?:[\s.\-]?\d){8}/g, "");
+    
+    // 3. Remove @usernames
+    cleaned = cleaned.replace(/@[a-zA-Z0-9_]{2,}/g, "");
 
-    return text
-      .replace(/https?:\/\/\S+/gi, "")
-      .replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "")
-      .replace(/@[a-zA-Z0-9_]{2,}/g, "")
-      .replace(PHONE_ET, "")
-      .replace(EMOJI, "") // Destroys all emojis
+    // 4. ULTIMATE EMOJI KILLER
+    // This forces the bot to ONLY keep Letters (\p{L}), Numbers (\p{N}), Punctuation (\p{P}), Spaces (\p{Z}), and Newlines.
+    // It destroys every single standard and premium emoji.
+    cleaned = cleaned.replace(/[^\p{L}\p{N}\p{P}\p{Z}\n\r]/gu, "");
+
+    // 5. Remove markdown and normalize spacing
+    return cleaned
       .replace(/[*_~`|]/g, "")
       .replace(/[ \t]+/g, " ")
       .replace(/[ \t]+\n/g, "\n")
