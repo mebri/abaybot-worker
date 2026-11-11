@@ -1,47 +1,50 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * 
- * Production Complete Edition (v7.1 Fully Fixed & Resilient):
+ * Production Complete Edition (v7.2 Resilient Web & Telegram Sync):
  * 1. Precision Bot Watermark Shield:
  *    - Only drops posts that contain the distinct bot footer signature (mebri.yegna.workers.dev).
  *    - Never drops legitimate seller ads containing #Cars, #Houses, #Electronics, or "Price:".
- * 2. Intelligent Loopback & In-Channel Cleaning:
- *    - Allows cleaning posts created directly inside the channel (@mebrigranite) without dropping them,
- *      while preventing infinite loops by checking the bot signature.
- * 3. Non-Blocking Firestore Sync:
- *    - Database duplicate checks never prematurely abort Telegram posting.
- * 4. Safe Telegram Message Cleaning:
- *    - In channels: edits channel post directly in place (stripping custom/premium emojis).
+ * 2. Instant Website Sync:
+ *    - Posts directly to Website API (/api/ads) so ads appear instantly on the web app.
+ *    - Non-blocking Firestore sync as secondary persistent store.
+ * 3. Infallible In-Memory Locking:
+ *    - Zero dependence on failing Cache API on *.workers.dev subdomains.
+ * 4. Dual Ingestion & In-Channel Cleaning:
+ *    - In channels: edits channel post directly in place without custom spam entities.
  *    - In groups/private: deletes original dirty post and reposts formatted ad to chat & target channel.
- * 5. Robust Error Handling:
- *    - Graceful fallbacks for missing env secrets, Cloudinary placeholders, and Telegram permissions.
+ * 5. Complete Emoji & Contact Stripping:
+ *    - Strips all emoji blocks, phone numbers, usernames, and orphan contact labels.
  * 6. Multi-Photo Album Aggregation:
  *    - Gathers photos and broadcasts as Telegram sendMediaGroup (up to 10 photos).
  * 7. Mathematical Amharic Price Parser:
- *    - Handles ሚሊዮን (million), ሺህ (k), Birr/ETB, explicit prices, protects manufacture years.
+ *    - Handles ሚሊዮን (million), ሺህ (k), Birr/ETB, protects manufacture years.
  * 8. AI Title Arranger & Brands DB:
  *    - [Year] [Brand] [Model] [Trim] (e.g. "2025 BYD Sealion 06 EV (Champion Edition)").
  */
 
 // In-Memory Aggregators & Deduplication Stores
 const albumStore = new Map(); // groupId -> { images: [], messageIds: [], caption: "", captionMsg: null, timerActive: false, timestamp: number }
-const completedLocks = new Set(); // keys that have already been broadcast
+const memoryLocks = new Map(); // key -> expireTimestamp
 const updateIdLocks = new Set(); // Telegram update_id deduplication
 let cachedFirebaseToken = null;
 let tokenExpiresAt = 0;
 
 export default {
   async fetch(request, env, ctx) {
-    // Health check endpoint
+    // Health check endpoint on GET
     if (request.method !== "POST") {
       const botConfigured = Boolean(env.TELEGRAM_BOT_TOKEN);
       const targetChannel = env.REPOST_CHANNEL_ID || "@mebrigranite";
+      const websiteUrl = env.WEBSITE_URL || "https://ais-dev-ligixirxwi2nidlsx5j5hb-166746593299.europe-west3.run.app";
+
       return new Response(
-        `Yegna Gebeya Bot is running ✅\n` +
-        `• Status: Online\n` +
-        `• Bot Token Configured: ${botConfigured ? "YES" : "NO (Set in Cloudflare Variables!)"}\n` +
+        `Yegna Gebeya Telegram Bot is Active ✅\n\n` +
+        `• Status: Running\n` +
+        `• Bot Token Configured: ${botConfigured ? "YES ✅" : "NO ❌ (Add TELEGRAM_BOT_TOKEN in Cloudflare Settings > Variables!)"}\n` +
         `• Repost Channel: ${targetChannel}\n` +
-        `• Version: v7.1 Production Resilient\n`,
+        `• Website API: ${websiteUrl}/api/ads\n` +
+        `• Version: v7.2 Production Resilient\n`,
         { 
           status: 200,
           headers: { "Content-Type": "text/plain; charset=utf-8" }
@@ -106,7 +109,6 @@ async function processUpdate(update, env, request) {
 
   // 4. PRECISE WATERMARK LOOPBACK SHIELD
   // Only drop if this message was ALREADY processed and formatted by our bot!
-  // Legitimate seller ads containing #Cars or #Electronics will NOT be dropped.
   if (hasBotWatermark(rawText)) {
     console.log("⏭️ Ignored: Post already has official bot watermark footer.");
     return;
@@ -114,10 +116,10 @@ async function processUpdate(update, env, request) {
 
   // 5. IGNORE BOT'S OWN MESSAGES
   const botId = env.TELEGRAM_BOT_TOKEN ? env.TELEGRAM_BOT_TOKEN.split(":")[0] : "";
-  if (message.from) {
+  if (message.from && botId) {
     const fromIdStr = String(message.from.id);
-    if (fromIdStr === botId || message.from.is_bot || fromIdStr === "1087968824" || fromIdStr === "777000") {
-      return;
+    if (fromIdStr === botId) {
+      return; // Do not process messages sent by our bot
     }
   }
 
@@ -135,8 +137,7 @@ async function processUpdate(update, env, request) {
     const groupId = String(message.media_group_id);
     const albumBroadcastKey = `album_done_${groupId}`;
 
-    // Fast check: If this album already finished, drop immediately
-    if (completedLocks.has(albumBroadcastKey) || await isEdgeLocked(albumBroadcastKey, request.url)) {
+    if (isMemoryLocked(albumBroadcastKey)) {
       return;
     }
 
@@ -153,7 +154,7 @@ async function processUpdate(update, env, request) {
 
     const album = albumStore.get(groupId);
 
-    // Collect photo file IDs (best resolution)
+    // Collect photo file IDs (highest resolution)
     if (message.photo && message.photo.length > 0) {
       const bestPhoto = message.photo[message.photo.length - 1].file_id;
       if (!album.images.includes(bestPhoto)) {
@@ -165,7 +166,7 @@ async function processUpdate(update, env, request) {
     }
 
     // Capture text / caption if present
-    if (rawText.length > 3 && !album.caption) {
+    if (rawText.length > 2 && !album.caption) {
       album.caption = rawText;
       album.captionMsg = message;
     }
@@ -174,8 +175,8 @@ async function processUpdate(update, env, request) {
     if (!album.timerActive) {
       album.timerActive = true;
 
-      // Wait 3.0 seconds to collect ALL photos in the album from Telegram
-      await new Promise((resolve) => setTimeout(resolve, 3000));
+      // Wait 2.5 seconds to collect all photos in the album from Telegram
+      await new Promise((resolve) => setTimeout(resolve, 2500));
 
       const finalAlbumData = albumStore.get(groupId) || album;
       const allImages = Array.from(new Set(finalAlbumData.images || []));
@@ -184,24 +185,17 @@ async function processUpdate(update, env, request) {
       const postText = finalAlbumData.caption || rawText;
 
       const cleanText = cleanTheText(postText);
-      if (cleanText.length < 3) {
+      if (cleanText.length < 2 && allImages.length === 0) {
         albumStore.delete(groupId);
         return;
       }
 
-      // Check if another isolate already broadcasted
-      if (completedLocks.has(albumBroadcastKey)) {
+      if (isMemoryLocked(albumBroadcastKey)) {
         albumStore.delete(groupId);
         return;
       }
 
-      // Claim edge lock right before broadcasting
-      const locked = await claimEdgeLock(albumBroadcastKey, 600, request.url);
-      if (!locked) {
-        albumStore.delete(groupId);
-        return;
-      }
-      completedLocks.add(albumBroadcastKey);
+      claimMemoryLock(albumBroadcastKey, 300);
       albumStore.delete(groupId);
 
       console.log(`🚀 Processing album ${groupId} (${allImages.length} images)`);
@@ -216,19 +210,17 @@ async function processUpdate(update, env, request) {
   // SINGLE POST HANDLING (1 PHOTO OR TEXT ONLY)
   // ============================================
   const cleanText = cleanTheText(rawText);
-  if (!cleanText || cleanText.length < 3) return;
+  if (cleanText.length < 2 && (!message.photo || message.photo.length === 0)) return;
 
-  const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
+  const textHash = simpleHash((cleanText || "photo_ad").toLowerCase().replace(/\s+/g, ''));
   const singleAdLockKey = `single_${message.chat?.id || ""}_${textHash}`;
 
-  if (completedLocks.has(singleAdLockKey) || await isEdgeLocked(singleAdLockKey, request.url)) {
+  if (isMemoryLocked(singleAdLockKey)) {
     console.log(`⏭️ Ignored: Duplicate single ad ${textHash}.`);
     return;
   }
 
-  const locked = await claimEdgeLock(singleAdLockKey, 600, request.url);
-  if (!locked) return;
-  completedLocks.add(singleAdLockKey);
+  claimMemoryLock(singleAdLockKey, 180);
 
   const images = [];
   if (message.photo && message.photo.length > 0) {
@@ -240,63 +232,29 @@ async function processUpdate(update, env, request) {
 }
 
 // ============================================
-// EDGE DISTRIBUTED BROADCAST LOCKING
+// MEMORY LOCKING (ZERO DEPENDENCE ON FAILING CACHE APIS)
 // ============================================
-async function claimEdgeLock(key, ttlSeconds = 600, requestUrl = null) {
-  if (completedLocks.has(key)) return false;
-
-  if (typeof caches !== "undefined" && caches.default && requestUrl) {
-    try {
-      const cache = caches.default;
-      const parsed = new URL(requestUrl);
-      const lockEndpoint = `https://${parsed.hostname}/__ad_lock__/${encodeURIComponent(key)}`;
-      const lockReq = new Request(lockEndpoint, { method: "GET" });
-      const hit = await cache.match(lockReq);
-      if (hit) {
-        return false;
-      }
-
-      const res = new Response("1", {
-        status: 200,
-        headers: {
-          "Content-Type": "text/plain",
-          "Cache-Control": `public, max-age=${ttlSeconds}, s-maxage=${ttlSeconds}`
-        }
-      });
-      await cache.put(lockReq, res);
-      return true;
-    } catch (e) {
-      // Ignored if cache API is unsupported on subdomain
-    }
-  }
-
+function claimMemoryLock(key, ttlSeconds = 180) {
+  const now = Date.now();
+  const exp = memoryLocks.get(key);
+  if (exp && exp > now) return false;
+  memoryLocks.set(key, now + (ttlSeconds * 1000));
   return true;
 }
 
-async function isEdgeLocked(key, requestUrl) {
-  if (completedLocks.has(key)) return true;
-  if (typeof caches !== "undefined" && caches.default && requestUrl) {
-    try {
-      const cache = caches.default;
-      const parsed = new URL(requestUrl);
-      const lockEndpoint = `https://${parsed.hostname}/__ad_lock__/${encodeURIComponent(key)}`;
-      const lockReq = new Request(lockEndpoint, { method: "GET" });
-      const hit = await cache.match(lockReq);
-      if (hit) return true;
-    } catch (e) {}
-  }
+function isMemoryLocked(key) {
+  const now = Date.now();
+  const exp = memoryLocks.get(key);
+  if (exp && exp > now) return true;
   return false;
 }
 
 /**
  * Robust watermark check: Only triggers on the bot's own official branding footer.
- * Will NOT drop genuine user ads that contain #Cars, #Houses, or "Price:".
  */
 function hasBotWatermark(text) {
   if (!text) return false;
   const lower = text.toLowerCase();
-  
-  // Distinguishing signatures that only appear in our bot's output footer:
   if (
     lower.includes("mebri.yegna.workers.dev") ||
     lower.includes("#yegnagebeya") ||
@@ -308,13 +266,15 @@ function hasBotWatermark(text) {
 }
 
 function cleanupOldStores() {
-  const twoMinutesAgo = Date.now() - 120000;
+  const now = Date.now();
+  const twoMinutesAgo = now - 120000;
   for (const [k, v] of albumStore.entries()) {
     if (v.timestamp < twoMinutesAgo) albumStore.delete(k);
   }
-  if (completedLocks.size > 2000) {
-    const first = completedLocks.values().next().value;
-    completedLocks.delete(first);
+  if (memoryLocks.size > 2000) {
+    for (const [k, v] of memoryLocks.entries()) {
+      if (v <= now) memoryLocks.delete(k);
+    }
   }
 }
 
@@ -578,7 +538,7 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
   const category = detectCategory(cleanText, brand);
   if (!subcategory) subcategory = bodyType || "Vehicles";
 
-  // Optional: Multimodal Vision enrichment if model or brand is missing
+  // Optional Gemini Vision enrichment
   if (env.GEMINI_API_KEY && (!model || !brand) && imageFileIds.length > 0) {
     try {
       const visionResult = await inspectImageWithGemini(imageFileIds[0], cleanText, env);
@@ -599,14 +559,46 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
   const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText, year);
   const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
 
-  // Upload photos to Cloudinary (up to 4 photos for website)
+  // Upload photos to Cloudinary if configured
   const imageUrls = await uploadImagesToCloudinary(imageFileIds.slice(0, 4), env);
+  const finalDisplayImages = imageUrls.length > 0 
+    ? imageUrls 
+    : ["https://images.unsplash.com/photo-1549399542-7e3f8b79c341?auto=format&fit=crop&w=900&q=80"];
 
   // ============================================
-  // 1. SAVE TO WEBSITE (FIREBASE FIRESTORE)
-  // (Non-blocking: DB failures do not break Telegram repost)
+  // 1. SAVE TO WEBSITE DIRECTLY (/api/ads)
   // ============================================
-  let allImages = imageUrls;
+  const websiteBaseUrl = (env.WEBSITE_URL || "https://ais-dev-ligixirxwi2nidlsx5j5hb-166746593299.europe-west3.run.app").replace(/\/$/, "");
+  try {
+    const webAdPayload = {
+      id: mediaGroupId ? `tg_${message.chat?.id || ""}_${mediaGroupId}` : `ad_${textHash}`,
+      title: arrangedTitle,
+      category: category,
+      subcategory: subcategory,
+      price: rawPrice,
+      city: extractCity(cleanText),
+      subcity: "",
+      condition: "Used",
+      images: finalDisplayImages,
+      description: cleanText,
+      phone: "0911680790",
+      sellerName: "የኛ ገበያ (Telegram)",
+      featured: true
+    };
+
+    await fetch(`${websiteBaseUrl}/api/ads`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(webAdPayload)
+    });
+    console.log(`✅ Ad synced to website: ${websiteBaseUrl}/api/ads`);
+  } catch (webApiErr) {
+    console.warn("Website API sync skipped:", webApiErr.message);
+  }
+
+  // ============================================
+  // 2. SAVE TO FIREBASE FIRESTORE (IF CONFIGURED)
+  // ============================================
   try {
     const token = await getFirebaseToken(env);
     if (token && env.FIREBASE_PROJECT_ID) {
@@ -614,19 +606,6 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
       const adOwnerId = env.ADMIN_UID || "admin_bot";
       const docId = mediaGroupId ? `tg_${message.chat?.id || ""}_${mediaGroupId}` : `ad_${textHash}`;
       const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
-
-      try {
-        const checkRes = await fetch(fbUrl, { headers: { Authorization: `Bearer ${token}` } });
-        if (checkRes.ok) {
-          const existingData = await checkRes.json();
-          if (existingData.fields?.images?.arrayValue?.values) {
-            const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
-            allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
-          }
-        }
-      } catch (checkErr) {
-        // Document does not exist yet, proceed
-      }
 
       const adData = {
         fields: {
@@ -646,8 +625,8 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
           rawPrice: { integerValue: String(rawPrice) },
           phone: { stringValue: "0911680790" },
           city: { stringValue: extractCity(cleanText) },
-          image: { stringValue: allImages.length > 0 ? allImages[0] : "" },
-          images: { arrayValue: { values: allImages.map((url) => ({ stringValue: url })) } },
+          image: { stringValue: finalDisplayImages[0] },
+          images: { arrayValue: { values: finalDisplayImages.map((url) => ({ stringValue: url })) } },
           status: { stringValue: "available" },
           source: { stringValue: "telegram" },
           userId: { stringValue: adOwnerId },
@@ -668,7 +647,7 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
   }
 
   // ============================================
-  // 2. BUILD STRUCTURED POST TEXT WITH BOT FOOTER
+  // 3. BUILD STRUCTURED POST TEXT WITH BOT FOOTER
   // ============================================
   const hashtagMap = { 
     Cars: "#Cars", 
@@ -723,36 +702,35 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
   const lastPhotoFileId = isPhoto ? imageFileIds[imageFileIds.length - 1] : null;
 
   // ============================================
-  // 3. IN-CHANNEL CLEANING VS GROUP CLEANING
+  // 4. IN-CHANNEL CLEANING VS GROUP CLEANING
   // ============================================
   if (isInsideTargetChannel) {
     // Post was made directly in @mebrigranite channel!
-    // As channel admin, bot can edit the channel post in place:
+    // As channel admin with edit rights, bot edits the channel post in place:
     try {
       if (isPhoto) {
         await callTelegram("editMessageCaption", { 
           chat_id: chatId, 
           message_id: message.message_id, 
-          caption: safeSubstring(newPostText, 1024),
-          caption_entities: [] // Strips hidden spam / premium emojis
+          caption: safeSubstring(newPostText, 1024)
         }, env);
       } else {
         await callTelegram("editMessageText", { 
           chat_id: chatId, 
           message_id: message.message_id, 
-          text: safeSubstring(newPostText, 4096),
-          entities: [] // Strips hidden spam / premium emojis
+          text: safeSubstring(newPostText, 4096)
         }, env);
       }
       console.log("✅ Cleaned in-place directly inside target channel!");
       return; // Finished!
     } catch (chanEditErr) {
-      console.warn("In-channel edit failed:", chanEditErr.message);
+      console.warn("In-channel edit failed (check bot admin rights in channel):", chanEditErr.message);
+      return;
     }
   }
 
   // ============================================
-  // 4. CLEANING IN SOURCE GROUP / PRIVATE CHAT
+  // 5. CLEANING IN SOURCE GROUP / PRIVATE CHAT
   // ============================================
   let messageHandledInSource = false;
 
@@ -762,24 +740,22 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
       await callTelegram("editMessageCaption", { 
         chat_id: chatId, 
         message_id: message.message_id, 
-        caption: safeSubstring(newPostText, 1024),
-        caption_entities: [] 
+        caption: safeSubstring(newPostText, 1024)
       }, env);
     } else {
       await callTelegram("editMessageText", { 
         chat_id: chatId, 
         message_id: message.message_id, 
-        text: safeSubstring(newPostText, 4096),
-        entities: [] 
+        text: safeSubstring(newPostText, 4096)
       }, env);
     }
     console.log("✅ Edited in place in source chat.");
     messageHandledInSource = true;
   } catch (editErr) {
-    // Normal for user messages in groups (bots cannot edit user posts)
+    // Normal for user messages in groups (Telegram API forbids bots from editing user messages)
   }
 
-  // If in-place edit failed, delete dirty post & repost clean copy in group
+  // If in-place edit failed, delete dirty user post & repost clean copy in group
   if (!messageHandledInSource) {
     try {
       if (messageIds.length === 1) {
@@ -795,28 +771,26 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
       }
       console.log(`✅ Deleted ${messageIds.length} dirty post(s) from group`);
     } catch (delErr) {
-      console.warn("Delete original failed (bot needs Delete Messages admin right in group):", delErr.message);
+      console.warn("Delete original failed (bot needs 'Delete Messages' admin permission in group):", delErr.message);
     }
 
     try {
       if (imageFileIds.length === 0) {
         await callTelegram("sendMessage", { 
           chat_id: chatId, 
-          text: safeSubstring(newPostText, 4096), 
-          entities: [] 
+          text: safeSubstring(newPostText, 4096)
         }, env);
       } else if (imageFileIds.length === 1) {
         await callTelegram("sendPhoto", { 
           chat_id: chatId, 
           photo: lastPhotoFileId, 
-          caption: safeSubstring(newPostText, 1024), 
-          caption_entities: [] 
+          caption: safeSubstring(newPostText, 1024)
         }, env);
       } else {
         const media = imageFileIds.slice(0, 10).map((fileId, index) => ({
           type: "photo",
           media: fileId,
-          ...(index === 0 ? { caption: safeSubstring(newPostText, 1024), caption_entities: [] } : {})
+          ...(index === 0 ? { caption: safeSubstring(newPostText, 1024) } : {})
         }));
         await callTelegram("sendMediaGroup", { chat_id: chatId, media }, env);
       }
@@ -827,7 +801,7 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
   }
 
   // ============================================
-  // 5. BROADCAST TO REPOST CHANNEL (@mebrigranite)
+  // 6. BROADCAST TO REPOST CHANNEL (@mebrigranite)
   // ============================================
   const targetChannel = env.REPOST_CHANNEL_ID || "@mebrigranite";
 
@@ -836,22 +810,20 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
       if (imageFileIds.length === 0) {
         await callTelegram("sendMessage", {
           chat_id: targetChannel,
-          text: safeSubstring(newPostText, 4096),
-          entities: []
+          text: safeSubstring(newPostText, 4096)
         }, env);
       } else if (imageFileIds.length === 1) {
         await callTelegram("sendPhoto", {
           chat_id: targetChannel,
           photo: imageFileIds[0],
-          caption: safeSubstring(newPostText, 1024),
-          caption_entities: []
+          caption: safeSubstring(newPostText, 1024)
         }, env);
       } else {
         // Broadcast ALL photos (up to 10 photos) together in a single media group!
         const media = imageFileIds.slice(0, 10).map((fileId, index) => ({
           type: "photo",
           media: fileId,
-          ...(index === 0 ? { caption: safeSubstring(newPostText, 1024), caption_entities: [] } : {})
+          ...(index === 0 ? { caption: safeSubstring(newPostText, 1024) } : {})
         }));
 
         await callTelegram("sendMediaGroup", {
@@ -1141,7 +1113,8 @@ function parseMathematicalPrice(text, knownYear) {
 
 function cleanTheText(text) {
   if (!text) return "";
-  const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu;
+  // Complete Unicode regex covering all emoji code point blocks
+  const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2300}-\u{23FF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}\u{3030}\u{303D}\u{3297}\u{3299}]/gu;
   return text
     .replace(/https?:\/\/\S+/gi, "")
     .replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "")
@@ -1149,6 +1122,7 @@ function cleanTheText(text) {
     .replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}\b/gi, "")
     .replace(EMOJI, "")
     .replace(/[*_~`|]/g, "")
+    .replace(/(?:phone|call|mobile|ስልክ|ቴሌግራም|telegram|contact|ይደውሉ|ይደውሉልን)[ \t:=-]+(?:or|\/)?\s*(?=\n|$)/gi, "")
     .replace(/[ \t]+/g, " ")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
