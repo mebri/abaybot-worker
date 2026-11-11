@@ -1,19 +1,26 @@
 /**
- * Yegna Gebeya Telegram Bot - Cloudflare Worker (Single-File Complete Edition)
+ * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * 
- * 1. Dual Ingestion: Listens to Channel posts (channel_post) and Group/Private messages.
- * 2. Multi-Photo Album Aggregator: Collects ALL photos belonging to a media_group_id over 
- *    a 3-second window, broadcasting them as a single Telegram `sendMediaGroup` (up to 10 photos).
- * 3. Edge Distributed Lock: Cloudflare `caches.default` prevents duplicate worker executions.
- * 4. Loopback & Watermark Shield: Ignores posts from target channel (@mebrigranite) and bot signatures.
- * 5. Strict Firestore Duplicate Check: Drops duplicates created within the last 5 minutes, 
- *    merging new photo URLs with existing ones.
- * 6. Dual-Mode Chat Clean: Attempts in-place edit with `caption_entities: []` to strip Telegram Premium
- *    custom emojis; if edit fails, deletes original dirty posts and reposts cleanly.
- * 7. Broadcast to Repost Channel: Posts clean formatted ad with media group to REPOST_CHANNEL_ID.
- * 8. Mathematical Amharic Price Parser: ሚሊዮን (million), ሺህ (k), Birr, explicit prices; protects manufacture years.
- * 9. AI Title Arranger & Brands DB: [Year] [Brand] [Model] [Trim] (e.g., "2025 BYD Sealion 06 EV (Champion Edition)").
- * 10. Gemini Vision & Cloudinary: Cloudinary CDN upload + multimodal inspection fallback.
+ * Production Complete Edition (v7.1 Fully Fixed & Resilient):
+ * 1. Precision Bot Watermark Shield:
+ *    - Only drops posts that contain the distinct bot footer signature (mebri.yegna.workers.dev).
+ *    - Never drops legitimate seller ads containing #Cars, #Houses, #Electronics, or "Price:".
+ * 2. Intelligent Loopback & In-Channel Cleaning:
+ *    - Allows cleaning posts created directly inside the channel (@mebrigranite) without dropping them,
+ *      while preventing infinite loops by checking the bot signature.
+ * 3. Non-Blocking Firestore Sync:
+ *    - Database duplicate checks never prematurely abort Telegram posting.
+ * 4. Safe Telegram Message Cleaning:
+ *    - In channels: edits channel post directly in place (stripping custom/premium emojis).
+ *    - In groups/private: deletes original dirty post and reposts formatted ad to chat & target channel.
+ * 5. Robust Error Handling:
+ *    - Graceful fallbacks for missing env secrets, Cloudinary placeholders, and Telegram permissions.
+ * 6. Multi-Photo Album Aggregation:
+ *    - Gathers photos and broadcasts as Telegram sendMediaGroup (up to 10 photos).
+ * 7. Mathematical Amharic Price Parser:
+ *    - Handles ሚሊዮን (million), ሺህ (k), Birr/ETB, explicit prices, protects manufacture years.
+ * 8. AI Title Arranger & Brands DB:
+ *    - [Year] [Brand] [Model] [Trim] (e.g. "2025 BYD Sealion 06 EV (Champion Edition)").
  */
 
 // In-Memory Aggregators & Deduplication Stores
@@ -25,18 +32,32 @@ let tokenExpiresAt = 0;
 
 export default {
   async fetch(request, env, ctx) {
+    // Health check endpoint
     if (request.method !== "POST") {
-      return new Response("Yegna Gebeya Bot is running ✅ (Single-File Complete Engine v7.0 Active)", { 
-        status: 200,
-        headers: { "Content-Type": "text/plain; charset=utf-8" }
-      });
+      const botConfigured = Boolean(env.TELEGRAM_BOT_TOKEN);
+      const targetChannel = env.REPOST_CHANNEL_ID || "@mebrigranite";
+      return new Response(
+        `Yegna Gebeya Bot is running ✅\n` +
+        `• Status: Online\n` +
+        `• Bot Token Configured: ${botConfigured ? "YES" : "NO (Set in Cloudflare Variables!)"}\n` +
+        `• Repost Channel: ${targetChannel}\n` +
+        `• Version: v7.1 Production Resilient\n`,
+        { 
+          status: 200,
+          headers: { "Content-Type": "text/plain; charset=utf-8" }
+        }
+      );
     }
 
     try {
       const update = await request.json();
       
       // Fast ACK to Telegram: Return 200 OK immediately so Telegram never retries
-      ctx.waitUntil(processUpdateSafe(update, env, request));
+      if (ctx && ctx.waitUntil) {
+        ctx.waitUntil(processUpdateSafe(update, env, request));
+      } else {
+        processUpdateSafe(update, env, request);
+      }
       return new Response("OK", { status: 200 });
     } catch (error) {
       console.error("Webhook parse error:", error.message);
@@ -80,34 +101,18 @@ async function processUpdate(update, env, request) {
     return;
   }
 
-  // 3. TARGET CHANNEL LOOPBACK SHIELD
-  // Prevent infinite loops from reposting into or from our own target channel (@mebrigranite)
-  const targetChannelRaw = env.REPOST_CHANNEL_ID || "@mebrigranite";
-  const targetClean = targetChannelRaw.replace("@", "").toLowerCase();
+  // 3. EXTRACT TEXT & CAPTION
+  const rawText = (message.text || message.caption || "").trim();
 
-  const chatUser = (message.chat?.username || "").toLowerCase();
-  const chatIdStr = String(message.chat?.id || "");
-  if (chatUser === targetClean || chatIdStr === targetClean) {
+  // 4. PRECISE WATERMARK LOOPBACK SHIELD
+  // Only drop if this message was ALREADY processed and formatted by our bot!
+  // Legitimate seller ads containing #Cars or #Electronics will NOT be dropped.
+  if (hasBotWatermark(rawText)) {
+    console.log("⏭️ Ignored: Post already has official bot watermark footer.");
     return;
   }
 
-  if (message.sender_chat) {
-    const sUser = (message.sender_chat.username || "").toLowerCase();
-    const sId = String(message.sender_chat.id || "");
-    if (sUser === targetClean || sId === targetClean) {
-      return;
-    }
-  }
-
-  if (message.forward_from_chat) {
-    const fUser = (message.forward_from_chat.username || "").toLowerCase();
-    const fId = String(message.forward_from_chat.id || "");
-    if (fUser === targetClean || fId === targetClean) {
-      return;
-    }
-  }
-
-  // 4. IGNORE BOT MESSAGES
+  // 5. IGNORE BOT'S OWN MESSAGES
   const botId = env.TELEGRAM_BOT_TOKEN ? env.TELEGRAM_BOT_TOKEN.split(":")[0] : "";
   if (message.from) {
     const fromIdStr = String(message.from.id);
@@ -116,15 +121,12 @@ async function processUpdate(update, env, request) {
     }
   }
 
-  // 5. EXTRACT TEXT & CAPTION
-  const rawText = (message.text || message.caption || "").trim();
-
-  // 6. STRICT BOT WATERMARK SHIELD
-  // If text already contains bot signatures, it is already formatted/posted!
-  if (hasBotWatermark(rawText)) {
-    console.log("⏭️ Ignored: Bot watermark detected.");
-    return;
-  }
+  // 6. TARGET CHANNEL CLEANING AWARENESS
+  const targetChannelRaw = env.REPOST_CHANNEL_ID || "@mebrigranite";
+  const targetClean = targetChannelRaw.replace("@", "").toLowerCase();
+  const currentChatUser = (message.chat?.username || "").toLowerCase();
+  const currentChatIdStr = String(message.chat?.id || "");
+  const isInsideTargetChannel = (currentChatUser === targetClean || currentChatIdStr === targetClean);
 
   // ============================================
   // MULTI-PHOTO ALBUM AGGREGATOR
@@ -183,7 +185,6 @@ async function processUpdate(update, env, request) {
 
       const cleanText = cleanTheText(postText);
       if (cleanText.length < 3) {
-        console.log(`⏭️ Dropping album ${groupId}: No valid text caption found.`);
         albumStore.delete(groupId);
         return;
       }
@@ -203,8 +204,8 @@ async function processUpdate(update, env, request) {
       completedLocks.add(albumBroadcastKey);
       albumStore.delete(groupId);
 
-      console.log(`🚀 Processing album ${groupId} with ALL ${allImages.length} images & ${messageIds.length} message IDs`);
-      await processFinalAd(postMsg, allImages, messageIds, cleanText, env, groupId);
+      console.log(`🚀 Processing album ${groupId} (${allImages.length} images)`);
+      await processFinalAd(postMsg, allImages, messageIds, cleanText, env, groupId, isInsideTargetChannel);
     }
 
     cleanupOldStores();
@@ -234,7 +235,7 @@ async function processUpdate(update, env, request) {
     images.push(message.photo[message.photo.length - 1].file_id);
   }
 
-  await processFinalAd(message, images, [message.message_id], cleanText, env, null);
+  await processFinalAd(message, images, [message.message_id], cleanText, env, null, isInsideTargetChannel);
   cleanupOldStores();
 }
 
@@ -252,7 +253,7 @@ async function claimEdgeLock(key, ttlSeconds = 600, requestUrl = null) {
       const lockReq = new Request(lockEndpoint, { method: "GET" });
       const hit = await cache.match(lockReq);
       if (hit) {
-        return false; // Already locked by another worker instance!
+        return false;
       }
 
       const res = new Response("1", {
@@ -264,7 +265,9 @@ async function claimEdgeLock(key, ttlSeconds = 600, requestUrl = null) {
       });
       await cache.put(lockReq, res);
       return true;
-    } catch (e) {}
+    } catch (e) {
+      // Ignored if cache API is unsupported on subdomain
+    }
   }
 
   return true;
@@ -285,22 +288,19 @@ async function isEdgeLocked(key, requestUrl) {
   return false;
 }
 
+/**
+ * Robust watermark check: Only triggers on the bot's own official branding footer.
+ * Will NOT drop genuine user ads that contain #Cars, #Houses, or "Price:".
+ */
 function hasBotWatermark(text) {
   if (!text) return false;
   const lower = text.toLowerCase();
+  
+  // Distinguishing signatures that only appear in our bot's output footer:
   if (
     lower.includes("mebri.yegna.workers.dev") ||
-    lower.includes("@mebrigranite") ||
-    lower.includes("0911680790") ||
-    lower.includes("yegna gebeya") ||
-    lower.includes("የኛ ገበያ") ||
     lower.includes("#yegnagebeya") ||
-    lower.includes("📝 title:") ||
-    lower.includes("💰 price:") ||
-    lower.includes("📂 category:") ||
-    lower.includes("website: mebri") ||
-    lower.includes("✈️ telegram: @mebrigranite") ||
-    /#(cars|houses|rentals|electronics|furniture|clothes|labor|ምንአለሽ_ተራ|other)\b/i.test(lower)
+    (lower.includes("የኛ ገበያ") && lower.includes("@mebrigranite") && lower.includes("0911680790"))
   ) {
     return true;
   }
@@ -328,6 +328,11 @@ function simpleHash(str) {
 }
 
 async function callTelegram(method, body, env) {
+  if (!env.TELEGRAM_BOT_TOKEN) {
+    console.error(`❌ TELEGRAM_BOT_TOKEN is missing! Set it in Cloudflare Dashboard Variables.`);
+    throw new Error("TELEGRAM_BOT_TOKEN is missing");
+  }
+
   const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -568,7 +573,7 @@ const ELECTRONICS_DATABASE = [
 // ============================================
 // MAIN PROCESSING & AD BROADCASTER
 // ============================================
-async function processFinalAd(message, imageFileIds, messageIds, cleanText, env, mediaGroupId = null) {
+async function processFinalAd(message, imageFileIds, messageIds, cleanText, env, mediaGroupId = null, isInsideTargetChannel = false) {
   let { brand, model, year, trim, bodyType, fuelType, transmission, subcategory } = detectBrandModelYear(cleanText);
   const category = detectCategory(cleanText, brand);
   if (!subcategory) subcategory = bodyType || "Vehicles";
@@ -594,12 +599,12 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
   const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText, year);
   const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
 
-  // Upload photos to Cloudinary (up to 4 photos for the website)
+  // Upload photos to Cloudinary (up to 4 photos for website)
   const imageUrls = await uploadImagesToCloudinary(imageFileIds.slice(0, 4), env);
 
   // ============================================
-  // 1. SAVE TO WEBSITE (FIREBASE FIRESTORE) FIRST
-  // (With Strict 5-Minute Duplicate & Merge Check)
+  // 1. SAVE TO WEBSITE (FIREBASE FIRESTORE)
+  // (Non-blocking: DB failures do not break Telegram repost)
   // ============================================
   let allImages = imageUrls;
   try {
@@ -614,22 +619,13 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
         const checkRes = await fetch(fbUrl, { headers: { Authorization: `Bearer ${token}` } });
         if (checkRes.ok) {
           const existingData = await checkRes.json();
-          // ✅ STRICT DUPLICATE CHECK: If created in last 5 minutes, ignore it!
-          if (existingData.fields?.createdAt?.timestampValue) {
-            const createdTime = new Date(existingData.fields.createdAt.timestampValue).getTime();
-            if (Date.now() - createdTime < 300000) { // 5 minutes
-              console.log("⏭️ Ignored: Duplicate text detected on website.");
-              return; // Stop processing, don't repost
-            }
-          }
-
           if (existingData.fields?.images?.arrayValue?.values) {
             const existingUrls = existingData.fields.images.arrayValue.values.map(v => v.stringValue);
             allImages = Array.from(new Set([...existingUrls, ...imageUrls]));
           }
         }
       } catch (checkErr) {
-        // Doc doesn't exist yet, proceed
+        // Document does not exist yet, proceed
       }
 
       const adData = {
@@ -668,11 +664,11 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
       console.log("✅ Saved to Website (Firebase Firestore)");
     }
   } catch (fbErr) {
-    console.error("Firebase Error:", fbErr.message);
+    console.warn("Firebase sync skipped:", fbErr.message);
   }
 
   // ============================================
-  // 2. BUILD STRUCTURED POST TEXT
+  // 2. BUILD STRUCTURED POST TEXT WITH BOT FOOTER
   // ============================================
   const hashtagMap = { 
     Cars: "#Cars", 
@@ -727,35 +723,63 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
   const lastPhotoFileId = isPhoto ? imageFileIds[imageFileIds.length - 1] : null;
 
   // ============================================
-  // 3. TRY TO EDIT IN-PLACE IN SOURCE CHAT
-  // (Forces stripping hidden custom & premium entities)
+  // 3. IN-CHANNEL CLEANING VS GROUP CLEANING
+  // ============================================
+  if (isInsideTargetChannel) {
+    // Post was made directly in @mebrigranite channel!
+    // As channel admin, bot can edit the channel post in place:
+    try {
+      if (isPhoto) {
+        await callTelegram("editMessageCaption", { 
+          chat_id: chatId, 
+          message_id: message.message_id, 
+          caption: safeSubstring(newPostText, 1024),
+          caption_entities: [] // Strips hidden spam / premium emojis
+        }, env);
+      } else {
+        await callTelegram("editMessageText", { 
+          chat_id: chatId, 
+          message_id: message.message_id, 
+          text: safeSubstring(newPostText, 4096),
+          entities: [] // Strips hidden spam / premium emojis
+        }, env);
+      }
+      console.log("✅ Cleaned in-place directly inside target channel!");
+      return; // Finished!
+    } catch (chanEditErr) {
+      console.warn("In-channel edit failed:", chanEditErr.message);
+    }
+  }
+
+  // ============================================
+  // 4. CLEANING IN SOURCE GROUP / PRIVATE CHAT
   // ============================================
   let messageHandledInSource = false;
+
+  // Try in-place edit first
   try {
     if (isPhoto) {
       await callTelegram("editMessageCaption", { 
         chat_id: chatId, 
         message_id: message.message_id, 
         caption: safeSubstring(newPostText, 1024),
-        caption_entities: [] // Strips Telegram Premium / custom emoji entities
+        caption_entities: [] 
       }, env);
     } else {
       await callTelegram("editMessageText", { 
         chat_id: chatId, 
         message_id: message.message_id, 
         text: safeSubstring(newPostText, 4096),
-        entities: [] // Strips Telegram Premium / custom emoji entities
+        entities: [] 
       }, env);
     }
     console.log("✅ Edited in place in source chat.");
     messageHandledInSource = true;
   } catch (editErr) {
-    console.log("⚠️ In-place edit skipped or failed:", editErr.message);
+    // Normal for user messages in groups (bots cannot edit user posts)
   }
 
-  // ============================================
-  // 4. IF EDIT FAILED, DELETE ORIGINAL & REPOST
-  // ============================================
+  // If in-place edit failed, delete dirty post & repost clean copy in group
   if (!messageHandledInSource) {
     try {
       if (messageIds.length === 1) {
@@ -764,15 +788,14 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
         try {
           await callTelegram("deleteMessages", { chat_id: chatId, message_ids: messageIds }, env);
         } catch (delManyErr) {
-          // Fallback to sequential deletion if deleteMessages is unsupported
           for (const mid of messageIds) {
             await callTelegram("deleteMessage", { chat_id: chatId, message_id: mid }, env).catch(() => {});
           }
         }
       }
-      console.log(`✅ Deleted ${messageIds.length} original dirty post(s)`);
+      console.log(`✅ Deleted ${messageIds.length} dirty post(s) from group`);
     } catch (delErr) {
-      console.log("⚠️ Could not delete original dirty post (requires bot admin delete rights):", delErr.message);
+      console.warn("Delete original failed (bot needs Delete Messages admin right in group):", delErr.message);
     }
 
     try {
@@ -790,7 +813,6 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
           caption_entities: [] 
         }, env);
       } else {
-        // Multi-photo album in source chat
         const media = imageFileIds.slice(0, 10).map((fileId, index) => ({
           type: "photo",
           media: fileId,
@@ -805,15 +827,11 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
   }
 
   // ============================================
-  // 5. BROADCAST TO REPOST CHANNEL
+  // 5. BROADCAST TO REPOST CHANNEL (@mebrigranite)
   // ============================================
   const targetChannel = env.REPOST_CHANNEL_ID || "@mebrigranite";
-  const targetClean = targetChannel.replace("@", "").toLowerCase();
-  const currentChatClean = (message.chat?.username || "").toLowerCase();
-  const currentChatIdStr = String(message.chat?.id || "");
 
-  // Avoid reposting if current message is already in target channel
-  if (targetChannel && currentChatClean !== targetClean && currentChatIdStr !== targetClean) {
+  if (targetChannel && !isInsideTargetChannel) {
     try {
       if (imageFileIds.length === 0) {
         await callTelegram("sendMessage", {
@@ -843,7 +861,7 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
       }
       console.log(`✅ Broadcasted Clean Ad to Channel ${targetChannel} (${imageFileIds.length} photos)`);
     } catch (chErr) {
-      console.error("❌ Repost Channel Error:", chErr.message);
+      console.error(`❌ Repost Channel Error (${targetChannel}):`, chErr.message);
     }
   }
 }
@@ -1123,7 +1141,6 @@ function parseMathematicalPrice(text, knownYear) {
 
 function cleanTheText(text) {
   if (!text) return "";
-  // Strips emojis and decorative symbols without harming Ge'ez / Amharic letters (\u1200-\u137F)
   const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu;
   return text
     .replace(/https?:\/\/\S+/gi, "")
@@ -1149,7 +1166,9 @@ function extractCity(text) {
 }
 
 async function uploadImagesToCloudinary(imageFileIds, env) {
-  if (!env.CLOUDINARY_CLOUD_NAME || !env.CLOUDINARY_UPLOAD_PRESET || !imageFileIds || imageFileIds.length === 0) return [];
+  if (!env.CLOUDINARY_CLOUD_NAME || env.CLOUDINARY_CLOUD_NAME === "your_cloud_name" || !env.CLOUDINARY_UPLOAD_PRESET || !imageFileIds || imageFileIds.length === 0) {
+    return [];
+  }
   const urls = [];
   for (const fileId of imageFileIds.slice(0, 4)) {
     try {
@@ -1217,36 +1236,41 @@ async function getFirebaseToken(env) {
   const privateKey = (env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
   if (!clientEmail || !privateKey) return "";
 
-  const header = { alg: "RS256", typ: "JWT" };
-  const payload = { 
-    iss: clientEmail, 
-    scope: "https://www.googleapis.com/auth/datastore", 
-    aud: "https://oauth2.googleapis.com/token", 
-    iat: now, 
-    exp: now + 3600 
-  };
-  const encHeader = base64UrlEncode(JSON.stringify(header));
-  const encPayload = base64UrlEncode(JSON.stringify(payload));
-  const signingInput = `${encHeader}.${encPayload}`;
-  const pemContents = privateKey.replace("-----BEGIN PRIVATE KEY-----", "").replace("-----END PRIVATE KEY-----", "").replace(/\s/g, "");
-  const binaryDer = Uint8Array.from(atob(pemContents), (c) => c.charCodeAt(0));
-  const cryptoKey = await crypto.subtle.importKey("pkcs8", binaryDer, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
-  const sigBuffer = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", cryptoKey, new TextEncoder().encode(signingInput));
-  const sigBytes = new Uint8Array(sigBuffer);
-  let binary = "";
-  for (let i = 0; i < sigBytes.length; i++) binary += String.fromCharCode(sigBytes[i]);
-  const signature = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  const jwt = `${signingInput}.${signature}`;
-  const tokRes = await fetch("https://oauth2.googleapis.com/token", { 
-    method: "POST", 
-    headers: { "Content-Type": "application/x-www-form-urlencoded" }, 
-    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}` 
-  });
-  const tokData = await tokRes.json();
-  if (!tokData.access_token) throw new Error("Token Error: " + JSON.stringify(tokData));
-  cachedFirebaseToken = tokData.access_token;
-  tokenExpiresAt = now + (tokData.expires_in || 3600);
-  return cachedFirebaseToken;
+  try {
+    const header = { alg: "RS256", typ: "JWT" };
+    const payload = { 
+      iss: clientEmail, 
+      scope: "https://www.googleapis.com/auth/datastore", 
+      aud: "https://oauth2.googleapis.com/token", 
+      iat: now, 
+      exp: now + 3600 
+    };
+    const encHeader = base64UrlEncode(JSON.stringify(header));
+    const encPayload = base64UrlEncode(JSON.stringify(payload));
+    const signingInput = `${encHeader}.${encPayload}`;
+    const pemContents = privateKey.replace("-----BEGIN PRIVATE KEY-----", "").replace("-----END PRIVATE KEY-----", "").replace(/\s/g, "");
+    const binaryDer = Uint8Array.from(atob(pemContents), (c) => c.charCodeAt(0));
+    const cryptoKey = await crypto.subtle.importKey("pkcs8", binaryDer, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
+    const sigBuffer = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", cryptoKey, new TextEncoder().encode(signingInput));
+    const sigBytes = new Uint8Array(sigBuffer);
+    let binary = "";
+    for (let i = 0; i < sigBytes.length; i++) binary += String.fromCharCode(sigBytes[i]);
+    const signature = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    const jwt = `${signingInput}.${signature}`;
+    const tokRes = await fetch("https://oauth2.googleapis.com/token", { 
+      method: "POST", 
+      headers: { "Content-Type": "application/x-www-form-urlencoded" }, 
+      body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}` 
+    });
+    const tokData = await tokRes.json();
+    if (!tokData.access_token) return "";
+    cachedFirebaseToken = tokData.access_token;
+    tokenExpiresAt = now + (tokData.expires_in || 3600);
+    return cachedFirebaseToken;
+  } catch (err) {
+    console.warn("Failed to generate Firebase token:", err.message);
+    return "";
+  }
 }
 
 function base64UrlEncode(str) {
