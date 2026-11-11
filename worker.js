@@ -1,5 +1,5 @@
 /**
- * Yegna Gebeya Telegram Bot - FINAL CLEAN & POST
+ * Yegna Gebeya Telegram Bot - Delete & Repost (Forced Clean)
  */
 
 const albumCache = new Map();
@@ -31,10 +31,7 @@ async function processUpdate(update, env) {
     if (processedUpdates.size > 1000) processedUpdates.clear();
   }
 
-  if (!env.TELEGRAM_BOT_TOKEN || !env.REPOST_CHANNEL_ID) {
-    await sendErrorToChat(message.chat.id, "❌ MISSING ENV VARS\n\nAdd TELEGRAM_BOT_TOKEN and REPOST_CHANNEL_ID in Cloudflare.", env);
-    return;
-  }
+  if (!env.TELEGRAM_BOT_TOKEN || !env.REPOST_CHANNEL_ID) return;
 
   try {
     const botId = env.TELEGRAM_BOT_TOKEN.split(":")[0];
@@ -85,7 +82,6 @@ async function processUpdate(update, env) {
 
   } catch (globalError) {
     console.error("GLOBAL CRASH:", globalError);
-    await sendErrorToChat(message.chat.id, `🚨 BOT CRASHED 🚨\n\nError: ${globalError.message}`, env);
   }
 }
 
@@ -93,7 +89,6 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   const messageText = (message.text || message.caption || "").trim();
   const cleanText = cleanTheText(messageText);
   
-  // If cleaning failed and returned empty, fallback to raw text but strip entities later
   if (!cleanText || cleanText.length < 3) return;
 
   const category = detectCategory(cleanText);
@@ -101,7 +96,6 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   const { formattedPrice } = parseMathematicalPrice(cleanText);
   const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
 
-  // 🛑 DEFENSE 2: IGNORE DUPLICATE ADS (1-Hour Block)
   const dedupKey = message.media_group_id ? String(message.media_group_id) : textHash;
   if (recentAds.has(dedupKey)) {
     const lastTime = recentAds.get(dedupKey);
@@ -110,7 +104,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   recentAds.set(dedupKey, Date.now());
 
   // ============================================
-  // 1. SAVE TO FIREBASE FIRST (So it never fails)
+  // 1. SAVE TO FIREBASE FIRST
   // ============================================
   try {
     const token = await getFirebaseToken(env);
@@ -130,15 +124,20 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
           createdAt: { timestampValue: new Date().toISOString() }
         }
       };
-      await fetch(fbUrl, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(adData) });
-      console.log("✅ Saved to Website (Firebase)");
+      const fbRes = await fetch(fbUrl, { method: "PATCH", headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: JSON.stringify(adData) });
+      if (!fbRes.ok) {
+        const err = await fbRes.text();
+        await sendErrorToChat(message.chat.id, `❌ WEBSITE SAVE FAILED\n\n${err.substring(0, 200)}`, env);
+      }
+    } else {
+      await sendErrorToChat(message.chat.id, `❌ FIREBASE TOKEN EMPTY\n\nCheck your Cloudflare Variables (FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY)`, env);
     }
   } catch (fbErr) {
-    console.log("Firebase Error (Ignored):", fbErr.message);
+    await sendErrorToChat(message.chat.id, `❌ FIREBASE CRASH\n\n${fbErr.message}`, env);
   }
 
   // ============================================
-  // 2. BUILD THE FORMATTED MESSAGE
+  // 2. BUILD NEW FORMATTED MESSAGE
   // ============================================
   const hashtagMap = { Cars: "#Cars", Houses: "#Houses", Rentals: "#Rentals", Electronics: "#Electronics", Furniture: "#Furniture", Clothes: "#Clothes", "Labor & Services": "#Labor", "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ" };
   const hashtag = hashtagMap[category] || "#Other";
@@ -159,57 +158,43 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   newPostText += `${hashtag}`;
 
   // ============================================
-  // 3. POST TO TELEGRAM CHANNEL
+  // 3. DELETE ORIGINAL & POST NEW (Bypasses edit bug)
   // ============================================
   const chatId = message.chat.id;
   const targetChannel = env.REPOST_CHANNEL_ID;
   const targetClean = String(targetChannel).replace("@", "").toLowerCase();
   const isTargetChannel = String(chatId) === targetClean || (message.chat.username || "").toLowerCase() === targetClean;
 
-  if (isTargetChannel) {
-    // If posting in channel, try to edit in place to destroy premium emojis
-    let messageHandled = false;
-    try {
-      if (imageFileIds.length > 0) {
-        await callTelegram("editMessageCaption", {
-          chat_id: chatId, message_id: message.message_id,
-          caption: safeSubstring(newPostText, 1024), 
-          caption_entities: [] // Forces downgrade of premium emojis
-        }, env);
-      } else {
-        await callTelegram("editMessageText", {
-          chat_id: chatId, message_id: message.message_id,
-          text: safeSubstring(newPostText, 4096), 
-          entities: [] // Forces downgrade
-        }, env);
-      }
-      messageHandled = true;
-    } catch (e) {
-      console.log("Edit failed, reposting...");
+  // Delete original messages (whether in group or channel)
+  try {
+    if (messageIds.length === 1) {
+      await callTelegram("deleteMessage", { chat_id: chatId, message_id: messageIds[0] }, env);
+    } else {
+      await callTelegram("deleteMessages", { chat_id: chatId, message_ids: messageIds }, env);
     }
+  } catch (e) {
+    console.log("Could not delete original (bot needs admin):", e.message);
+  }
 
-    if (!messageHandled) {
-      try { await callTelegram("deleteMessage", { chat_id: chatId, message_id: message.message_id }, env); } catch (e) {}
-      
-      if (imageFileIds.length > 0) {
-        await callTelegram("sendPhoto", { chat_id: chatId, photo: imageFileIds[0], caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
-      } else {
-        await callTelegram("sendMessage", { chat_id: chatId, text: safeSubstring(newPostText, 4096), entities: [] }, env);
-      }
+  // Send the newly formatted post
+  const finalChatId = isTargetChannel ? chatId : targetChannel;
+  try {
+    if (imageFileIds.length > 0) {
+      await callTelegram("sendPhoto", { 
+        chat_id: finalChatId, 
+        photo: imageFileIds[0], 
+        caption: safeSubstring(newPostText, 1024), 
+        caption_entities: [] 
+      }, env);
+    } else {
+      await callTelegram("sendMessage", { 
+        chat_id: finalChatId, 
+        text: safeSubstring(newPostText, 4096), 
+        entities: [] 
+      }, env);
     }
-  } else {
-    // If posting in a group, delete from group and send new to channel
-    try { await callTelegram("deleteMessage", { chat_id: chatId, message_id: message.message_id }, env); } catch (e) {}
-
-    try {
-      if (imageFileIds.length > 0) {
-        await callTelegram("sendPhoto", { chat_id: targetChannel, photo: imageFileIds[0], caption: safeSubstring(newPostText, 1024), caption_entities: [] }, env);
-      } else {
-        await callTelegram("sendMessage", { chat_id: targetChannel, text: safeSubstring(newPostText, 4096), entities: [] }, env);
-      }
-    } catch (chErr) {
-      console.error("Channel post failed:", chErr.message);
-    }
+  } catch (chErr) {
+    await sendErrorToChat(chatId, `❌ TELEGRAM POST FAILED\n\n${chErr.message}`, env);
   }
 }
 
@@ -233,26 +218,21 @@ async function callTelegram(method, body, env) {
 
 function cleanTheText(text) {
   if (!text) return "";
-  
-  // 1. Strip URLs and Telegram links
-  let cleaned = text.replace(/https?:\/\/\S+/gi, "").replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "");
-  
-  // 2. Strip @usernames
-  cleaned = cleaned.replace(/@[a-zA-Z0-9_]{2,}/g, "");
-  
-  // 3. Strip ALL Ethiopian phone numbers (0911..., +251..., 0712..., grouped or not)
-  cleaned = cleaned.replace(/(?:\+251|251|0)?[\s-]*[97]\d[\s-]*\d{3}[\s-]*\d{4}/g, "");
-  cleaned = cleaned.replace(/(?:\+251|251|0)?[\s-]*[97]\d{8}/g, ""); 
-  
-  // 4. Strip ALL Emojis (Standard and Premium)
-  const EMOJI = /[\p{Extended_Pictographic}\p{Emoji_Presentation}\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu;
-  cleaned = cleaned.replace(EMOJI, "");
-  
-  // 5. Remove markdown symbols
-  cleaned = cleaned.replace(/[*_~`|]/g, "");
-
-  // 6. Normalize spaces but keep new lines
-  return cleaned.replace(/[ \t]+/g, " ").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  try {
+    let cleaned = text.replace(/https?:\/\/\S+/gi, "").replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "");
+    cleaned = cleaned.replace(/@[a-zA-Z0-9_]{2,}/g, "");
+    cleaned = cleaned.replace(/(?:\+251|251|0)?[\s-]*[97]\d[\s-]*\d{3}[\s-]*\d{4}/g, "");
+    cleaned = cleaned.replace(/(?:\+251|251|0)?[\s-]*[97]\d{8}/g, ""); 
+    
+    // The Ultimate Emoji Killer
+    const EMOJI = /[\p{Extended_Pictographic}\p{Emoji_Presentation}\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu;
+    cleaned = cleaned.replace(EMOJI, "");
+    
+    cleaned = cleaned.replace(/[*_~`|]/g, "");
+    return cleaned.replace(/[ \t]+/g, " ").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+  } catch (err) {
+    return text;
+  }
 }
 
 function safeSubstring(str, maxLen) {
