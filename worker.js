@@ -1,6 +1,5 @@
 /**
- * Yegna Gebeya Telegram Bot - Final Production Version
- * Cleans text, saves to Firebase, and posts to Telegram.
+ * Yegna Gebeya Telegram Bot - Ultimate Album & Cleaner Fix
  */
 
 const albumCache = new Map();
@@ -25,7 +24,7 @@ async function processUpdate(update, env) {
   const message = update.message || update.channel_post;
   if (!message) return;
 
-  // 1. Prevent Double Posts (Webhook Retries)
+  // Prevent Webhook Retries
   if (update.update_id) {
     if (processedUpdates.has(update.update_id)) return;
     processedUpdates.add(update.update_id);
@@ -40,7 +39,7 @@ async function processUpdate(update, env) {
 
     const rawText = (message.text || message.caption || "").trim();
 
-    // Watermark check (Prevents the bot from cleaning its own posts)
+    // Watermark check to prevent loops
     if (
       rawText.includes("🏢 የኛ ገበያ (Yegna Gebeya)") ||
       rawText.includes("📝 Title:") ||
@@ -50,13 +49,16 @@ async function processUpdate(update, env) {
       return;
     }
 
-    // Handle Albums (Multi-image posts)
+    // ============================================
+    // ALBUM HANDLING (Groups all images into 1 post)
+    // ============================================
     if (message.media_group_id) {
       const groupId = message.media_group_id;
       if (!albumCache.has(groupId)) {
         albumCache.set(groupId, { images: [], messageIds: [], firstMessage: rawText.length > 3 ? message : null, timerActive: false, timestamp: Date.now() });
       }
       const albumData = albumCache.get(groupId);
+      
       if (message.photo && message.photo.length > 0) {
         albumData.images.push(message.photo[message.photo.length - 1].file_id);
         albumData.messageIds.push(message.message_id);
@@ -65,7 +67,7 @@ async function processUpdate(update, env) {
 
       if (!albumData.timerActive) {
         albumData.timerActive = true;
-        await new Promise((resolve) => setTimeout(resolve, 2500));
+        await new Promise((resolve) => setTimeout(resolve, 2500)); // Wait to collect all images
         if (!albumCache.has(groupId)) return;
         const finalData = albumCache.get(groupId);
         albumCache.delete(groupId);
@@ -75,7 +77,9 @@ async function processUpdate(update, env) {
       return;
     }
 
-    // Handle Single Post
+    // ============================================
+    // SINGLE POST
+    // ============================================
     if (rawText.length < 3) return;
     const images = [];
     if (message.photo && message.photo.length > 0) {
@@ -99,7 +103,6 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   const { formattedPrice } = parseMathematicalPrice(cleanText);
   const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
 
-  // 2. Prevent Duplicate Posts (1-Hour Block)
   const dedupKey = message.media_group_id ? String(message.media_group_id) : textHash;
   if (recentAds.has(dedupKey)) {
     const lastTime = recentAds.get(dedupKey);
@@ -108,7 +111,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   recentAds.set(dedupKey, Date.now());
 
   // ============================================
-  // STEP 1: SAVE TO WEBSITE (FIREBASE)
+  // 1. SAVE TO FIREBASE (WEBSITE)
   // ============================================
   try {
     const token = await getFirebaseToken(env);
@@ -116,7 +119,9 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
       const projectId = env.FIREBASE_PROJECT_ID;
       const docId = message.media_group_id ? `tg_${message.chat.id}_${message.media_group_id}` : `ad_${textHash}`;
       const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
-      const imageUrls = await uploadImagesToCloudinary(imageFileIds, env);
+      
+      // Only upload first image for website thumbnail to save Cloudinary limits
+      const imageUrls = await uploadImagesToCloudinary(imageFileIds.slice(0, 1), env);
 
       const adData = {
         fields: {
@@ -136,7 +141,7 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   }
 
   // ============================================
-  // STEP 2: BUILD THE FORMATTED MESSAGE
+  // 2. BUILD THE CLEAN FORMATTED MESSAGE
   // ============================================
   const hashtagMap = { Cars: "#Cars", Houses: "#Houses", Rentals: "#Rentals", Electronics: "#Electronics", Furniture: "#Furniture", Clothes: "#Clothes", "Labor & Services": "#Labor", "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ" };
   const hashtag = hashtagMap[category] || "#Other";
@@ -157,49 +162,62 @@ async function processFinalAd(message, imageFileIds, messageIds, env) {
   newPostText += `${hashtag}`;
 
   // ============================================
-  // STEP 3: DELETE ORIGINAL & POST CLEAN (Bypasses Emoji Edit Error)
+  // 3. DELETE ORIGINALS & POST AS ALBUM OR SINGLE
   // ============================================
   const chatId = message.chat.id;
   const targetChannel = env.REPOST_CHANNEL_ID;
   const targetClean = String(targetChannel).replace("@", "").toLowerCase();
   const isTargetChannel = String(chatId) === targetClean || (message.chat.username || "").toLowerCase() === targetClean;
 
-  // Delete original message from the chat it was sent in
+  // Delete original raw messages
   try {
     if (messageIds.length === 1) {
       await callTelegram("deleteMessage", { chat_id: chatId, message_id: messageIds[0] }, env);
-    } else {
+    } else if (messageIds.length > 1) {
       await callTelegram("deleteMessages", { chat_id: chatId, message_ids: messageIds }, env);
     }
   } catch (e) {
     console.log("Could not delete original (bot needs admin rights):", e.message);
   }
 
-  // Send the newly formatted post to the Channel (or the group if testing)
+  // Send to target channel
   const finalChatId = isTargetChannel ? chatId : targetChannel;
+  
   try {
-    if (imageFileIds.length > 0) {
+    if (imageFileIds.length > 1) {
+      // 📸 MULTIPLE IMAGES: Send as ONE grouped album
+      const media = imageFileIds.slice(0, 10).map((fileId, index) => ({
+        type: "photo",
+        media: fileId,
+        ...(index === 0 ? { caption: safeSubstring(newPostText, 1024), caption_entities: [] } : {})
+      }));
+      await callTelegram("sendMediaGroup", { chat_id: finalChatId, media: media }, env);
+      console.log("✅ Posted Album to Telegram!");
+    } else if (imageFileIds.length === 1) {
+      // 🖼️ SINGLE IMAGE
       await callTelegram("sendPhoto", { 
         chat_id: finalChatId, 
         photo: imageFileIds[0], 
         caption: safeSubstring(newPostText, 1024), 
-        caption_entities: [] // Forces premium emoji downgrade
+        caption_entities: [] 
       }, env);
+      console.log("✅ Posted Single Photo to Telegram!");
     } else {
+      // 📝 TEXT ONLY
       await callTelegram("sendMessage", { 
         chat_id: finalChatId, 
         text: safeSubstring(newPostText, 4096), 
-        entities: [] // Forces premium emoji downgrade
+        entities: [] 
       }, env);
+      console.log("✅ Posted Text to Telegram!");
     }
-    console.log("✅ Posted clean ad to Telegram Channel!");
   } catch (chErr) {
     console.error("Telegram Post Failed:", chErr.message);
   }
 }
 
 // ============================================
-// TEXT CLEANING & HELPERS
+// HELPERS
 // ============================================
 async function callTelegram(method, body, env) {
   const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
@@ -214,21 +232,17 @@ function cleanTheText(text) {
   if (!text) return "";
   try {
     let cleaned = text.replace(/https?:\/\/\S+/gi, "").replace(/\b(?:t\.me|telegram\.me)\/\S+/gi, "");
-    
-    // Remove Telegram usernames
     cleaned = cleaned.replace(/@[a-zA-Z0-9_]{2,}/g, "");
     
-    // Remove ALL Ethiopian phone numbers (e.g. 0911..., +251..., 0716...)
+    // Remove ALL Ethiopian phone numbers
     cleaned = cleaned.replace(/(?:\+251|251|0)?[\s-]*[97]\d[\s-]*\d{3}[\s-]*\d{4}/g, "");
     cleaned = cleaned.replace(/(?:\+251|251|0)?[\s-]*[97]\d{8}/g, ""); 
     
-    // Destroy all Emojis (Standard and Premium)
+    // Destroy ALL Emojis (Standard and Premium)
     const EMOJI = /[\p{Extended_Pictographic}\p{Emoji_Presentation}\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}]/gu;
     cleaned = cleaned.replace(EMOJI, "");
     
-    // Remove markdown
     cleaned = cleaned.replace(/[*_~`|]/g, "");
-    
     return cleaned.replace(/[ \t]+/g, " ").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
   } catch (err) {
     return text;
