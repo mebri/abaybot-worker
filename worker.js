@@ -1,27 +1,19 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * 
- * Production Complete Edition (v7.3 Resilient Web & Telegram Sync + Profile Ownership & Old Post Migration):
- * 1. Precision Bot Watermark Shield:
- *    - Only drops posts that contain the distinct bot footer signature (mebri.yegna.workers.dev).
- *    - Never drops legitimate seller ads containing #Cars, #Houses, #Electronics, or "Price:".
+ * Production Complete Edition (v7.4 Amharic NLP + Resilient Web & Telegram Sync + Admin Profile):
+ * 1. Amharic Title, Category, Brand, Model, Price & Location Intelligence:
+ *    - Correctly parses Amharic brand/model names without ASCII \b regex bugs.
+ *    - Extracts clean Amharic titles (skipping greetings/price-only lines) & supports explicit ርዕስ:/አይነት: labels.
+ *    - Parses compound Amharic prices (e.g. "4 ሚሊዮን 500 ሺህ" -> 4,500,000, Ethiopic numerals, ሺ/ሚ/ብር).
+ *    - Detects Amharic categories, subcategories, condition (አዲስ/ለኪራይ), cities & Addis subcities.
+ *    - Optional Gemini Flash Amharic text fallback when GEMINI_API_KEY is configured.
  * 2. Instant Website & Profile Sync (marbatu1@gmail.com):
  *    - Posts directly to Website API (/api/ads) tagged to marbatu1@gmail.com for profile edit/delete.
- *    - Resolves marbatu1@gmail.com UID in Firestore so bot ads appear on your user profile.
- *    - Includes ?migrate=old_bot_posts GET route to assign existing old bot posts in Firestore to your profile.
- * 3. Infallible In-Memory Locking:
- *    - Zero dependence on failing Cache API on *.workers.dev subdomains.
- * 4. Dual Ingestion & In-Channel Cleaning:
- *    - In channels: edits channel post directly in place without custom spam entities.
- *    - In groups/private: deletes original dirty post and reposts formatted ad to chat & target channel.
- * 5. Complete Emoji & Contact Stripping:
- *    - Strips all emoji blocks, phone numbers, usernames, and orphan contact labels.
- * 6. Multi-Photo Album Aggregation:
- *    - Gathers photos and broadcasts as Telegram sendMediaGroup (up to 10 photos).
- * 7. Mathematical Amharic Price Parser:
- *    - Handles ሚሊዮን (million), ሺህ (k), Birr/ETB, protects manufacture years.
- * 8. AI Title Arranger & Brands DB:
- *    - [Year] [Brand] [Model] [Trim] (e.g. "2025 BYD Sealion 06 EV (Champion Edition)").
+ *    - Resolves marbatu1@gmail.com UID in Firestore & includes ?migrate=old_bot_posts GET route.
+ * 3. Precision Bot Watermark Shield & In-Memory Locking:
+ *    - Prevents loopback without dropping legitimate seller ads.
+ * 4. Dual Ingestion, Multi-Photo Album Aggregation & Complete Emoji/Contact Stripping.
  */
 
 // In-Memory Aggregators & Deduplication Stores
@@ -57,7 +49,8 @@ export default {
         `• Repost Channel: ${targetChannel}\n` +
         `• Website API: ${websiteUrl}/api/ads\n` +
         `• Admin Profile: ${env.ADMIN_EMAIL || "marbatu1@gmail.com"}\n` +
-        `• Version: v7.3 Production Resilient\n` +
+        `• Amharic NLP Parser: Enabled ✅\n` +
+        `• Version: v7.4 Production Resilient\n` +
         `• Old Post Migration: Visit ?migrate=old_bot_posts once to assign old bot posts to your profile\n`,
         { 
           status: 200,
@@ -122,7 +115,6 @@ async function processUpdate(update, env, request) {
   const rawText = (message.text || message.caption || "").trim();
 
   // 4. PRECISE WATERMARK LOOPBACK SHIELD
-  // Only drop if this message was ALREADY processed and formatted by our bot!
   if (hasBotWatermark(rawText)) {
     console.log("⏭️ Ignored: Post already has official bot watermark footer.");
     return;
@@ -133,7 +125,7 @@ async function processUpdate(update, env, request) {
   if (message.from && botId) {
     const fromIdStr = String(message.from.id);
     if (fromIdStr === botId) {
-      return; // Do not process messages sent by our bot
+      return;
     }
   }
 
@@ -168,7 +160,6 @@ async function processUpdate(update, env, request) {
 
     const album = albumStore.get(groupId);
 
-    // Collect photo file IDs (highest resolution)
     if (message.photo && message.photo.length > 0) {
       const bestPhoto = message.photo[message.photo.length - 1].file_id;
       if (!album.images.includes(bestPhoto)) {
@@ -179,13 +170,11 @@ async function processUpdate(update, env, request) {
       }
     }
 
-    // Capture text / caption if present
     if (rawText.length > 2 && !album.caption) {
       album.caption = rawText;
       album.captionMsg = message;
     }
 
-    // Single coordinator timer: collects ALL photos arriving across webhook requests
     if (!album.timerActive) {
       album.timerActive = true;
 
@@ -263,9 +252,6 @@ function isMemoryLocked(key) {
   return false;
 }
 
-/**
- * Robust watermark check: Only triggers on the bot's own official branding footer.
- */
 function hasBotWatermark(text) {
   if (!text) return false;
   const lower = text.toLowerCase();
@@ -329,163 +315,194 @@ function safeSubstring(str, maxLen) {
 }
 
 // ============================================
-// CARS & ELECTRONICS DATABASE
+// CARS & ELECTRONICS DATABASE (ENGLISH + AMHARIC)
+// Note: Amharic words are NOT wrapped in \b because \b only matches ASCII [a-zA-Z0-9_].
 // ============================================
 const CAR_DATABASE = [
   {
     name: "BYD",
-    regex: /\b(byd|ባይድ)\b/i,
+    regex: /\bbyd\b|ባይድ|ቢዋይዲ/i,
     models: [
-      { name: "Sealion 06 EV", regex: /sealion\s*06/i, subcategory: "Electric (EV)" },
-      { name: "Sealion 07", regex: /sealion\s*07/i, subcategory: "Electric (EV)" },
-      { name: "Seagull", regex: /seagull/i, subcategory: "Electric (EV)" },
-      { name: "Song Plus EV", regex: /song\s*plus/i, subcategory: "Electric (EV)" },
-      { name: "Atto 3 / Yuan Plus", regex: /(atto\s*3|yuan\s*plus)/i, subcategory: "Electric (EV)" },
-      { name: "Tang", regex: /\btang\b/i, subcategory: "Electric (EV)" },
+      { name: "Sealion 06 EV", regex: /sealion\s*06|ሲሊዮን\s*0?6/i, subcategory: "Electric (EV)" },
+      { name: "Sealion 07", regex: /sealion\s*07|ሲሊዮን\s*0?7/i, subcategory: "Electric (EV)" },
+      { name: "Seagull", regex: /seagull|ሲገል|ሲጋል/i, subcategory: "Electric (EV)" },
+      { name: "Song Plus EV", regex: /song\s*plus|ሶንግ\s*ፕላስ/i, subcategory: "Electric (EV)" },
+      { name: "Atto 3 / Yuan Plus", regex: /atto\s*3|yuan\s*plus|አቶ\s*3|ዩአን\s*ፕላስ/i, subcategory: "Electric (EV)" },
+      { name: "Tang", regex: /\btang\b|ታንግ/i, subcategory: "Electric (EV)" },
       { name: "Han", regex: /\bhan\b/i, subcategory: "Electric (EV)" },
-      { name: "Dolphin", regex: /dolphin/i, subcategory: "Electric (EV)" },
-      { name: "Qin Plus", regex: /qin\s*plus/i, subcategory: "Sedan" },
-      { name: "Chazor / Destroyer 05", regex: /(chazor|destroyer\s*05)/i, subcategory: "Sedan" }
+      { name: "Dolphin", regex: /dolphin|ዶልፊን\s*ኢቪ/i, subcategory: "Electric (EV)" },
+      { name: "Qin Plus", regex: /qin\s*plus|ቺን\s*ፕላስ/i, subcategory: "Sedan" },
+      { name: "Chazor / Destroyer 05", regex: /chazor|destroyer\s*05|ቻዞር/i, subcategory: "Sedan" }
     ]
   },
   {
     name: "Toyota",
-    regex: /\b(toyota|ቶዮታ)\b/i,
+    regex: /\btoyota\b|ቶዮታ|ቶየታ/i,
     models: [
+      { name: "Corolla Cross", regex: /corolla\s*cross|ኮሮላ\s*ክሮስ/i, subcategory: "SUV / Crossover" },
       { name: "Corolla", regex: /corolla|ኮሮላ/i, subcategory: "Sedan" },
       { name: "RAV4", regex: /rav\s*4|ራቭ\s*4/i, subcategory: "SUV / Crossover" },
-      { name: "Land Cruiser", regex: /land\s*cruiser|ላንድ\s*ክሩዘር/i, subcategory: "SUV / Crossover" },
+      { name: "Land Cruiser", regex: /land\s*cruiser|ላንድ\s*ክሩዘር|ላንድክሩዘር/i, subcategory: "SUV / Crossover" },
       { name: "Prado", regex: /prado|ፕራዶ/i, subcategory: "SUV / Crossover" },
-      { name: "Hilux", regex: /hilux|ሃይሉክስ/i, subcategory: "Pickup / Truck" },
+      { name: "Hilux", regex: /hilux|ሃይሉክስ|ሀይሉክስ/i, subcategory: "Pickup / Truck" },
       { name: "Yaris", regex: /yaris|ያሪስ/i, subcategory: "Hatchback / Compact" },
-      { name: "Vitz", regex: /vitz|ቪትዝ/i, subcategory: "Hatchback / Compact" },
+      { name: "Vitz", regex: /vitz|ቪትዝ|ቪዝ/i, subcategory: "Hatchback / Compact" },
       { name: "Camry", regex: /camry|ካምሪ/i, subcategory: "Sedan" },
       { name: "Rush", regex: /rush|ራሽ/i, subcategory: "SUV / Crossover" },
-      { name: "HiAce", regex: /hiace|ሀይአይስ|ዶልፊን\s*ቫን/i, subcategory: "Van / Minibus" },
-      { name: "bz4X", regex: /bz4x/i, subcategory: "Electric (EV)" },
-      { name: "Fortuner", regex: /fortuner|ፎርቹን/i, subcategory: "SUV / Crossover" }
+      { name: "HiAce", regex: /hiace|ሀይአይስ|ሃይኤስ|ዶልፊን\s*ቫን|ዶልፊን/i, subcategory: "Van / Minibus" },
+      { name: "bz4X", regex: /bz4x|ቢዜድ4ኤክስ/i, subcategory: "Electric (EV)" },
+      { name: "Fortuner", regex: /fortuner|ፎርቹነር|ፎርቹን/i, subcategory: "SUV / Crossover" },
+      { name: "Avanza", regex: /avanza|አቫንዛ/i, subcategory: "Van / Minibus" }
     ]
   },
   {
     name: "Suzuki",
-    regex: /\b(suzuki|ሱዙኪ)\b/i,
+    regex: /\bsuzuki\b|ሱዙኪ|ሱዚኪ/i,
     models: [
       { name: "Swift", regex: /\bswift\b|ስዊፍት/i, subcategory: "Hatchback / Compact" },
-      { name: "Dzire", regex: /dzire|ዲዛየር/i, subcategory: "Sedan" },
-      { name: "Celerio", regex: /celerio|ሴሌሪዮ/i, subcategory: "Hatchback / Compact" },
-      { name: "Alto", regex: /alto|አልቶ/i, subcategory: "Hatchback / Compact" },
+      { name: "Dzire", regex: /dzire|ዲዛየር|ዲዛይር/i, subcategory: "Sedan" },
+      { name: "Celerio", regex: /celerio|ሴሌሪዮ|ሰሌሪዮ/i, subcategory: "Hatchback / Compact" },
+      { name: "Alto", regex: /\balto\b|አልቶ/i, subcategory: "Hatchback / Compact" },
       { name: "Vitara", regex: /vitara|ቪታራ/i, subcategory: "SUV / Crossover" },
       { name: "Jimny", regex: /jimny|ጂምኒ/i, subcategory: "SUV / Crossover" },
-      { name: "Ertiga", regex: /ertiga/i, subcategory: "Van / Minibus" },
-      { name: "S-Presso", regex: /s-?presso|ኤስፕሬሶ/i, subcategory: "Hatchback / Compact" }
+      { name: "Ertiga", regex: /ertiga|ኤርቲጋ/i, subcategory: "Van / Minibus" },
+      { name: "Baleno", regex: /baleno|ባሌኖ/i, subcategory: "Hatchback / Compact" },
+      { name: "S-Presso", regex: /s-?presso|ኤስፕሬሶ|ኤስ-?ፕሬሶ/i, subcategory: "Hatchback / Compact" }
     ]
   },
   {
     name: "Hyundai",
-    regex: /\b(hyundai|ሂዩንዳይ)\b/i,
+    regex: /\bhyundai\b|ሂዩንዳይ|ሃዩንዳይ|ሁንዳይ/i,
     models: [
-      { name: "Elantra", regex: /elantra|ኤላንትራ/i, subcategory: "Sedan" },
-      { name: "Tucson", regex: /tucson|ቱክሰን/i, subcategory: "SUV / Crossover" },
-      { name: "Avante", regex: /avante|አቫንቴ/i, subcategory: "Sedan" },
+      { name: "Elantra", regex: /elantra|ኤላንትራ|ኢላንትራ/i, subcategory: "Sedan" },
+      { name: "Tucson", regex: /tucson|ቱክሰን|ታክሰን/i, subcategory: "SUV / Crossover" },
+      { name: "Avante", regex: /avante|አቫንቴ|አቫንተ/i, subcategory: "Sedan" },
+      { name: "Accent", regex: /accent|አክሰንት/i, subcategory: "Sedan" },
       { name: "Creta", regex: /creta|ክሬታ/i, subcategory: "SUV / Crossover" },
-      { name: "Santa Fe", regex: /santa\s*fe|ሳንታፌ/i, subcategory: "SUV / Crossover" },
-      { name: "Ioniq 5", regex: /ioniq\s*5/i, subcategory: "Electric (EV)" },
-      { name: "Grand i10", regex: /i10|አይ10/i, subcategory: "Hatchback / Compact" },
-      { name: "Kona", regex: /kona|ኮና/i, subcategory: "SUV / Crossover" },
+      { name: "Santa Fe", regex: /santa\s*fe|ሳንታፌ|ሳንታ\s*ፌ/i, subcategory: "SUV / Crossover" },
+      { name: "Ioniq 5", regex: /ioniq\s*5|አዮኒክ\s*5/i, subcategory: "Electric (EV)" },
+      { name: "Grand i10", regex: /\bi10\b|አይ\s*10/i, subcategory: "Hatchback / Compact" },
+      { name: "Kona", regex: /\bkona\b|ኮና/i, subcategory: "SUV / Crossover" },
       { name: "Staria", regex: /staria|ስታሪያ/i, subcategory: "Van / Minibus" }
     ]
   },
   {
     name: "Volkswagen",
-    regex: /\b(volkswagen|vw|ፎልክስዋገን|ቮልስዋገን)\b/i,
+    regex: /\bvolkswagen\b|\bvw\b|ፎልክስዋገን|ቮልስዋገን|ቮልክስዋገን/i,
     models: [
-      { name: "ID.4 Crozz", regex: /id\.?4/i, subcategory: "Electric (EV)" },
-      { name: "ID.6 Crozz", regex: /id\.?6/i, subcategory: "Electric (EV)" },
-      { name: "Tiguan", regex: /tiguan/i, subcategory: "SUV / Crossover" },
-      { name: "Golf", regex: /\bgolf\b/i, subcategory: "Hatchback / Compact" }
+      { name: "ID.4 Crozz", regex: /id\.?\s*4|አይዲ\.?\s*4/i, subcategory: "Electric (EV)" },
+      { name: "ID.6 Crozz", regex: /id\.?\s*6|አይዲ\.?\s*6/i, subcategory: "Electric (EV)" },
+      { name: "Tiguan", regex: /tiguan|ቲጓን/i, subcategory: "SUV / Crossover" },
+      { name: "Golf", regex: /\bgolf\b|ጎልፍ/i, subcategory: "Hatchback / Compact" }
     ]
   },
   {
     name: "Geely",
-    regex: /\b(geely|ጂሊ)\b/i,
+    regex: /\bgeely\b|ጂሊ/i,
     models: [
-      { name: "Coolray", regex: /coolray/i, subcategory: "SUV / Crossover" },
-      { name: "Geometry C", regex: /geometry\s*c/i, subcategory: "Electric (EV)" },
-      { name: "Monjaro", regex: /monjaro/i, subcategory: "SUV / Crossover" }
+      { name: "Coolray", regex: /coolray|ኩልሬይ/i, subcategory: "SUV / Crossover" },
+      { name: "Geometry C", regex: /geometry\s*c|ጂኦሜትሪ/i, subcategory: "Electric (EV)" },
+      { name: "Monjaro", regex: /monjaro|ሞንጃሮ/i, subcategory: "SUV / Crossover" }
     ]
   },
   {
     name: "Changan",
-    regex: /\b(changan|ቻንጋን)\b/i,
+    regex: /\bchangan\b|ቻንጋን/i,
     models: [
-      { name: "CS35 Plus", regex: /cs35/i, subcategory: "SUV / Crossover" },
-      { name: "CS55 Plus", regex: /cs55/i, subcategory: "SUV / Crossover" },
-      { name: "UNI-T", regex: /uni-?t/i, subcategory: "SUV / Crossover" },
-      { name: "UNI-K", regex: /uni-?k/i, subcategory: "SUV / Crossover" },
-      { name: "BenBen E-Star", regex: /benben/i, subcategory: "Electric (EV)" }
+      { name: "CS35 Plus", regex: /cs\s*35|ሲኤስ\s*35/i, subcategory: "SUV / Crossover" },
+      { name: "CS55 Plus", regex: /cs\s*55|ሲኤስ\s*55/i, subcategory: "SUV / Crossover" },
+      { name: "UNI-T", regex: /uni-?t|ዩኒቲ/i, subcategory: "SUV / Crossover" },
+      { name: "UNI-K", regex: /uni-?k|ዩኒኬ/i, subcategory: "SUV / Crossover" },
+      { name: "BenBen E-Star", regex: /benben|ቤንቤን/i, subcategory: "Electric (EV)" }
     ]
   },
   {
     name: "Jetour",
-    regex: /\b(jetour|ጄቱር)\b/i,
+    regex: /\bjetour\b|ጄቱር|ጀቱር/i,
     models: [
-      { name: "Dashing", regex: /dashing/i, subcategory: "SUV / Crossover" },
-      { name: "X70 Plus", regex: /x70/i, subcategory: "SUV / Crossover" },
-      { name: "Traveler (T2)", regex: /(traveler|t2)/i, subcategory: "SUV / Crossover" }
+      { name: "Dashing", regex: /dashing|ዳሽንግ/i, subcategory: "SUV / Crossover" },
+      { name: "X70 Plus", regex: /x70|ኤክስ\s*70/i, subcategory: "SUV / Crossover" },
+      { name: "Traveler (T2)", regex: /traveler|\bt2\b|ትራቭለር/i, subcategory: "SUV / Crossover" }
     ]
   },
   {
     name: "Kia",
-    regex: /\b(kia|ኪያ)\b/i,
+    regex: /\bkia\b|ኪያ/i,
     models: [
-      { name: "Sportage", regex: /sportage|ስፖርቴጅ/i, subcategory: "SUV / Crossover" },
+      { name: "Sportage", regex: /sportage|ስፖርቴጅ|ስፖርተጅ/i, subcategory: "SUV / Crossover" },
       { name: "Sorento", regex: /sorento|ሶሬንቶ/i, subcategory: "SUV / Crossover" },
       { name: "Picanto", regex: /picanto|ፒካንቶ/i, subcategory: "Hatchback / Compact" },
-      { name: "EV6", regex: /ev6/i, subcategory: "Electric (EV)" }
+      { name: "Rio", regex: /\brio\b|ሪዮ/i, subcategory: "Sedan" },
+      { name: "EV6", regex: /\bev6\b|ኢቪ6/i, subcategory: "Electric (EV)" }
     ]
   },
   {
     name: "Mercedes-Benz",
-    regex: /\b(mercedes|benz|መርሴዲስ|ቤንዝ)\b/i,
+    regex: /\bmercedes\b|\bbenz\b|መርሴዲስ|መርሰዲስ|ቤንዝ/i,
     models: [
-      { name: "C-Class", regex: /c-?class|c200|c180|c300/i, subcategory: "Sedan" },
-      { name: "E-Class", regex: /e-?class|e200|e300|e350/i, subcategory: "Sedan" },
-      { name: "G-Wagon / G-Class", regex: /g-?wagon|g63|g500/i, subcategory: "SUV / Crossover" },
-      { name: "GLE", regex: /gle/i, subcategory: "SUV / Crossover" }
+      { name: "C-Class", regex: /c-?class|c200|c180|c300|ሲ\s*ክላስ/i, subcategory: "Sedan" },
+      { name: "E-Class", regex: /e-?class|e200|e300|e350|ኢ\s*ክላስ/i, subcategory: "Sedan" },
+      { name: "G-Wagon / G-Class", regex: /g-?wagon|g63|g500|ጂ\s*ዋገን/i, subcategory: "SUV / Crossover" },
+      { name: "GLE", regex: /\bgle\b/i, subcategory: "SUV / Crossover" }
     ]
   },
   {
     name: "Nissan",
-    regex: /\b(nissan|ኒሳን)\b/i,
+    regex: /\bnissan\b|ኒሳን/i,
     models: [
       { name: "Patrol", regex: /patrol|ፓትሮል/i, subcategory: "SUV / Crossover" },
-      { name: "X-Trail", regex: /x-?trail/i, subcategory: "SUV / Crossover" },
-      { name: "Qashqai", regex: /qashqai/i, subcategory: "SUV / Crossover" },
-      { name: "Sunny", regex: /sunny/i, subcategory: "Sedan" }
+      { name: "X-Trail", regex: /x-?trail|ኤክስትሬል/i, subcategory: "SUV / Crossover" },
+      { name: "Qashqai", regex: /qashqai|ካሽካይ/i, subcategory: "SUV / Crossover" },
+      { name: "Sunny", regex: /sunny|ሳኒ/i, subcategory: "Sedan" }
+    ]
+  },
+  {
+    name: "Mitsubishi",
+    regex: /\bmitsubishi\b|ሚትሱቢሺ|ሚጽቡሺ/i,
+    models: [
+      { name: "Pajero", regex: /pajero|ፓጄሮ|ፓጀሮ/i, subcategory: "SUV / Crossover" },
+      { name: "L200", regex: /l200|ኤል\s*200/i, subcategory: "Pickup / Truck" },
+      { name: "Outlander", regex: /outlander|አውትላንደር/i, subcategory: "SUV / Crossover" }
+    ]
+  },
+  {
+    name: "Isuzu",
+    regex: /\bisuzu\b|አይሱዙ|ኢሱዙ/i,
+    models: [
+      { name: "NPR", regex: /\bnpr\b|ኤንፒአር/i, subcategory: "Pickup / Truck" },
+      { name: "FSR", regex: /\bfsr\b|ኤፍኤስአር/i, subcategory: "Pickup / Truck" },
+      { name: "D-Max", regex: /d-?max|ዲማክስ/i, subcategory: "Pickup / Truck" }
+    ]
+  },
+  {
+    name: "Sinotruk",
+    regex: /\bsinotruk\b|\bhowo\b|ሳይኖትራክ|ሲኖትራክ|ሆዎ/i,
+    models: [
+      { name: "HOWO Dump Truck", regex: /howo|ሆዎ|ገልባጭ/i, subcategory: "Pickup / Truck" }
     ]
   },
   {
     name: "Land Rover",
-    regex: /\b(range\s*rover|land\s*rover|ሬንጅ\s*ሮቨር)\b/i,
+    regex: /range\s*rover|land\s*rover|ሬንጅ\s*ሮቨር|ላንድ\s*ሮቨር/i,
     models: [
       { name: "Defender", regex: /defender|ዲፌንደር/i, subcategory: "SUV / Crossover" },
-      { name: "Sport", regex: /range\s*rover\s*sport/i, subcategory: "SUV / Crossover" },
-      { name: "Vogue", regex: /vogue/i, subcategory: "SUV / Crossover" },
-      { name: "Evoque", regex: /evoque/i, subcategory: "SUV / Crossover" }
+      { name: "Sport", regex: /range\s*rover\s*sport|ስፖርት/i, subcategory: "SUV / Crossover" },
+      { name: "Vogue", regex: /vogue|ቮግ/i, subcategory: "SUV / Crossover" },
+      { name: "Evoque", regex: /evoque|ኢቮክ/i, subcategory: "SUV / Crossover" }
     ]
   },
   {
     name: "Chery",
-    regex: /\b(chery|ቼሪ)\b/i,
+    regex: /\bchery\b|ቼሪ|ቸሪ/i,
     models: [
-      { name: "Tiggo 7 Pro", regex: /tiggo\s*7/i, subcategory: "SUV / Crossover" },
-      { name: "Tiggo 8 Pro", regex: /tiggo\s*8/i, subcategory: "SUV / Crossover" },
+      { name: "Tiggo 7 Pro", regex: /tiggo\s*7|ቲጎ\s*7/i, subcategory: "SUV / Crossover" },
+      { name: "Tiggo 8 Pro", regex: /tiggo\s*8|ቲጎ\s*8/i, subcategory: "SUV / Crossover" },
       { name: "EQ1 / Little Ant", regex: /eq1|little\s*ant/i, subcategory: "Electric (EV)" }
     ]
   },
   {
     name: "Zeekr",
-    regex: /\b(zeekr|ዚከር)\b/i,
+    regex: /\bzeekr\b|ዚከር/i,
     models: [
       { name: "001", regex: /001/, subcategory: "Electric (EV)" },
       { name: "007", regex: /007/, subcategory: "Electric (EV)" },
@@ -495,7 +512,7 @@ const CAR_DATABASE = [
   },
   {
     name: "Li Auto (Li Xiang)",
-    regex: /\b(li\s*auto|lixiang|ሊ\s*አውቶ)\b/i,
+    regex: /li\s*auto|lixiang|ሊ\s*አውቶ|ሊ\s*ዢያንግ/i,
     models: [
       { name: "L6", regex: /\bl6\b/i, subcategory: "SUV / Crossover" },
       { name: "L7", regex: /\bl7\b/i, subcategory: "SUV / Crossover" },
@@ -508,38 +525,102 @@ const CAR_DATABASE = [
 const ELECTRONICS_DATABASE = [
   {
     name: "Apple",
-    regex: /\b(apple|iphone|macbook|ipad|አፕል|አይፎን)\b/i,
+    regex: /\b(apple|iphone|macbook|ipad)\b|አፕል|አይፎን|ማክቡክ|አይፓድ/i,
     models: [
-      { name: "iPhone 16 Pro Max", regex: /16\s*pro\s*max/i, subcategory: "Smartphones & Tablets" },
-      { name: "iPhone 16 Pro", regex: /16\s*pro\b/i, subcategory: "Smartphones & Tablets" },
-      { name: "iPhone 16", regex: /iphone\s*16/i, subcategory: "Smartphones & Tablets" },
-      { name: "iPhone 15 Pro Max", regex: /15\s*pro\s*max/i, subcategory: "Smartphones & Tablets" },
-      { name: "iPhone 15 Pro", regex: /15\s*pro\b/i, subcategory: "Smartphones & Tablets" },
-      { name: "iPhone 15", regex: /iphone\s*15/i, subcategory: "Smartphones & Tablets" },
-      { name: "iPhone 14 Pro Max", regex: /14\s*pro\s*max/i, subcategory: "Smartphones & Tablets" },
-      { name: "iPhone 13", regex: /iphone\s*13/i, subcategory: "Smartphones & Tablets" },
-      { name: "MacBook Pro", regex: /macbook\s*pro/i, subcategory: "Laptops & Computers" },
-      { name: "MacBook Air", regex: /macbook\s*air/i, subcategory: "Laptops & Computers" },
-      { name: "iPad Pro", regex: /ipad/i, subcategory: "Smartphones & Tablets" }
+      { name: "iPhone 16 Pro Max", regex: /(?:16|፲፮)\s*(?:pro\s*max|ፕሮ\s*ማክስ)/i, subcategory: "Smartphones & Tablets" },
+      { name: "iPhone 16 Pro", regex: /(?:16|፲፮)\s*(?:pro\b|ፕሮ)/i, subcategory: "Smartphones & Tablets" },
+      { name: "iPhone 16", regex: /(?:iphone|አይፎን)\s*16/i, subcategory: "Smartphones & Tablets" },
+      { name: "iPhone 15 Pro Max", regex: /15\s*(?:pro\s*max|ፕሮ\s*ማክስ)/i, subcategory: "Smartphones & Tablets" },
+      { name: "iPhone 15 Pro", regex: /15\s*(?:pro\b|ፕሮ)/i, subcategory: "Smartphones & Tablets" },
+      { name: "iPhone 15", regex: /(?:iphone|አይፎን)\s*15/i, subcategory: "Smartphones & Tablets" },
+      { name: "iPhone 14 Pro Max", regex: /14\s*(?:pro\s*max|ፕሮ\s*ማክስ)/i, subcategory: "Smartphones & Tablets" },
+      { name: "iPhone 14", regex: /(?:iphone|አይፎን)\s*14/i, subcategory: "Smartphones & Tablets" },
+      { name: "iPhone 13", regex: /(?:iphone|አይፎን)\s*13/i, subcategory: "Smartphones & Tablets" },
+      { name: "MacBook Pro", regex: /macbook\s*pro|ማክቡክ\s*ፕሮ/i, subcategory: "Laptops & Computers" },
+      { name: "MacBook Air", regex: /macbook\s*air|ማክቡክ\s*ኤር/i, subcategory: "Laptops & Computers" },
+      { name: "iPad Pro", regex: /ipad|አይፓድ/i, subcategory: "Smartphones & Tablets" }
     ]
   },
   {
     name: "Samsung",
-    regex: /\b(samsung|ሳምሰንግ|galaxy)\b/i,
+    regex: /\b(samsung|galaxy)\b|ሳምሰንግ|ጋላክሲ/i,
     models: [
-      { name: "Galaxy S24 Ultra", regex: /s24\s*ultra/i, subcategory: "Smartphones & Tablets" },
+      { name: "Galaxy S24 Ultra", regex: /s24\s*(?:ultra|አልትራ)/i, subcategory: "Smartphones & Tablets" },
       { name: "Galaxy S24", regex: /s24/i, subcategory: "Smartphones & Tablets" },
-      { name: "Galaxy S23 Ultra", regex: /s23\s*ultra/i, subcategory: "Smartphones & Tablets" },
+      { name: "Galaxy S23 Ultra", regex: /s23\s*(?:ultra|አልትራ)/i, subcategory: "Smartphones & Tablets" },
       { name: "Galaxy Z Fold", regex: /z\s*fold/i, subcategory: "Smartphones & Tablets" },
       { name: "Galaxy Z Flip", regex: /z\s*flip/i, subcategory: "Smartphones & Tablets" }
     ]
   },
   {
-    name: "Sony",
-    regex: /\b(sony|ሶኒ|playstation|ps5|ps4)\b/i,
+    name: "Tecno",
+    regex: /\btecno\b|ቴክኖ/i,
     models: [
-      { name: "PlayStation 5", regex: /ps5|playstation\s*5/i, subcategory: "Gaming & Consoles" },
-      { name: "Bravia TV", regex: /bravia|tv/i, subcategory: "TV & Home Entertainment" }
+      { name: "Camon", regex: /camon|ካሞን/i, subcategory: "Smartphones & Tablets" },
+      { name: "Spark", regex: /spark|ስፓርክ/i, subcategory: "Smartphones & Tablets" },
+      { name: "Phantom", regex: /phantom|ፋንተም/i, subcategory: "Smartphones & Tablets" }
+    ]
+  },
+  {
+    name: "Infinix",
+    regex: /\binfinix\b|ኢንፊኒክስ/i,
+    models: [
+      { name: "Note", regex: /\bnote\b|ኖት/i, subcategory: "Smartphones & Tablets" },
+      { name: "Hot", regex: /\bhot\b|ሆት/i, subcategory: "Smartphones & Tablets" }
+    ]
+  },
+  {
+    name: "Xiaomi",
+    regex: /\b(xiaomi|redmi|poco)\b|ሺያኦሚ|ሬድሚ|ፖኮ/i,
+    models: [
+      { name: "Redmi Note", regex: /redmi\s*note|ሬድሚ\s*ኖት/i, subcategory: "Smartphones & Tablets" }
+    ]
+  },
+  {
+    name: "HP",
+    regex: /\bhp\b|ኤችፒ/i,
+    models: [
+      { name: "EliteBook", regex: /elitebook|ኢሊትቡክ/i, subcategory: "Laptops & Computers" },
+      { name: "Pavilion", regex: /pavilion|ፓቪሊዮን/i, subcategory: "Laptops & Computers" },
+      { name: "ProBook", regex: /probook|ፕሮቡክ/i, subcategory: "Laptops & Computers" }
+    ]
+  },
+  {
+    name: "Dell",
+    regex: /\bdell\b|ዴል/i,
+    models: [
+      { name: "XPS", regex: /\bxps\b/i, subcategory: "Laptops & Computers" },
+      { name: "Latitude", regex: /latitude|ላቲቲዩድ/i, subcategory: "Laptops & Computers" }
+    ]
+  },
+  {
+    name: "Lenovo",
+    regex: /\blenovo\b|ሌኖቮ/i,
+    models: [
+      { name: "ThinkPad", regex: /thinkpad|ቲንክፓድ/i, subcategory: "Laptops & Computers" }
+    ]
+  },
+  {
+    name: "LG",
+    regex: /\blg\b|ኤልጂ/i,
+    models: [
+      { name: "Smart TV", regex: /tv|ቴሌቪዥን|ቲቪ/i, subcategory: "TV & Home Entertainment" }
+    ]
+  },
+  {
+    name: "Hisense",
+    regex: /\bhisense\b|ሃይሴንስ|ሀይሴንስ/i,
+    models: [
+      { name: "Smart TV", regex: /tv|ቴሌቪዥን|ቲቪ/i, subcategory: "TV & Home Entertainment" },
+      { name: "Refrigerator", regex: /fridge|ፍሪጅ|ማቀዝቀዣ/i, subcategory: "Home Appliances" }
+    ]
+  },
+  {
+    name: "Sony",
+    regex: /\b(sony|playstation|ps5|ps4)\b|ሶኒ|ፕሌይስቴሽን/i,
+    models: [
+      { name: "PlayStation 5", regex: /ps5|playstation\s*5|ፕሌይስቴሽን\s*5/i, subcategory: "Gaming & Consoles" },
+      { name: "Bravia TV", regex: /bravia|tv|ቴሌቪዥን|ቲቪ/i, subcategory: "TV & Home Entertainment" }
     ]
   }
 ];
@@ -548,14 +629,51 @@ const ELECTRONICS_DATABASE = [
 // MAIN PROCESSING & AD BROADCASTER
 // ============================================
 async function processFinalAd(message, imageFileIds, messageIds, cleanText, env, mediaGroupId = null, isInsideTargetChannel = false) {
-  let { brand, model, year, trim, bodyType, fuelType, transmission, subcategory } = detectBrandModelYear(cleanText);
-  const category = detectCategory(cleanText, brand);
-  if (!subcategory) subcategory = bodyType || "Vehicles";
+  const normalizedText = normalizeEthiopicNumerals(cleanText);
+  let { brand, model, year, trim, bodyType, fuelType, transmission, subcategory } = detectBrandModelYear(normalizedText);
+  let category = detectCategory(normalizedText, brand);
+  let { formattedPrice, rawPrice } = parseMathematicalPrice(normalizedText, year);
+  let condition = detectCondition(normalizedText, category);
+  let city = extractCity(normalizedText);
+  const subcity = extractSubcity(normalizedText);
 
-  // Optional Gemini Vision enrichment
-  if (env.GEMINI_API_KEY && (!model || !brand) && imageFileIds.length > 0) {
+  if (!subcategory) {
+    subcategory = detectAmharicSubcategory(normalizedText, category) || bodyType || (category === "Cars" ? "Vehicles" : category);
+  }
+
+  let aiTitle = "";
+
+  // Optional Gemini Amharic Text Intelligence (fills gaps for Amharic titles, brands, categories, prices)
+  const hasAmharicChars = /[\u1200-\u137F]/.test(normalizedText);
+  if (env.GEMINI_API_KEY && hasAmharicChars && (!brand || !rawPrice || category === "ምንአለሽ_ተራ")) {
     try {
-      const visionResult = await inspectImageWithGemini(imageFileIds[0], cleanText, env);
+      const amharicAi = await analyzeAmharicAdWithGemini(normalizedText, env);
+      if (amharicAi) {
+        if (!brand && amharicAi.brand) brand = amharicAi.brand;
+        if (!model && amharicAi.model) model = amharicAi.model;
+        if (!year && amharicAi.year) year = String(amharicAi.year);
+        if (!trim && amharicAi.trim) trim = amharicAi.trim;
+        if (category === "ምንአለሽ_ተራ" && amharicAi.category) category = amharicAi.category;
+        if ((!subcategory || subcategory === category || subcategory === "Vehicles") && amharicAi.subcategory) {
+          subcategory = amharicAi.subcategory;
+        }
+        if (amharicAi.title && amharicAi.title.trim().length > 2) aiTitle = amharicAi.title.trim();
+        if (!rawPrice && amharicAi.priceETB && Number(amharicAi.priceETB) > 0) {
+          rawPrice = Math.round(Number(amharicAi.priceETB));
+          formattedPrice = rawPrice.toLocaleString("en-US");
+        }
+        if (amharicAi.city && city === "Addis Ababa") city = amharicAi.city;
+        if (amharicAi.condition) condition = amharicAi.condition;
+      }
+    } catch (aiErr) {
+      console.warn("Gemini Amharic NLP skipped:", aiErr.message);
+    }
+  }
+
+  // Optional Gemini Vision enrichment for vehicle photos
+  if (env.GEMINI_API_KEY && (!model || !brand) && category === "Cars" && imageFileIds.length > 0) {
+    try {
+      const visionResult = await inspectImageWithGemini(imageFileIds[0], normalizedText, env);
       if (visionResult) {
         if (!brand && visionResult.brand) brand = visionResult.brand;
         if (!model && visionResult.model) model = visionResult.model;
@@ -569,9 +687,18 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
     }
   }
 
-  const arrangedTitle = arrangeTitle({ brand, model, year, trim, cleanText, category, subcategory });
-  const { formattedPrice, rawPrice } = parseMathematicalPrice(cleanText, year);
-  const textHash = simpleHash(cleanText.toLowerCase().replace(/\s+/g, ''));
+  const arrangedTitle = arrangeTitle({
+    brand,
+    model,
+    year,
+    trim,
+    cleanText: normalizedText,
+    category,
+    subcategory,
+    subcity,
+    aiTitle
+  });
+  const textHash = simpleHash(normalizedText.toLowerCase().replace(/\s+/g, ''));
 
   // Upload photos to Cloudinary if configured
   const imageUrls = await uploadImagesToCloudinary(imageFileIds.slice(0, 4), env);
@@ -593,10 +720,11 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
       title: arrangedTitle,
       category: category,
       subcategory: subcategory,
+      brand: brand || "",
       price: rawPrice,
-      city: extractCity(cleanText),
-      subcity: "",
-      condition: "Used",
+      city: city,
+      subcity: subcity,
+      condition: condition,
       images: finalDisplayImages,
       description: cleanText,
       phone: "0911680790",
@@ -640,12 +768,14 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
           transmission: { stringValue: transmission || "" },
           category: { stringValue: category },
           subcategory: { stringValue: subcategory },
+          condition: { stringValue: condition },
           description: { stringValue: cleanText },
           textHash: { stringValue: textHash },
           price: { stringValue: formattedPrice },
           rawPrice: { integerValue: String(rawPrice) },
           phone: { stringValue: "0911680790" },
-          city: { stringValue: extractCity(cleanText) },
+          city: { stringValue: city },
+          subcity: { stringValue: subcity },
           image: { stringValue: finalDisplayImages[0] },
           images: { arrayValue: { values: finalDisplayImages.map((url) => ({ stringValue: url })) } },
           status: { stringValue: "available" },
@@ -693,13 +823,16 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
   let headerText = `📝 Title: ${arrangedTitle}\n`;
   if (brand || model || year) {
     const metaParts = [];
-    if (brand) metaParts.push(`Make: ${brand}`);
+    if (brand) metaParts.push(`Brand: ${brand}`);
     if (model) metaParts.push(`Model: ${model}`);
     if (year) metaParts.push(`Year: ${year}`);
     headerText += `🏷️ ${metaParts.join(" | ")}\n`;
   }
-  headerText += `📂 Category: ${category}${subcategory ? ` › ${subcategory}` : ""}\n`;
+  headerText += `📂 Category: ${category}${subcategory && subcategory !== category ? ` › ${subcategory}` : ""}\n`;
   headerText += `💰 Price: ${displayPriceText}\n`;
+  if (city || subcity) {
+    headerText += `📍 Location: ${city}${subcity ? ` (${subcity})` : ""}\n`;
+  }
   if (transmission || fuelType) {
     const specParts = [];
     if (transmission) specParts.push(`⚙️ ${transmission}`);
@@ -716,7 +849,6 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
   footerText += `━━━━━━━━━━━━━━━\n\n`;
   footerText += `${hashtag} #YegnaGebeya`;
 
-  // Safely calculate remaining character allowance for Details (Telegram caption max 1024)
   const fixedLen = headerText.length + footerText.length + 15;
   const maxDetailsLen = Math.max(100, 1020 - fixedLen);
   let safeDetails = safeSubstring(cleanText, maxDetailsLen);
@@ -732,8 +864,6 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
   // 4. IN-CHANNEL CLEANING VS GROUP CLEANING
   // ============================================
   if (isInsideTargetChannel) {
-    // Post was made directly in @mebrigranite channel!
-    // As channel admin with edit rights, bot edits the channel post in place:
     try {
       if (isPhoto) {
         await callTelegram("editMessageCaption", { 
@@ -749,7 +879,7 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
         }, env);
       }
       console.log("✅ Cleaned in-place directly inside target channel!");
-      return; // Finished!
+      return;
     } catch (chanEditErr) {
       console.warn("In-channel edit failed (check bot admin rights in channel):", chanEditErr.message);
       return;
@@ -761,7 +891,6 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
   // ============================================
   let messageHandledInSource = false;
 
-  // Try in-place edit first
   try {
     if (isPhoto) {
       await callTelegram("editMessageCaption", { 
@@ -779,10 +908,9 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
     console.log("✅ Edited in place in source chat.");
     messageHandledInSource = true;
   } catch (editErr) {
-    // Normal for user messages in groups (Telegram API forbids bots from editing user messages)
+    // Normal for user messages in groups
   }
 
-  // If in-place edit failed, delete dirty user post & repost clean copy in group
   if (!messageHandledInSource) {
     try {
       if (messageIds.length === 1) {
@@ -846,7 +974,6 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
           caption: safeSubstring(newPostText, 1024)
         }, env);
       } else {
-        // Broadcast ALL photos (up to 10 photos) together in a single media group!
         const media = imageFileIds.slice(0, 10).map((fileId, index) => ({
           type: "photo",
           media: fileId,
@@ -866,7 +993,35 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
 }
 
 // ============================================
-// BRAND / MODEL / YEAR / SPECS PARSER
+// ETHIOPIC NUMERAL NORMALIZER
+// ============================================
+function normalizeEthiopicNumerals(text) {
+  if (!text) return "";
+  const map = {
+    "፩": "1", "፪": "2", "፫": "3", "፬": "4", "፭": "5",
+    "፮": "6", "፯": "7", "፰": "8", "፱": "9", "፲": "10",
+    "፳": "20", "፴": "30", "፵": "40", "፶": "50",
+    "፷": "60", "፸": "70", "፹": "80", "፺": "90", "፻": "100"
+  };
+  return text.replace(/[፩-፻]+/g, (seq) => {
+    if (seq.length === 1 && map[seq]) return map[seq];
+    let total = 0;
+    let current = 0;
+    for (const ch of seq) {
+      const val = Number(map[ch] || 0);
+      if (val === 100) {
+        total += (current || 1) * 100;
+        current = 0;
+      } else {
+        current += val;
+      }
+    }
+    return String(total + current);
+  });
+}
+
+// ============================================
+// BRAND / MODEL / YEAR / SPECS PARSER (AMHARIC + ENGLISH)
 // ============================================
 function detectBrandModelYear(text) {
   let brand = "";
@@ -878,26 +1033,33 @@ function detectBrandModelYear(text) {
   let transmission = "";
   let subcategory = "";
 
-  const makeMatch = text.match(/(?:Make|የመኪናው\s*ዓይነት|Brand|ብራንድ)[ \t:=-]+([a-zA-Z0-9/._ -]+)/i);
+  const makeMatch = text.match(/(?:Make|የመኪናው\s*ዓይነት|የመኪና\s*ዓይነት|Brand|ብራንድ|አይነት)[ \t:=-]+([^\n,;()]+)/i);
   if (makeMatch && makeMatch[1]) {
-    brand = makeMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
-    if (/^(?:new|brand\s*new|used)\b/i.test(brand)) brand = "";
+    const candidate = makeMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
+    if (!/^(?:new|brand\s*new|used|አዲስ|ያገለገለ)\b/i.test(candidate) && candidate.length < 30) {
+      brand = candidate;
+    }
   }
 
-  const modelMatch = text.match(/(?:Model|ሞዴል)[ \t:=-]+([a-zA-Z0-9/._ -]+)/i);
+  const modelMatch = text.match(/(?:Model|ሞዴል)[ \t:=-]+([a-zA-Z0-9\u1200-\u137F/._ -]+)/i);
   if (modelMatch && modelMatch[1]) {
     model = modelMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
   }
 
-  const yearMatch = text.match(/(?:Year|ዓመተ\s*ምህረት)[ \t:=-]+([0-9]{4}(?:\/[0-9]{1,2})?)/i);
+  const yearMatch = text.match(/(?:Year|ዓመተ\s*ምህረት|የተሰራበት\s*ዓመት|ዓ\.?ም)[ \t:=-]+([0-9]{4}(?:\/[0-9]{1,2})?)/i);
   if (yearMatch && yearMatch[1]) {
     year = yearMatch[1].trim();
   } else {
-    const rawYear = text.match(/\b(199\d|200\d|201\d|202[0-9])(?:\/([0-9]{1,2}))?\b/);
-    if (rawYear) year = rawYear[0];
+    const ecYearMatch = text.match(/\b(200\d|201\d)\s*(?:ዓ\.?ም|E\.?C)/i);
+    if (ecYearMatch) {
+      year = `${ecYearMatch[1]} E.C`;
+    } else {
+      const rawYear = text.match(/\b(199\d|200\d|201\d|202[0-9])(?:\/([0-9]{1,2}))?\b/);
+      if (rawYear) year = rawYear[0];
+    }
   }
 
-  // Ethiopian ad convention: ". Model 2022" is manufacture YEAR, not model name!
+  // Ethiopian ad convention: "Model 2022" or "ሞዴል 2022" is manufacture YEAR, not model name!
   if (model && /^(?:19|20)\d{2}(?:\/\d{1,2})?$/.test(model)) {
     if (!year) year = model;
     model = "";
@@ -908,36 +1070,40 @@ function detectBrandModelYear(text) {
     trim = trimMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
   }
 
-  const bodyMatch = text.match(/(?:Body\s*Type|የቦዲ\s*ዓይነት)[ \t:=-]+([a-zA-Z0-9/._ -]+)/i);
+  const bodyMatch = text.match(/(?:Body\s*Type|የቦዲ\s*ዓይነት)[ \t:=-]+([a-zA-Z0-9\u1200-\u137F/._ -]+)/i);
   if (bodyMatch && bodyMatch[1]) {
     bodyType = bodyMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
   }
 
-  const fuelMatch = text.match(/(?:Fuel|ነዳጅ)[ \t:=-]+([a-zA-Z0-9/._ -]+)/i);
+  const fuelMatch = text.match(/(?:Fuel|ነዳጅ)[ \t:=-]+([a-zA-Z0-9\u1200-\u137F/._ -]+)/i);
   if (fuelMatch && fuelMatch[1]) {
     fuelType = fuelMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
-  } else if (/(?:electric|ኤሌክትሪክ|ev\b|battery|ባትሪ)/i.test(text)) {
-    fuelType = "Electric";
-  } else if (/(?:benzin|petrol|ቤንዚን)/i.test(text)) {
-    fuelType = "Petrol / Benzin";
-  } else if (/(?:diesel|ናፍጣ)/i.test(text)) {
-    fuelType = "Diesel";
-  } else if (/(?:hybrid|ሃይብሪድ)/i.test(text)) {
-    fuelType = "Hybrid";
+  }
+  if (!fuelType || /[\u1200-\u137F]/.test(fuelType)) {
+    if (/\bev\b|electric|ኤሌክትሪክ|በኤሌክትሪክ|በቻርጅ|ባትሪ/i.test(text)) {
+      fuelType = "Electric";
+    } else if (/benzin|petrol|ቤንዚን|በንዚን/i.test(text)) {
+      fuelType = "Petrol / Benzin";
+    } else if (/diesel|ናፍጣ/i.test(text)) {
+      fuelType = "Diesel";
+    } else if (/hybrid|ሃይብሪድ|ሀይብሪድ/i.test(text)) {
+      fuelType = "Hybrid";
+    }
   }
 
-  const transMatch = text.match(/(?:Transmission|ማስተላለፊያ)[ \t:=-]+([a-zA-Z0-9/._ -]+)/i);
+  const transMatch = text.match(/(?:Transmission|ማስተላለፊያ|ጊር)[ \t:=-]+([a-zA-Z0-9\u1200-\u137F/._ -]+)/i);
   if (transMatch && transMatch[1]) {
     const candidate = transMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
-    if (/(?:automatic|ኦቶማቲክ)/i.test(candidate)) transmission = "Automatic";
-    else if (/(?:manual|ማኑዋል)/i.test(candidate)) transmission = "Manual";
+    if (/automatic|ኦቶማቲክ|አውቶማቲክ|አውቶ/i.test(candidate)) transmission = "Automatic";
+    else if (/manual|ማኑዋል|ማንዋል/i.test(candidate)) transmission = "Manual";
     else if (candidate.length < 20 && !/^(?:19|20)\d{2}/.test(candidate)) transmission = candidate;
   }
   if (!transmission) {
-    if (/(?:automatic\s*transmission|ኦቶማቲክ)/i.test(text)) transmission = "Automatic";
-    else if (/(?:manual\s*transmission|ማኑዋል)/i.test(text)) transmission = "Manual";
+    if (/automatic|ኦቶማቲክ|አውቶማቲክ/i.test(text)) transmission = "Automatic";
+    else if (/manual|ማኑዋል|ማንዋል/i.test(text)) transmission = "Manual";
   }
 
+  // Match car brand & model from CAR_DATABASE (including Amharic brand/model spellings)
   if (!brand) {
     for (const b of CAR_DATABASE) {
       if (b.regex.test(text)) {
@@ -953,8 +1119,11 @@ function detectBrandModelYear(text) {
       }
     }
   } else {
-    const matchedBrandObj = CAR_DATABASE.find(b => b.name.toLowerCase() === brand.toLowerCase());
+    const matchedBrandObj = CAR_DATABASE.find(
+      b => b.name.toLowerCase() === brand.toLowerCase() || b.regex.test(brand)
+    );
     if (matchedBrandObj) {
+      brand = matchedBrandObj.name;
       for (const m of matchedBrandObj.models) {
         if (m.regex.test(text)) {
           if (!model || /^\d+$/.test(model)) model = m.name;
@@ -979,6 +1148,7 @@ function detectBrandModelYear(text) {
     }
   }
 
+  // Match electronics brand & model
   if (!brand) {
     for (const eb of ELECTRONICS_DATABASE) {
       if (eb.regex.test(text)) {
@@ -996,9 +1166,9 @@ function detectBrandModelYear(text) {
   }
 
   if (!subcategory && bodyType) {
-    if (bodyType.toLowerCase().includes("suv") || /suv/i.test(text)) {
+    if (/suv|ኤስዩቪ/i.test(bodyType) || /\bsuv\b/i.test(text)) {
       subcategory = "SUV / Crossover";
-    } else if (bodyType.toLowerCase().includes("sedan") || /sedan/i.test(text)) {
+    } else if (/sedan|ሴዳን/i.test(bodyType) || /\bsedan\b/i.test(text)) {
       subcategory = "Sedan";
     }
   }
@@ -1006,7 +1176,60 @@ function detectBrandModelYear(text) {
   return { brand, model, year, trim, bodyType, fuelType, transmission, subcategory };
 }
 
-function arrangeTitle({ brand, model, year, trim, cleanText, category, subcategory }) {
+// ============================================
+// AMHARIC TITLE EXTRACTOR & ARRANGER
+// ============================================
+function extractAmharicTitle(cleanText, category, subcity) {
+  if (!cleanText) return "";
+
+  // 1. Check explicit Amharic or English title labels
+  const explicitMatch = cleanText.match(
+    /(?:^|\n)[ \t]*(?:Title|ርዕስ|ስም|የእቃው\s*ስም|የእቃው\s*አይነት|የቤቱ\s*አይነት|አይነት)[ \t:：=-]+([^\n]+)/i
+  );
+  if (explicitMatch && explicitMatch[1]) {
+    const candidate = cleanTitleLine(explicitMatch[1]);
+    if (candidate.length >= 3) {
+      return appendSubcityIfMissing(candidate, subcity);
+    }
+  }
+
+  // 2. Score lines to skip greetings, standalone phone/price/contact lines, and pick descriptive Amharic title
+  const lines = cleanText.split("\n").map((l) => l.trim()).filter(Boolean);
+  const fillerLineRegex = /^(?:ሰላም(?:\s+ለሁላችሁ)?|እንዴት\s+ናችሁ|በአስቸኳይ|አስቸኳይ|ለበለጠ\s+መረጃ|ስልክ|አድራሻ|ዋጋ|የመሸጫ\s*ዋጋ|price|contact|call|location)[ \t:：=-]*$/i;
+  const priceOnlyRegex = /^(?:ዋጋ|የመሸጫ\s*ዋጋ|price|በ|ብር|ETB)?[ \t:：=-]*[0-9.,]+[ \t]*(?:ETB|ብር|Birr|ሚሊዮን|ሚሊየን|ሚ|ሺህ|ሺ|k|m)?[ \t]*$/i;
+
+  for (const rawLine of lines) {
+    if (fillerLineRegex.test(rawLine) || priceOnlyRegex.test(rawLine)) continue;
+    // Strip leading labels like "መግለጫ፡" or bullet prefixes
+    const cleaned = cleanTitleLine(
+      rawLine
+        .replace(/^(?:አስቸኳይ\s*የሚሸጥ|በአስቸኳይ\s*የሚሸጥ|የሚሸጥ|ለሽያጭ\s*የቀረበ|ለኪራይ\s*የቀረበ)[ \t:：-]+/i, "")
+        .replace(/^(?:ዋጋ|price)[ \t:：=-]+.*$/i, "")
+    );
+    if (cleaned.length >= 4) {
+      return appendSubcityIfMissing(cleaned, subcity);
+    }
+  }
+
+  return "";
+}
+
+function cleanTitleLine(str) {
+  return (str || "")
+    .replace(/[💎📌⭐✔️•#*_~`]/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/^[:：\-–—.,\s]+|[:：\-–—.,\s]+$/g, "")
+    .trim();
+}
+
+function appendSubcityIfMissing(title, subcity) {
+  if (!subcity) return safeSubstring(title, 68);
+  if (title.toLowerCase().includes(subcity.toLowerCase())) return safeSubstring(title, 68);
+  const combined = `${title} (${subcity})`;
+  return combined.length <= 68 ? combined : safeSubstring(title, 68);
+}
+
+function arrangeTitle({ brand, model, year, trim, cleanText, category, subcategory, subcity, aiTitle }) {
   if (category === "Cars") {
     const cleanYear = year ? year.split("/")[0] : "";
     if (brand && model) {
@@ -1020,7 +1243,7 @@ function arrangeTitle({ brand, model, year, trim, cleanText, category, subcatego
       return parts.join(" ");
     }
     if (brand) {
-      const parts = [cleanYear, brand, subcategory !== "Vehicles" ? subcategory : ""].filter(Boolean);
+      const parts = [cleanYear, brand, subcategory && subcategory !== "Vehicles" ? subcategory : ""].filter(Boolean);
       return parts.join(" ");
     }
   }
@@ -1029,55 +1252,143 @@ function arrangeTitle({ brand, model, year, trim, cleanText, category, subcatego
     return `${brand} ${model}${trim ? ` ${trim}` : ""}`;
   }
 
-  const firstLine = cleanText.split("\n")[0].replace(/[💎📌⭐✔️•#]/g, "").trim();
+  if (aiTitle) {
+    return safeSubstring(aiTitle, 68);
+  }
+
+  const amharicTitle = extractAmharicTitle(cleanText, category, subcity);
+  if (amharicTitle) {
+    return amharicTitle;
+  }
+
+  const firstLine = cleanTitleLine((cleanText.split("\n")[0] || ""));
   return safeSubstring(firstLine, 65) || `${category} Item`;
 }
 
+// ============================================
+// AMHARIC + ENGLISH CATEGORY, SUBCATEGORY & CONDITION
+// ============================================
 function detectCategory(text, brand) {
   const t = text.toLowerCase();
   if (brand && CAR_DATABASE.some(b => b.name.toLowerCase() === brand.toLowerCase())) return "Cars";
   if (brand && ELECTRONICS_DATABASE.some(eb => eb.name.toLowerCase() === brand.toLowerCase())) return "Electronics";
-  if (/(መኪና|car|vitz|corolla|rav4|suzuki|hyundai|byd|elantra|sealion|tucson|toyota|yaris|benz|mileage|km|plate)/i.test(t)) return "Cars";
-  if (/(ቤት|ኮንዶሚኒየም|apartment|villa|house|g\+|ሪል\s*እስቴት|ካሬ|sqm)/i.test(t)) {
-    if (/(ኪራይ|rent|ለኪራይ|ወርሃዊ)/i.test(t)) return "Rentals";
+
+  // Rentals vs Sales
+  const isRentIntent = /(ኪራይ|ለኪራይ|የሚከራይ|ይከራያል|በወር|ወርሃዊ|\brent\b|\bfor\s*rent\b)/i.test(t);
+  const isHouseTerm = /(ቤት|ኮንዶሚኒየም|አፓርታማ|ቪላ|መኝታ|ህንጻ|ህንፃ|ሱቅ|ቢሮ|መጋዘን|ቦታ|መሬት|ሪል\s*እስቴት|ካሬ|apartment|villa|house|condominium|g\+|sqm|bedroom)/i.test(t);
+  const isCarTerm = /(መኪና|ተሽከርካሪ|አውቶሞቢል|ፒክአፕ|ቫን|ሚኒባስ|ባጃጅ|ታርጋ|ሰሌዳ|ኪሎ\s*ሜትር|ኮድ\s*[12345]|\bcar\b|vitz|corolla|rav4|suzuki|hyundai|byd|elantra|sealion|tucson|toyota|yaris|benz|mileage|\bkm\b|plate)/i.test(t);
+
+  if (isCarTerm) return "Cars";
+  if (isHouseTerm) {
+    if (isRentIntent) return "Rentals";
     return "Houses";
   }
-  if (/(ስልክ|phone|iphone|samsung|laptop|macbook|ipad|tv|electronics|playstation|ps5|ቴሌቪዥን|ላፕቶፕ)/i.test(t)) return "Electronics";
-  if (/(sofa|bed|table|chair|furniture|ሶፋ|አልጋ|ጠረጴዛ|ወንበር|ቁምሳጥን)/i.test(t)) return "Furniture";
-  if (/(shoes|jacket|dress|suit|clothes|pants|ጫማ|ጃኬት|ቀሚስ|ልብስ)/i.test(t)) return "Clothes";
-  if (/(driver|plumber|electrician|mechanic|ቧንቧ|ኤሌክትሪክ|ቀለም|ሹፌር|ሰርቪስ|ጽዳት)/i.test(t)) return "Labor & Services";
+  if (isRentIntent) return "Rentals";
+
+  if (/(ስልክ|ሞባይል|አይፎን|ሳምሰንግ|ላፕቶፕ|ኮምፒውተር|ታብሌት|ቴሌቪዥን|ቲቪ|ፕሌይስቴሽን|ፍሪጅ|ልብስ\s*ማጠቢያ|ማይክሮዌቭ|ስፒከር|ካሜራ|phone|iphone|samsung|laptop|macbook|ipad|\btv\b|electronics|playstation|ps5)/i.test(t)) {
+    return "Electronics";
+  }
+  if (/(ሶፋ|አልጋ|ጠረጴዛ|ወንበር|ቁምሳጥን|ፍራሽ|መጋረጃ|ምንጣፍ|ፈርኒቸር|የቤት\s*እቃ|sofa|bed|table|chair|furniture|wardrobe|mattress)/i.test(t)) {
+    return "Furniture";
+  }
+  if (/(ጫማ|ጃኬት|ቀሚስ|ልብስ|ሱፍ|ሸሚዝ|ቦርሳ|ሰዓት|ሽቶ|ቲሸርት|shoes|jacket|dress|suit|clothes|pants)/i.test(t)) {
+    return "Clothes";
+  }
+  if (/(ቧንቧ|ኤሌክትሪክ\s*ሰራተኛ|ቀለም\s*ቀቢ|ሹፌር|ሰርቪስ|ጽዳት|ጥገና|ሞግዚት|አስተማሪ|ዲዛይን|driver|plumber|electrician|mechanic)/i.test(t)) {
+    return "Labor & Services";
+  }
   return "ምንአለሽ_ተራ";
 }
 
+function detectAmharicSubcategory(text, category) {
+  if (category === "Cars") {
+    if (/ኤሌክትሪክ|በቻርጅ|\bev\b|electric/i.test(text)) return "Electric (EV)";
+    if (/ፒክአፕ|ገልባጭ|ትራክ|pickup|truck/i.test(text)) return "Pickup / Truck";
+    if (/ቫን|ሚኒባስ|ዶልፊን|van|minibus/i.test(text)) return "Van / Minibus";
+    if (/suv|ኤስዩቪ/i.test(text)) return "SUV / Crossover";
+    if (/sedan|ሴዳን/i.test(text)) return "Sedan";
+    return "Vehicles";
+  }
+  if (category === "Houses" || category === "Rentals") {
+    if (/ኮንዶሚኒየም|condo/i.test(text)) return "Condominium";
+    if (/አፓርታማ|apartment/i.test(text)) return "Apartment";
+    if (/ቪላ|villa/i.test(text)) return "Villa";
+    if (/ቦታ|መሬት|ይዞታ|land|plot/i.test(text)) return "Land / Plot";
+    if (/ቢሮ|ሱቅ|መጋዘን|ህንጻ|commercial|office|shop/i.test(text)) return "Commercial / Office";
+    return category === "Rentals" ? "For Rent" : "Residential";
+  }
+  if (category === "Electronics") {
+    if (/ስልክ|ሞባይል|አይፎን|ታብሌት|phone|tablet/i.test(text)) return "Smartphones & Tablets";
+    if (/ላፕቶፕ|ኮምፒውተር|laptop|computer/i.test(text)) return "Laptops & Computers";
+    if (/ቴሌቪዥን|ቲቪ|tv/i.test(text)) return "TV & Home Entertainment";
+    if (/ፍሪጅ|ማጠቢያ|ማይክሮዌቭ|fridge/i.test(text)) return "Home Appliances";
+    return "Electronics";
+  }
+  if (category === "Furniture") {
+    if (/ሶፋ|sofa/i.test(text)) return "Living Room";
+    if (/አልጋ|ፍራሽ|ቁምሳጥን|bed/i.test(text)) return "Bedroom";
+    if (/ጠረጴዛ|ወንበር|table|chair/i.test(text)) return "Dining & Office";
+    return "Furniture";
+  }
+  return category;
+}
+
+function detectCondition(text, category) {
+  if (category === "Rentals" || /(?:ለኪራይ|የሚከራይ|ይከራያል|\bfor\s*rent\b)/i.test(text)) {
+    return "For Rent";
+  }
+  if (/(?:ብራንድ\s*ኒው|አዲስ|ዜሮ\s*ኪሎ|00\s*km|\bbrand\s*new\b)/i.test(text) && !/ያገለገለ|used/i.test(text)) {
+    return "New";
+  }
+  return "Used";
+}
+
+// ============================================
+// MATHEMATICAL AMHARIC + ENGLISH PRICE PARSER
+// ============================================
 function parseMathematicalPrice(text, knownYear) {
   if (!text) return { formattedPrice: "0", rawPrice: 0 };
-  const detectedYear = (knownYear ? knownYear.split("/")[0] : "") || "";
+  const detectedYear = (knownYear ? knownYear.split("/")[0].replace(/\D/g, "") : "") || "";
 
   const isExcluded = (num, rawStr) => {
     if (detectedYear && (num.toString() === detectedYear || rawStr.includes(detectedYear))) return true;
     if (num >= 1970 && num <= 2035) {
-      const yearPattern = new RegExp(`(?:year|ዓመተ|model|ሞዴል|month|ወር)?\\s*${num}`, "i");
+      const yearPattern = new RegExp(`(?:year|ዓመተ|ዓ\\.?ም|model|ሞዴል|month|ወር)?\\s*${num}`, "i");
       if (yearPattern.test(text)) return true;
     }
     return false;
   };
 
-  const explicitLineMatch = text.match(/(?:💰|price|ዋጋ|fixed|የመሸጫ\s*ዋጋ)[ \t:=-]+([0-9.,]+)\s*(?:ETB|ብር|Birr)?\s*(?:million|mil|mln|m|ሚሊዮን|ሚሊየን|k|thousand|ሺህ|ሺ)?/i);
+  // 1. Compound Amharic/English Million + Thousand (e.g. "4 ሚሊዮን 500 ሺህ" -> 4,500,000)
+  const compoundMillionMatch = text.match(
+    /([0-9]+(?:[.,][0-9]+)?)\s*(?:ETB|ብር|Birr)?\s*(?:million|mil|mln|ሚሊዮን|ሚሊየን|ሚ\.?)(?:\s*(?:ከ|እና)?\s*([0-9]+(?:[.,][0-9]+)?)\s*(?:thousand|ሺህ|ሺ|k))?/i
+  );
+  if (compoundMillionMatch && compoundMillionMatch[1]) {
+    const milVal = parseFloat(compoundMillionMatch[1].replace(/,/g, ""));
+    const thouVal = compoundMillionMatch[2] ? parseFloat(compoundMillionMatch[2].replace(/,/g, "")) : 0;
+    if (!isNaN(milVal) && milVal > 0 && milVal < 1000) {
+      const finalNum = Math.round(milVal * 1000000 + (isNaN(thouVal) ? 0 : thouVal * 1000));
+      return { formattedPrice: finalNum.toLocaleString("en-US"), rawPrice: finalNum };
+    }
+  }
+
+  // 2. Explicit price label line (ዋጋ, የመሸጫ ዋጋ, መሸጫ, ኪራይ, Price, Fixed)
+  const explicitLineMatch = text.match(
+    /(?:💰|price|ዋጋ|fixed|የመሸጫ\s*ዋጋ|መሸጫ|ጠቅላላ\s*ዋጋ|ወርሃዊ\s*ኪራይ|ኪራይ)[ \t:：=-]+(?:በ\s*)?([0-9.,]+)\s*(?:ETB|ብር|Birr)?\s*(?:million|mil|mln|m|ሚሊዮን|ሚሊየን|ሚ|k|thousand|ሺህ|ሺ)?/i
+  );
   if (explicitLineMatch && explicitLineMatch[1]) {
     const rawVal = explicitLineMatch[1];
-    const isMillion = /(?:million|mil|mln|m|ሚሊዮን|ሚሊየን)/i.test(explicitLineMatch[0]);
-    const isThousand = /(?:k|thousand|ሺህ|ሺ)/i.test(explicitLineMatch[0]);
+    const isMillion = /(?:million|mil|mln|\bm\b|ሚሊዮን|ሚሊየን|ሚ(?:\s|$))/i.test(explicitLineMatch[0]);
+    const isThousand = /(?:\bk\b|thousand|ሺህ|ሺ)/i.test(explicitLineMatch[0]);
 
     if (isMillion) {
-      const cleanNum = rawVal.replace(/,/g, "");
-      const val = parseFloat(cleanNum);
+      const val = parseFloat(rawVal.replace(/,/g, ""));
       if (!isNaN(val) && val > 0) {
         const finalNum = val < 1000 ? Math.round(val * 1000000) : Math.round(val);
         return { formattedPrice: finalNum.toLocaleString("en-US"), rawPrice: finalNum };
       }
     } else if (isThousand) {
-      const cleanNum = rawVal.replace(/,/g, "");
-      const val = parseFloat(cleanNum);
+      const val = parseFloat(rawVal.replace(/,/g, ""));
       if (!isNaN(val) && val > 0) {
         const finalNum = val < 10000 ? Math.round(val * 1000) : Math.round(val);
         return { formattedPrice: finalNum.toLocaleString("en-US"), rawPrice: finalNum };
@@ -1090,18 +1401,8 @@ function parseMathematicalPrice(text, knownYear) {
     }
   }
 
-  const generalMillionMatch = text.match(/([0-9]+(?:[.,][0-9]+)*)\s*(?:ETB|ብር|Birr)?\s*(?:million|mil|mln|m|ሚሊዮን|ሚሊየን)\b/i);
-  if (generalMillionMatch && generalMillionMatch[1]) {
-    const rawVal = generalMillionMatch[1];
-    const cleanNum = rawVal.replace(/,/g, "");
-    const val = parseFloat(cleanNum);
-    if (!isNaN(val) && val > 0) {
-      const finalNum = val < 1000 ? Math.round(val * 1000000) : Math.round(val);
-      return { formattedPrice: finalNum.toLocaleString("en-US"), rawPrice: finalNum };
-    }
-  }
-
-  const thousandMatch = text.match(/([0-9]+(?:[.,][0-9]+)*)\s*(?:ETB|ብር|Birr)?\s*(?:k|thousand|ሺህ|ሺ)\b/i);
+  // 3. Thousand patterns anywhere (e.g. "450 ሺህ", "250ሺ", "35k")
+  const thousandMatch = text.match(/([0-9]+(?:[.,][0-9]+)*)\s*(?:ETB|ብር|Birr)?\s*(?:k\b|thousand|ሺህ|ሺ)/i);
   if (thousandMatch && thousandMatch[1]) {
     const rawVal = thousandMatch[1];
     const val = parseFloat(rawVal.replace(/,/g, ""));
@@ -1111,7 +1412,10 @@ function parseMathematicalPrice(text, knownYear) {
     }
   }
 
-  const currencyMatch = text.match(/(?:ETB|ብር|Birr)\s*[:=.-]?\s*([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{5,10})|([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{5,10})\s*(?:ETB|ብር|Birr)/i);
+  // 4. Currency adjacent numbers ("ETB 5,650,000", "45,000 ብር")
+  const currencyMatch = text.match(
+    /(?:ETB|ብር|Birr)\s*[:=.-]?\s*([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{4,10})|([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{4,10})\s*(?:ETB|ብር|Birr)/i
+  );
   if (currencyMatch) {
     const rawVal = currencyMatch[1] || currencyMatch[2];
     if (rawVal) {
@@ -1122,13 +1426,14 @@ function parseMathematicalPrice(text, knownYear) {
     }
   }
 
+  // 5. Fallback scan on lines containing ዋጋ or price
   const lines = text.split("\n");
   for (const line of lines) {
-    if (/(?:price|ዋጋ)/i.test(line)) {
-      const nums = line.match(/\b([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{5,9})\b/);
+    if (/(?:price|ዋጋ|መሸጫ|ኪራይ)/i.test(line)) {
+      const nums = line.match(/\b([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{4,9})\b/);
       if (nums) {
         const num = parseInt(nums[1].replace(/[.,]/g, ""), 10);
-        if (!isNaN(num) && num > 1000 && !isExcluded(num, nums[1])) {
+        if (!isNaN(num) && num > 500 && !isExcluded(num, nums[1])) {
           return { formattedPrice: num.toLocaleString("en-US"), rawPrice: num };
         }
       }
@@ -1140,7 +1445,6 @@ function parseMathematicalPrice(text, knownYear) {
 
 function cleanTheText(text) {
   if (!text) return "";
-  // Complete Unicode regex covering all emoji code point blocks
   const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE00}-\u{FE0F}\u{1F1E6}-\u{1F1FF}\u{200D}\u{20E3}\u{2190}-\u{21FF}\u{2300}-\u{23FF}\u{25A0}-\u{25FF}\u{2B50}\u{1F004}\u{1F0CF}\u{3030}\u{303D}\u{3297}\u{3299}]/gu;
   return text
     .replace(/https?:\/\/\S+/gi, "")
@@ -1149,7 +1453,7 @@ function cleanTheText(text) {
     .replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}\b/gi, "")
     .replace(EMOJI, "")
     .replace(/[*_~`|]/g, "")
-    .replace(/(?:phone|call|mobile|ስልክ|ቴሌግራም|telegram|contact|ይደውሉ|ይደውሉልን)[ \t:=-]+(?:or|\/)?\s*(?=\n|$)/gi, "")
+    .replace(/(?:phone|call|mobile|ስልክ|ቴሌግራም|telegram|contact|ይደውሉ|ይደውሉልን|ለበለጠ\s*መረጃ)[ \t:：=-]+(?:or|\/|ወይም)?\s*(?=\n|$)/gi, "")
     .replace(/[ \t]+/g, " ")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
@@ -1158,12 +1462,43 @@ function cleanTheText(text) {
 
 function extractCity(text) {
   const lower = text.toLowerCase();
-  if (/(አዲስ አበባ|addis ababa|finfinne|bole|sarbet|cmc|gerji|piassa|ayat|summit)/i.test(lower)) return "Addis Ababa";
-  if (/(hawassa|ሀዋሳ)/i.test(lower)) return "Hawassa";
-  if (/(adama|አዳማ|nazret)/i.test(lower)) return "Adama";
-  if (/(bahir dar|ባህር ዳር)/i.test(lower)) return "Bahir Dar";
-  if (/(dire dawa|ድሬዳዋ)/i.test(lower)) return "Dire Dawa";
+  if (/(አዲስ\s*አበባ|addis\s*ababa|finfinne|ቦሌ|ሳርቤት|ሲኤምሲ|ገርጂ|ፒያሳ|አያት|ሰሚት|መገናኛ|ለቡ|ጀሞ|bole|sarbet|cmc|gerji|piassa|ayat|summit)/i.test(lower)) return "Addis Ababa";
+  if (/(hawassa|ሀዋሳ|ሐዋሳ)/i.test(lower)) return "Hawassa";
+  if (/(adama|አዳማ|ናዝሬት|nazret)/i.test(lower)) return "Adama";
+  if (/(bahir\s*dar|ባህር\s*ዳር)/i.test(lower)) return "Bahir Dar";
+  if (/(dire\s*dawa|ድሬ\s*ዳዋ|ድሬዳዋ)/i.test(lower)) return "Dire Dawa";
+  if (/(gondar|ጎንደር)/i.test(lower)) return "Gondar";
+  if (/(mekelle|መቀሌ|መቀለ)/i.test(lower)) return "Mekelle";
+  if (/(jimma|ጅማ)/i.test(lower)) return "Jimma";
+  if (/(bishoftu|ቢሾፍቱ|ደብረ\s*ዘይት)/i.test(lower)) return "Bishoftu";
+  if (/(dessie|ደሴ)/i.test(lower)) return "Dessie";
+  if (/(harar|ሀረር|ሐረር)/i.test(lower)) return "Harar";
   return "Addis Ababa";
+}
+
+function extractSubcity(text) {
+  const map = [
+    [/ቦሌ|\bbole\b/i, "Bole"],
+    [/ሰሚት|\bsummit\b/i, "Summit"],
+    [/ሲኤምሲ|\bcmc\b/i, "CMC"],
+    [/ገርጂ|\bgerji\b/i, "Gerji"],
+    [/አያት|\bayat\b/i, "Ayat"],
+    [/ሳር\s*ቤት|ሳርቤት|\bsarbet\b/i, "Sarbet"],
+    [/መገናኛ|\bmegenagna\b/i, "Megenagna"],
+    [/ካዛንቺስ|\bkazanchis\b/i, "Kazanchis"],
+    [/ለቡ|\blebu\b/i, "Lebu"],
+    [/ጀሞ|\bjemo\b/i, "Jemo"],
+    [/ፒያሳ|\bpiassa\b/i, "Piassa"],
+    [/የካ|\byeka\b/i, "Yeka"],
+    [/ቃሊቲ|\bkaliti\b/i, "Kaliti"],
+    [/መርካቶ|\bmerkato\b/i, "Merkato"],
+    [/4\s*ኪሎ|አራት\s*ኪሎ/i, "Arat Kilo"],
+    [/22|ሃያ\s*ሁለት/i, "Haya Hulet"]
+  ];
+  for (const [regex, label] of map) {
+    if (regex.test(text)) return label;
+  }
+  return "";
 }
 
 async function uploadImagesToCloudinary(imageFileIds, env) {
@@ -1190,6 +1525,44 @@ async function uploadImagesToCloudinary(imageFileIds, env) {
     }
   }
   return urls;
+}
+
+async function analyzeAmharicAdWithGemini(cleanText, env) {
+  if (!env.GEMINI_API_KEY || !cleanText) return null;
+  try {
+    const prompt = `You are an Ethiopian marketplace classifier for Amharic and English Telegram ads.
+Extract structured details from this listing text:
+"""
+${cleanText.substring(0, 900)}
+"""
+Return ONLY valid JSON:
+{
+  "title": "concise clean listing title (keep key Amharic or English product name, max 60 chars)",
+  "category": "one of: Cars, Houses, Rentals, Electronics, Furniture, Clothes, Labor & Services, ምንአለሽ_ተራ",
+  "subcategory": "concise subcategory",
+  "brand": "brand name in English if present, else empty string",
+  "model": "model name if present, else empty string",
+  "year": "4-digit year if present, else empty string",
+  "trim": "",
+  "priceETB": 0,
+  "city": "Addis Ababa",
+  "condition": "New or Used or For Rent"
+}`;
+
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { response_mime_type: "application/json" }
+      })
+    });
+    const data = await res.json();
+    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
 }
 
 async function inspectImageWithGemini(fileId, contextText, env) {
