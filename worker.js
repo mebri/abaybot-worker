@@ -1,13 +1,13 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * 
- * Production Complete Edition (v7.2 Resilient Web & Telegram Sync):
+ * Production Complete Edition (v7.2 Resilient Web & Telegram Sync + Admin Profile Ownership):
  * 1. Precision Bot Watermark Shield:
  *    - Only drops posts that contain the distinct bot footer signature (mebri.yegna.workers.dev).
  *    - Never drops legitimate seller ads containing #Cars, #Houses, #Electronics, or "Price:".
- * 2. Instant Website Sync:
- *    - Posts directly to Website API (/api/ads) so ads appear instantly on the web app.
- *    - Non-blocking Firestore sync as secondary persistent store.
+ * 2. Instant Website & Profile Sync:
+ *    - Posts directly to Website API (/api/ads) tagged to marbatu1@gmail.com for profile edit/delete.
+ *    - Resolves marbatu1@gmail.com UID in Firestore so bot ads appear on your user profile.
  * 3. Infallible In-Memory Locking:
  *    - Zero dependence on failing Cache API on *.workers.dev subdomains.
  * 4. Dual Ingestion & In-Channel Cleaning:
@@ -29,6 +29,8 @@ const memoryLocks = new Map(); // key -> expireTimestamp
 const updateIdLocks = new Set(); // Telegram update_id deduplication
 let cachedFirebaseToken = null;
 let tokenExpiresAt = 0;
+let cachedAdminUid = null;
+let cachedAdminEmailForUid = "";
 
 export default {
   async fetch(request, env, ctx) {
@@ -44,6 +46,7 @@ export default {
         `• Bot Token Configured: ${botConfigured ? "YES ✅" : "NO ❌ (Add TELEGRAM_BOT_TOKEN in Cloudflare Settings > Variables!)"}\n` +
         `• Repost Channel: ${targetChannel}\n` +
         `• Website API: ${websiteUrl}/api/ads\n` +
+        `• Admin Profile: ${env.ADMIN_EMAIL || "marbatu1@gmail.com"}\n` +
         `• Version: v7.2 Production Resilient\n`,
         { 
           status: 200,
@@ -565,13 +568,17 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
     ? imageUrls 
     : ["https://images.unsplash.com/photo-1549399542-7e3f8b79c341?auto=format&fit=crop&w=900&q=80"];
 
+  // Profile ownership & document ID for website + Firebase profile management
+  const websiteBaseUrl = (env.WEBSITE_URL || "https://ais-dev-ligixirxwi2nidlsx5j5hb-166746593299.europe-west3.run.app").replace(/\/$/, "");
+  const adOwnerEmail = env.ADMIN_EMAIL || "marbatu1@gmail.com";
+  const adDocId = mediaGroupId ? `tg_${message.chat?.id || ""}_${mediaGroupId}` : `tg_${textHash}`;
+
   // ============================================
   // 1. SAVE TO WEBSITE DIRECTLY (/api/ads)
   // ============================================
-  const websiteBaseUrl = (env.WEBSITE_URL || "https://ais-dev-ligixirxwi2nidlsx5j5hb-166746593299.europe-west3.run.app").replace(/\/$/, "");
   try {
     const webAdPayload = {
-      id: mediaGroupId ? `tg_${message.chat?.id || ""}_${mediaGroupId}` : `ad_${textHash}`,
+      id: adDocId,
       title: arrangedTitle,
       category: category,
       subcategory: subcategory,
@@ -582,8 +589,12 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
       images: finalDisplayImages,
       description: cleanText,
       phone: "0911680790",
-      sellerName: "የኛ ገበያ (Telegram)",
-      featured: true
+      sellerName: "የኛ ገበያ (Telegram Bot)",
+      featured: true,
+      source: "telegram",
+      ownerEmail: adOwnerEmail,
+      userEmail: adOwnerEmail,
+      status: "available"
     };
 
     await fetch(`${websiteBaseUrl}/api/ads`, {
@@ -591,7 +602,7 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(webAdPayload)
     });
-    console.log(`✅ Ad synced to website: ${websiteBaseUrl}/api/ads`);
+    console.log(`✅ Ad synced to website (${adOwnerEmail}): ${websiteBaseUrl}/api/ads`);
   } catch (webApiErr) {
     console.warn("Website API sync skipped:", webApiErr.message);
   }
@@ -603,9 +614,8 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
     const token = await getFirebaseToken(env);
     if (token && env.FIREBASE_PROJECT_ID) {
       const projectId = env.FIREBASE_PROJECT_ID;
-      const adOwnerId = env.ADMIN_UID || "admin_bot";
-      const docId = mediaGroupId ? `tg_${message.chat?.id || ""}_${mediaGroupId}` : `ad_${textHash}`;
-      const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${docId}`;
+      const adOwnerId = await resolveAdminUidByEmail(token, projectId, adOwnerEmail, env.ADMIN_UID || "admin_bot");
+      const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${adDocId}`;
 
       const adData = {
         fields: {
@@ -629,7 +639,13 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
           images: { arrayValue: { values: finalDisplayImages.map((url) => ({ stringValue: url })) } },
           status: { stringValue: "available" },
           source: { stringValue: "telegram" },
+          isBotPost: { booleanValue: true },
           userId: { stringValue: adOwnerId },
+          uid: { stringValue: adOwnerId },
+          ownerId: { stringValue: adOwnerId },
+          userEmail: { stringValue: adOwnerEmail },
+          email: { stringValue: adOwnerEmail },
+          ownerEmail: { stringValue: adOwnerEmail },
           views: { integerValue: "0" },
           createdAt: { timestampValue: new Date().toISOString() }
         }
@@ -640,7 +656,7 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, 
         body: JSON.stringify(adData) 
       });
-      console.log("✅ Saved to Website (Firebase Firestore)");
+      console.log(`✅ Saved to Website (Firebase Firestore) for ${adOwnerEmail} (${adOwnerId})`);
     }
   } catch (fbErr) {
     console.warn("Firebase sync skipped:", fbErr.message);
@@ -1252,4 +1268,58 @@ function base64UrlEncode(str) {
   let binary = "";
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function resolveAdminUidByEmail(token, projectId, email, fallbackUid = "admin_bot") {
+  if (fallbackUid && fallbackUid !== "admin_bot") {
+    return fallbackUid;
+  }
+  if (!email) return fallbackUid;
+  if (cachedAdminUid && cachedAdminEmailForUid === email) {
+    return cachedAdminUid;
+  }
+
+  try {
+    const queryUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents:runQuery`;
+    const res = await fetch(queryUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: "users" }],
+          where: {
+            fieldFilter: {
+              field: { fieldPath: "email" },
+              op: "EQUAL",
+              value: { stringValue: email }
+            }
+          },
+          limit: 1
+        }
+      })
+    });
+
+    if (res.ok) {
+      const results = await res.json();
+      if (Array.isArray(results)) {
+        const doc = results.find((r) => r && r.document && r.document.name);
+        if (doc) {
+          const parts = doc.document.name.split("/");
+          const uid = parts[parts.length - 1];
+          if (uid) {
+            cachedAdminUid = uid;
+            cachedAdminEmailForUid = email;
+            return uid;
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("Admin UID lookup skipped:", err.message);
+  }
+
+  return fallbackUid;
 }
