@@ -1,13 +1,14 @@
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  * 
- * Production Complete Edition (v7.2 Resilient Web & Telegram Sync + Admin Profile Ownership):
+ * Production Complete Edition (v7.3 Resilient Web & Telegram Sync + Profile Ownership & Old Post Migration):
  * 1. Precision Bot Watermark Shield:
  *    - Only drops posts that contain the distinct bot footer signature (mebri.yegna.workers.dev).
  *    - Never drops legitimate seller ads containing #Cars, #Houses, #Electronics, or "Price:".
- * 2. Instant Website & Profile Sync:
+ * 2. Instant Website & Profile Sync (marbatu1@gmail.com):
  *    - Posts directly to Website API (/api/ads) tagged to marbatu1@gmail.com for profile edit/delete.
  *    - Resolves marbatu1@gmail.com UID in Firestore so bot ads appear on your user profile.
+ *    - Includes ?migrate=old_bot_posts GET route to assign existing old bot posts in Firestore to your profile.
  * 3. Infallible In-Memory Locking:
  *    - Zero dependence on failing Cache API on *.workers.dev subdomains.
  * 4. Dual Ingestion & In-Channel Cleaning:
@@ -34,8 +35,17 @@ let cachedAdminEmailForUid = "";
 
 export default {
   async fetch(request, env, ctx) {
-    // Health check endpoint on GET
+    // Health check & one-click old post migration endpoint on GET
     if (request.method !== "POST") {
+      const url = new URL(request.url);
+      if (url.searchParams.get("migrate") === "old_bot_posts") {
+        const result = await migrateOldBotPostsToProfile(env);
+        return new Response(JSON.stringify(result, null, 2), {
+          status: result.ok ? 200 : 500,
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        });
+      }
+
       const botConfigured = Boolean(env.TELEGRAM_BOT_TOKEN);
       const targetChannel = env.REPOST_CHANNEL_ID || "@mebrigranite";
       const websiteUrl = env.WEBSITE_URL || "https://ais-dev-ligixirxwi2nidlsx5j5hb-166746593299.europe-west3.run.app";
@@ -47,7 +57,8 @@ export default {
         `• Repost Channel: ${targetChannel}\n` +
         `• Website API: ${websiteUrl}/api/ads\n` +
         `• Admin Profile: ${env.ADMIN_EMAIL || "marbatu1@gmail.com"}\n` +
-        `• Version: v7.2 Production Resilient\n`,
+        `• Version: v7.3 Production Resilient\n` +
+        `• Old Post Migration: Visit ?migrate=old_bot_posts once to assign old bot posts to your profile\n`,
         { 
           status: 200,
           headers: { "Content-Type": "text/plain; charset=utf-8" }
@@ -1322,4 +1333,118 @@ async function resolveAdminUidByEmail(token, projectId, email, fallbackUid = "ad
   }
 
   return fallbackUid;
+}
+
+async function migrateOldBotPostsToProfile(env) {
+  const token = await getFirebaseToken(env);
+  const projectId = env.FIREBASE_PROJECT_ID;
+  const adOwnerEmail = env.ADMIN_EMAIL || "marbatu1@gmail.com";
+
+  if (!token || !projectId) {
+    return {
+      ok: false,
+      error: "Missing FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY, or FIREBASE_PROJECT_ID in Cloudflare Variables."
+    };
+  }
+
+  const adOwnerId = await resolveAdminUidByEmail(token, projectId, adOwnerEmail, env.ADMIN_UID || "admin_bot");
+  const baseAdsUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads`;
+  const maskParams = [
+    "userId",
+    "uid",
+    "ownerId",
+    "userEmail",
+    "email",
+    "ownerEmail",
+    "source",
+    "isBotPost"
+  ].map((f) => `updateMask.fieldPaths=${f}`).join("&");
+
+  let pageToken = "";
+  let scanned = 0;
+  let updated = 0;
+  let skippedAlreadyOwned = 0;
+  let errors = 0;
+
+  do {
+    const listUrl = `${baseAdsUrl}?pageSize=100${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ""}`;
+    const listRes = await fetch(listUrl, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    const listData = await listRes.json();
+
+    if (!listRes.ok) {
+      return {
+        ok: false,
+        error: listData?.error?.message || `Firestore list failed (${listRes.status})`
+      };
+    }
+
+    const docs = listData.documents || [];
+    for (const doc of docs) {
+      scanned++;
+      const docId = doc.name.split("/").pop() || "";
+      const f = doc.fields || {};
+      const existingUid = f.userId?.stringValue || "";
+      const existingEmail = f.userEmail?.stringValue || f.ownerEmail?.stringValue || "";
+      const source = f.source?.stringValue || "";
+
+      const isOldBotPost =
+        source === "telegram" ||
+        existingUid === "admin_bot" ||
+        docId.startsWith("tg_") ||
+        (docId.startsWith("ad_") && (!existingUid || existingUid === "admin_bot") && !existingEmail);
+
+      if (!isOldBotPost) continue;
+
+      const alreadyOwned = existingEmail === adOwnerEmail && existingUid === adOwnerId;
+      if (alreadyOwned) {
+        skippedAlreadyOwned++;
+        continue;
+      }
+
+      const patchRes = await fetch(`${baseAdsUrl}/${encodeURIComponent(docId)}?${maskParams}`, {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          fields: {
+            userId: { stringValue: adOwnerId },
+            uid: { stringValue: adOwnerId },
+            ownerId: { stringValue: adOwnerId },
+            userEmail: { stringValue: adOwnerEmail },
+            email: { stringValue: adOwnerEmail },
+            ownerEmail: { stringValue: adOwnerEmail },
+            source: { stringValue: "telegram" },
+            isBotPost: { booleanValue: true }
+          }
+        })
+      });
+
+      if (patchRes.ok) {
+        updated++;
+      } else {
+        errors++;
+      }
+    }
+
+    pageToken = listData.nextPageToken || "";
+  } while (pageToken);
+
+  return {
+    ok: true,
+    adminEmail: adOwnerEmail,
+    resolvedUid: adOwnerId,
+    uidAutoMatched: adOwnerId !== "admin_bot",
+    scanned,
+    updated,
+    skippedAlreadyOwned,
+    errors,
+    note:
+      adOwnerId === "admin_bot"
+        ? "UID not found in Firestore users collection; set ADMIN_UID in Cloudflare Variables to your Firebase Auth UID and re-run if your profile filters only by UID."
+        : "All old bot posts now match your profile UID and email."
+  };
 }
