@@ -1,4 +1,3 @@
-// FILE: worker.js
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
  *
@@ -65,22 +64,60 @@ const DEFAULT_CATEGORY_IMAGES = {
 
 export default {
   async fetch(request, env, ctx) {
-    // Health check endpoint on GET
+    const url = new URL(request.url);
+
+    // Interactive AI classifier test endpoint: GET /?test=ai&q=...
+    if (request.method === "GET" && url.searchParams.get("test") === "ai") {
+      const sampleText = (url.searchParams.get("q") || "Bole G+2 Villa for sale 500 sqm with granite kitchen 85 million").trim();
+      const normalized = normalizeEthiopicNumerals(sampleText);
+      const specs = detectBrandModelYear(normalized);
+      const ruleResult = detectCategoryWeighted(normalized, specs.brand, specs.subcategory);
+      const aiResult = await classifyAdWithAI(normalized, null, specs, ruleResult, env);
+      return new Response(
+        JSON.stringify({ input: sampleText, specs, ruleResult, aiResult }, null, 2),
+        { status: 200, headers: { "Content-Type": "application/json; charset=utf-8" } }
+      );
+    }
+
+    // Health & diagnostics endpoint on GET
     if (request.method !== "POST") {
       const botConfigured = Boolean(env.TELEGRAM_BOT_TOKEN);
       const geminiConfigured = Boolean(env.GEMINI_API_KEY);
       const workersAiConfigured = Boolean(env.AI);
+      const firebaseConfigured = Boolean(env.FIREBASE_PROJECT_ID && env.FIREBASE_CLIENT_EMAIL && env.FIREBASE_PRIVATE_KEY);
+      const cloudinaryConfigured = Boolean(env.CLOUDINARY_CLOUD_NAME && env.CLOUDINARY_CLOUD_NAME !== "your_cloud_name");
       const targetChannel = env.REPOST_CHANNEL_ID || "@mebrigranite";
       const websiteUrl = env.WEBSITE_URL || "https://mebri.yegna.workers.dev";
 
+      let webhookStatus = "Unknown (TELEGRAM_BOT_TOKEN missing)";
+      if (botConfigured) {
+        try {
+          const whRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getWebhookInfo`);
+          const whData = await whRes.json();
+          if (whData.ok && whData.result) {
+            const currentWh = whData.result.url || "(NOT SET)";
+            const errMsg = whData.result.last_error_message ? ` | Last Error: ${whData.result.last_error_message}` : "";
+            webhookStatus = `${currentWh}${errMsg}`;
+          } else {
+            webhookStatus = `Invalid Bot Token (${whData.description || "unauthorized"}) ❌`;
+          }
+        } catch (e) {
+          webhookStatus = `Check failed: ${e.message}`;
+        }
+      }
+
       return new Response(
         `Yegna Gebeya Telegram Bot is Active ✅\n\n` +
-        `• Status: Running\n` +
-        `• Bot Token Configured: ${botConfigured ? "YES ✅" : "NO ❌ (Add TELEGRAM_BOT_TOKEN in Cloudflare Settings > Variables!)"}\n` +
-        `• AI Classification: ${geminiConfigured ? "Gemini 4 Hydrogen ✅" : workersAiConfigured ? "Cloudflare Workers AI (Free Built-in) ✅" : "Weighted Rule Classifier Only ⚠️ (Bind [ai] or set GEMINI_API_KEY)"}\n` +
+        `• Worker URL: ${url.origin}\n` +
+        `• Bot Token Configured: ${botConfigured ? "YES ✅" : "NO ❌ (Add TELEGRAM_BOT_TOKEN in Cloudflare Settings > Variables and Secrets!)"}\n` +
+        `• Telegram Webhook URL: ${webhookStatus}\n` +
+        `• AI Classification: ${geminiConfigured ? "Gemini 4 Hydrogen ✅" : workersAiConfigured ? "Cloudflare Workers AI (Free Built-in) ✅" : "Weighted Rule Classifier Only ⚠️"}\n` +
+        `• Firebase Firestore Sync: ${firebaseConfigured ? "YES ✅" : "NO ⚠️ (Missing FIREBASE_CLIENT_EMAIL or FIREBASE_PRIVATE_KEY)"}\n` +
+        `• Cloudinary Photo Upload: ${cloudinaryConfigured ? "YES ✅" : "NO ⚠️ (Set CLOUDINARY_CLOUD_NAME)"}\n` +
         `• Repost Channel: ${targetChannel}\n` +
         `• Website API: ${websiteUrl}/api/ads\n` +
-        `• Version: v8.0 AI Category Engine\n`,
+        `• Version: v8.1 AI Category Engine\n` +
+        `\nTip: Test AI classification at ${url.origin}/?test=ai&q=Toyota+Corolla+2020\n`,
         {
           status: 200,
           headers: { "Content-Type": "text/plain; charset=utf-8" }
@@ -651,7 +688,7 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
     }
   }
 
-  if (!subcategory || (subcategory === "Vehicles" && category !== "Cars")) {
+  if (!subcategory || subcategory === "Vehicles" && category !== "Cars") {
     subcategory = DEFAULT_SUBCATEGORIES[category] || "General Marketplace";
   }
 
@@ -1002,16 +1039,23 @@ function parseJsonObjectSafe(rawText) {
   }
 }
 
+function getTimeoutSignal(ms) {
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+    return AbortSignal.timeout(ms);
+  }
+  return undefined;
+}
+
 async function fetchTelegramPhotoBase64(fileId, env) {
   if (!fileId || !env.TELEGRAM_BOT_TOKEN) return null;
   try {
     const fileRes = await callTelegram("getFile", { file_id: fileId }, env);
     if (!fileRes?.file_path) return null;
     const tgUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileRes.file_path}`;
-    const imgFetch = await fetch(tgUrl, { signal: AbortSignal.timeout(6000) });
+    const imgFetch = await fetch(tgUrl, { signal: getTimeoutSignal(6000) });
     if (!imgFetch.ok) return null;
     const arrayBuffer = await imgFetch.arrayBuffer();
-    if (arrayBuffer.byteLength > 4 * 1024 * 1024) return null;
+    if (arrayBuffer.byteLength > 4 * 1024 * 1024) return null; // Keep memory bounded on Worker
     const ext = fileRes.file_path.split(".").pop()?.toLowerCase();
     const mimeType = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
     return { base64: arrayBufferToBase64(arrayBuffer), mimeType };
@@ -1051,6 +1095,7 @@ Return ONLY valid JSON with keys: category, subcategory, brand, model, year, tri
 }
 
 async function classifyAdWithAI(cleanText, firstImageFileId, specs, ruleResult, env) {
+  // Fetch photo once if either Gemini or Workers AI needs visual context
   const needsImage = Boolean(firstImageFileId && (env.GEMINI_API_KEY || env.AI));
   const photoData = needsImage ? await fetchTelegramPhotoBase64(firstImageFileId, env) : null;
 
@@ -1067,7 +1112,7 @@ async function classifyAdWithAI(cleanText, firstImageFileId, specs, ruleResult, 
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          signal: AbortSignal.timeout(9000),
+          signal: getTimeoutSignal(9000),
           body: JSON.stringify({
             contents: [{ parts }],
             generationConfig: {
@@ -1112,6 +1157,7 @@ async function classifyAdWithAI(cleanText, firstImageFileId, specs, ruleResult, 
   if (env.AI) {
     let imageDescription = "";
 
+    // If post has an image (especially helpful when caption is short/missing or ambiguous), inspect photo via Llama 3.2 Vision
     if (photoData && (cleanText.length < 40 || ruleResult.confidence < 0.8 || (!specs.brand && ruleResult.category === "Cars"))) {
       try {
         const visionOut = await Promise.race([
@@ -1155,8 +1201,7 @@ async function classifyAdWithAI(cleanText, firstImageFileId, specs, ruleResult, 
             }
           ],
           temperature: 0.1,
-          max_tokens: 300,
-          response_format: { type: "json_object" }
+          max_tokens: 300
         }),
         new Promise((_, reject) => setTimeout(() => reject(new Error("llm_timeout")), 7000))
       ]);
@@ -1334,6 +1379,7 @@ function detectCategoryWeighted(text, brand = "", suggestedSubcat = "") {
   const hasCarBrand = Boolean(brand && CAR_DATABASE.some((b) => b.name.toLowerCase() === brand.toLowerCase()));
   const hasElecBrand = Boolean(brand && ELECTRONICS_DATABASE.some((eb) => eb.name.toLowerCase() === brand.toLowerCase()));
 
+  // Whole-vehicle indicators vs spare part indicators
   const wholeCarSignals = /(መኪና|አውቶሞቢል|ተሽከርካሪ|ታርጋ|ኮድ\s*[1234]|mileage|odometer|\bkm\b|automatic|manual|ኦቶማቲክ|ማኑዋል|kwh|single\s*motor|dual\s*motor|\bsuv\b|\bsedan\b|hatchback|pickup)/gi;
   const wholeCarMatches = (t.match(wholeCarSignals) || []).length;
   const partSignals = /(spare\s*part|auto\s*part|car\s*part|brake\s*pad|shock\s*absorber|alternator|radiator|headlight|bumper|engine\s*oil|car\s*battery|tyre|\btire\b|alloy\s*rim|መለዋወጫ|ስፔር\s*ፓርት|ጎማ|የመኪና\s*ባትሪ|ፍሬን|ፋሮ|ፓራውልት|ቦምፐር|ራዲያተር|ፊልተር|ሞተር\s*ዘይት)/gi;
@@ -1346,6 +1392,7 @@ function detectCategoryWeighted(text, brand = "", suggestedSubcat = "") {
   }
 
   if (partMatches > 0) {
+    // If whole car specs are strong (mileage, transmission, plate code), mentions like "new tires/battery" are features of the car!
     if (wholeCarMatches >= 2 || (hasCarBrand && /(mileage|\bkm\b|ታርጋ|ኮድ|plate|year|20\d{2}|ሞዴል)/i.test(t) && !/(spare\s*part|መለዋወጫ|ስፔር\s*ፓርት)/i.test(t))) {
       scores["Spare Parts"] += 1;
     } else {
@@ -1353,6 +1400,7 @@ function detectCategoryWeighted(text, brand = "", suggestedSubcat = "") {
     }
   }
 
+  // Real Estate (Houses / Rentals) vs Building Materials / Furnished items
   const propertySignals = /(house|villa|condominium|condo|apartment|g\+\d|real\s*estate|compound|bedroom|office|shop|store|warehouse|hall|land|plot|ቤት|ቪላ|ኮንዶሚኒየም|ኮንዶ|አፓርታማ|ሪል\s*እስቴት|መኝታ|ቦታ|መሬት|ሱቅ|ቢሮ|መጋዘን|አዳራሽ|ካርታ)/gi;
   const propertyMatches = (t.match(propertySignals) || []).length;
   const rentalSignals = /(for\s*rent|\brent\b|\blease\b|\bmonthly\b|ኪራይ|የሚከራይ|ለኪራይ|ወርሃዊ|በወር)/gi;
@@ -1373,6 +1421,7 @@ function detectCategoryWeighted(text, brand = "", suggestedSubcat = "") {
   }
 
   if (materialMatches > 0) {
+    // Only boost Building Materials above Houses if property sale/rent cues aren't dominant OR bulk supply cues exist
     if (propertyMatches >= 2 && !bulkSupplySignals && !/(building\s*material|የግንባታ\s*እቃ)/i.test(t)) {
       scores["Building Materials"] += 1;
     } else {
@@ -1380,23 +1429,28 @@ function detectCategoryWeighted(text, brand = "", suggestedSubcat = "") {
     }
   }
 
+  // Electronics (don't let "furnished with TV/fridge" override Rentals/Houses)
   const elecMatches = (t.match(/(iphone|samsung|laptop|computer|macbook|ipad|smartphone|tablet|smart\s*tv|television|camera|ps5|playstation|xbox|fridge|refrigerator|washing\s*machine|ስልክ|ሞባይል|ላፕቶፕ|ኮምፒውተር|ቴሌቪዥን|ቲቪ|ካሜራ|ፍሪጅ|የልብስ\s*ማጠቢያ)/gi) || []).length;
   if (hasElecBrand) scores.Electronics += 4;
   if (elecMatches > 0) {
     scores.Electronics += propertyMatches >= 2 ? 1 : elecMatches * 3;
   }
 
+  // Furniture (don't let "furnished apartment with sofa/bed" override Rentals/Houses)
   const furnMatches = (t.match(/(sofa|bed|mattress|table|chair|cupboard|wardrobe|furniture|cabinet|shelf|desk|ሶፋ|አልጋ|ፍራሽ|ጠረጴዛ|ወንበር|ቁምሳጥን|ፈርኒቸር|ቡፌ|መደርደሪያ)/gi) || []).length;
   if (furnMatches > 0) {
     scores.Furniture += propertyMatches >= 2 ? 1 : furnMatches * 3;
   }
 
+  // Clothes
   const clothMatches = (t.match(/(shoes|sneakers|boots|jacket|dress|suit|t-?shirt|clothes|pants|hoodie|handbag|watch|ጫማ|ጃኬት|ቀሚስ|ልብስ|ሱሪ|ቲሸርት|ኮት|ቦርሳ|ሀበሻ\s*ቀሚስ)/gi) || []).length;
   scores.Clothes += clothMatches * 3;
 
+  // Labor & Services
   const serviceMatches = (t.match(/(driver|plumber|electrician|painter|mechanic|cleaner|carpenter|technician|tutor|delivery|maintenance|service|ቧንቧ|ኤሌክትሪክ\s*ባለሙያ|ቀለም\s*ቀቢ|ሹፌር|መካኒክ|ጽዳት|ሠራተኛ|አገልግሎት|ጥገና)/gi) || []).length;
   scores["Labor & Services"] += serviceMatches * 3;
 
+  // Pick highest scoring category
   let bestCategory = "ምንአለሽ_ተራ";
   let bestScore = 0;
   for (const [cat, score] of Object.entries(scores)) {
