@@ -81,18 +81,21 @@ export default {
 
     // Health & diagnostics endpoint on GET
     if (request.method !== "POST") {
-      const botConfigured = Boolean(env.TELEGRAM_BOT_TOKEN);
-      const geminiConfigured = Boolean(env.GEMINI_API_KEY);
+      const botToken = cleanEnv(env.TELEGRAM_BOT_TOKEN);
+      const geminiKey = cleanEnv(env.GEMINI_API_KEY);
+      const cloudName = cleanEnv(env.CLOUDINARY_CLOUD_NAME);
+      const botConfigured = Boolean(botToken);
+      const geminiConfigured = Boolean(geminiKey);
       const workersAiConfigured = Boolean(env.AI);
-      const firebaseConfigured = Boolean(env.FIREBASE_PROJECT_ID && env.FIREBASE_CLIENT_EMAIL && env.FIREBASE_PRIVATE_KEY);
-      const cloudinaryConfigured = Boolean(env.CLOUDINARY_CLOUD_NAME && env.CLOUDINARY_CLOUD_NAME !== "your_cloud_name");
-      const targetChannel = env.REPOST_CHANNEL_ID || "@mebrigranite";
-      const websiteUrl = env.WEBSITE_URL || "https://mebri.yegna.workers.dev";
+      const firebaseConfigured = Boolean(cleanEnv(env.FIREBASE_PROJECT_ID) && cleanEnv(env.FIREBASE_CLIENT_EMAIL) && cleanEnv(env.FIREBASE_PRIVATE_KEY));
+      const cloudinaryConfigured = Boolean(cloudName && cloudName !== "your_cloud_name");
+      const targetChannel = cleanEnv(env.REPOST_CHANNEL_ID) || "@mebrigranite";
+      const websiteUrl = cleanEnv(env.WEBSITE_URL) || "https://mebri.yegna.workers.dev";
 
       let webhookStatus = "Unknown (TELEGRAM_BOT_TOKEN missing)";
       if (botConfigured) {
         try {
-          const whRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getWebhookInfo`);
+          const whRes = await fetch(`https://api.telegram.org/bot${botToken}/getWebhookInfo`);
           const whData = await whRes.json();
           if (whData.ok && whData.result) {
             const currentWh = whData.result.url || "(NOT SET)";
@@ -187,7 +190,8 @@ async function processUpdate(update, env, request) {
   }
 
   // 5. IGNORE BOT'S OWN MESSAGES
-  const botId = env.TELEGRAM_BOT_TOKEN ? env.TELEGRAM_BOT_TOKEN.split(":")[0] : "";
+  const botToken = cleanEnv(env.TELEGRAM_BOT_TOKEN);
+  const botId = botToken ? botToken.split(":")[0] : "";
   if (message.from && botId) {
     const fromIdStr = String(message.from.id);
     if (fromIdStr === botId) {
@@ -349,13 +353,18 @@ function simpleHash(str) {
   return Math.abs(hash).toString();
 }
 
+function cleanEnv(val) {
+  return typeof val === "string" ? val.trim() : "";
+}
+
 async function callTelegram(method, body, env) {
-  if (!env.TELEGRAM_BOT_TOKEN) {
+  const botToken = cleanEnv(env.TELEGRAM_BOT_TOKEN);
+  if (!botToken) {
     console.error("❌ TELEGRAM_BOT_TOKEN is missing! Set it in Cloudflare Dashboard Variables.");
     throw new Error("TELEGRAM_BOT_TOKEN is missing");
   }
 
-  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
+  const res = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
@@ -1047,11 +1056,12 @@ function getTimeoutSignal(ms) {
 }
 
 async function fetchTelegramPhotoBase64(fileId, env) {
-  if (!fileId || !env.TELEGRAM_BOT_TOKEN) return null;
+  const botToken = cleanEnv(env.TELEGRAM_BOT_TOKEN);
+  if (!fileId || !botToken) return null;
   try {
     const fileRes = await callTelegram("getFile", { file_id: fileId }, env);
     if (!fileRes?.file_path) return null;
-    const tgUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileRes.file_path}`;
+    const tgUrl = `https://api.telegram.org/file/bot${botToken}/${fileRes.file_path}`;
     const imgFetch = await fetch(tgUrl, { signal: getTimeoutSignal(6000) });
     if (!imgFetch.ok) return null;
     const arrayBuffer = await imgFetch.arrayBuffer();
@@ -1095,12 +1105,13 @@ Return ONLY valid JSON with keys: category, subcategory, brand, model, year, tri
 }
 
 async function classifyAdWithAI(cleanText, firstImageFileId, specs, ruleResult, env) {
+  const geminiKey = cleanEnv(env.GEMINI_API_KEY);
   // Fetch photo once if either Gemini or Workers AI needs visual context
-  const needsImage = Boolean(firstImageFileId && (env.GEMINI_API_KEY || env.AI));
+  const needsImage = Boolean(firstImageFileId && (geminiKey || env.AI));
   const photoData = needsImage ? await fetchTelegramPhotoBase64(firstImageFileId, env) : null;
 
   // 1. Primary AI: Google Gemini (`gemini-4-hydrogen`) when GEMINI_API_KEY is configured
-  if (env.GEMINI_API_KEY) {
+  if (geminiKey) {
     try {
       const parts = [{ text: buildClassifierPrompt(cleanText) }];
       if (photoData) {
@@ -1108,7 +1119,7 @@ async function classifyAdWithAI(cleanText, firstImageFileId, specs, ruleResult, 
       }
 
       const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`,
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent?key=${encodeURIComponent(geminiKey)}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1734,7 +1745,10 @@ function extractCityAndSubcity(text) {
 }
 
 async function uploadImagesToCloudinary(imageFileIds, env) {
-  if (!env.CLOUDINARY_CLOUD_NAME || env.CLOUDINARY_CLOUD_NAME === "your_cloud_name" || !env.CLOUDINARY_UPLOAD_PRESET || !imageFileIds || imageFileIds.length === 0) {
+  const cloudName = cleanEnv(env.CLOUDINARY_CLOUD_NAME);
+  const uploadPreset = cleanEnv(env.CLOUDINARY_UPLOAD_PRESET);
+  const botToken = cleanEnv(env.TELEGRAM_BOT_TOKEN);
+  if (!cloudName || cloudName === "your_cloud_name" || !uploadPreset || !botToken || !imageFileIds || imageFileIds.length === 0) {
     return [];
   }
   const urls = [];
@@ -1742,11 +1756,11 @@ async function uploadImagesToCloudinary(imageFileIds, env) {
     try {
       const getFileRes = await callTelegram("getFile", { file_id: fileId }, env);
       if (!getFileRes || !getFileRes.file_path) continue;
-      const tgFileUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${getFileRes.file_path}`;
+      const tgFileUrl = `https://api.telegram.org/file/bot${botToken}/${getFileRes.file_path}`;
       const form = new FormData();
       form.append("file", tgFileUrl);
-      form.append("upload_preset", env.CLOUDINARY_UPLOAD_PRESET);
-      const uploadRes = await fetch(`https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/image/upload`, {
+      form.append("upload_preset", uploadPreset);
+      const uploadRes = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/image/upload`, {
         method: "POST",
         body: form
       });
@@ -1762,8 +1776,8 @@ async function uploadImagesToCloudinary(imageFileIds, env) {
 async function getFirebaseToken(env) {
   const now = Math.floor(Date.now() / 1000);
   if (cachedFirebaseToken && tokenExpiresAt > now + 300) return cachedFirebaseToken;
-  const clientEmail = env.FIREBASE_CLIENT_EMAIL;
-  const privateKey = (env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
+  const clientEmail = cleanEnv(env.FIREBASE_CLIENT_EMAIL);
+  const privateKey = cleanEnv(env.FIREBASE_PRIVATE_KEY).replace(/\\n/g, "\n");
   if (!clientEmail || !privateKey) return "";
 
   try {
