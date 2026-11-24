@@ -1,13 +1,19 @@
-name = "abaybot-worker"
+name = "yegna-gebeya-bot"
 main = "worker.js"
-compatibility_date = "2024-10-01"
+compatibility_date = "2024-03-01"
 compatibility_flags = ["nodejs_compat"]
 
+# Cloudflare Workers AI (Built-in, zero external API key required)
+[ai]
+binding = "AI"
 
+# Cloudflare Worker Environment Variables
+# Note: Sensitive variables (TELEGRAM_BOT_TOKEN, FIREBASE_PRIVATE_KEY, optional GEMINI_API_KEY)
+# should be added via GitHub Secrets or Cloudflare Dashboard (Settings > Variables).
 [vars]
-TELEGRAM_BOT_TOKEN = "8983581512:AAEeXyfUEBsalh-ns5DFn5Qcmd9Cpt2a1sQ"
-FIREBASE_PROJECT_ID = "yeegna-gebeya"
-FIREBASE_CLIENT_EMAIL = "firebase-adminsdk-fbsvc@yeegna-gebeya.iam.gserviceaccount.com"
-FIREBASE_PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCpwBtwQFPjJ9YK\n5VG1DK703UxZTlfQ4W/BzfcMswvqfqza+HngR2HdlSUUuduVfrqlPZB5ATuOmDz6\nLxPbDpC/W9vOj7S3uHEJguUrY/wLjlxyf+omD/5cFPsFT5yjysIMa1KiLOm9igRd\nng5HWZGAvUPDu2OaDLU+OpA70xoAZ5TfjJtyjfx7eSARyXXUOSIB2gnm9G9nMIP9\ncZ/gEvzJTyidZn9wYUJYjgAe6vWpZ9Y6zPmscGGr6wAtJJmC3qzk1/h8COglqTUV\nPIDxU201irMmauYjYyaaQT8kph4qIqj9P+bkE2y8bihAviiEF+u0DO7/UQ/e0e9z\no74bpwwPAgMBAAECggEABZ81qW2P+a13ksvOfXMKllR/81M7aFEXDPGf1X1WjzEb\n03K4QpvKm3aVkE6pfZWBY/iagM9wJARZvKVzgGVGmPfXW0t6Hj2PDNQXd+zrS4yu\n9iHTZOhRscYGHEJrOyd7bsLdLT7UjPD1vQ3/hhBq17ss894Qaeky1XlGDp0qtsmp\nmsfNEWn5ihIl3jUWbw9cxRp3tkCG+S07mPm5epHinVbAMsIAAXemeNnWBg5CJQPY\nTjOWh4P3qAFM21IOy0syhG/kEg8SM3iUrQHCl2XtrBRyAXs6DmPhqMCqIp/OHt5r\nl3Ga2BrK2OoYIX77ParmR/k2PHWQyGenN0y6Z1L5BQKBgQDbHu+kZMiBjYQUUujf\nYDKO/P6YyPjwYY3VMUPSevL7WMC/Zk/r0JAbtvCHRigfhoXaPXxoCt/UOqUaQXjc\nFRl51S/egEyL+a3twxZ4IZ7aqG7HXqZgGrrYnQOdq83fRd/1hZxaz1DQ0xcSzh2n\nY28o2ZAD3jELoFxWBCV2g1WK0wKBgQDGUf3f+Fv71pT8m1JydmibVpCvuFgsrBc9\nQDLwNo1+90P7s7ucHsQ+OF8nH5zkuq3uxjAbUeSgjYaqlHXibA+lKEJQXKuFrvxD\niUult/780Z8Q4fuok/VCD5oc7TRkFTP2atGSIWxWefKl64HtvM1Uh95B6rd9FRFz\nG+Bx7l+8VQKBgBY0N1JwSAUgwv6QPDrOc7Ebn+z5iIhLSmUNHfNJNDAWGUoL4xNh\nSgkU66C5kj1Hk26/BklAuNe3rZ1Qfx/GH5PB75zbYWZZwa8zMqavuXos0TTwuWlJ\nrB9hIcmrbCww13X4uRRWp7jReygTrNuWbuAz060gqdWkxVaOCwHMYzGzAoGATEEU\ne7y0KZYtfR9/yREsUaYsRdR82thkqyF3NJPVPh93HV3TYkkWLdJhC9sE6ZG59Rhx\nQN/xJ6ajRA2HckMYlOlw7hNjxCgvSQyOcK7ZtX4oSkaKDByv7fGv0TWHsn/Qlgwm\nfqipTmrfWNq//5hb3wfK9s94M/kY14i9eTEt0G0CgYEAyadIZIxvir3orlCPeW4K\n304rbyFU4KyOFkOZFdmWo62YN7j1J1Lat4Bl7UvXSG5z40nmvvPVSjyIhm+xZYAG\nFa17dGcxSbiFg41UsG0TbPVr/wyWq05tLKffLGP++DldntteUEm2NnmgCPbzU0S7\nElmhUOskyfjLw5+V+O5Mouw=\n-----END PRIVATE KEY-----\n"
-CLOUDINARY_CLOUD_NAME = "lisqr7zn"
-CLOUDINARY_UPLOAD_PRESET = "yeegna_uploads"
+REPOST_CHANNEL_ID = "@mebrigranite"
+ADMIN_UID = "admin_bot"
+ADMIN_EMAIL = "marbatu1@gmail.com"
+FIREBASE_PROJECT_ID = "yegna-gebeya"
+CLOUDINARY_CLOUD_NAME = "your_cloud_name"
+CLOUDINARY_UPLOAD_PRESET = "yegna_ads"
