@@ -1,4 +1,4 @@
-name = "yegna-gebeya-bot"
+name = "abaybot-worker"
 main = "worker.js"
 compatibility_date = "2024-03-01"
 compatibility_flags = ["nodejs_compat"]
@@ -8,12 +8,12 @@ compatibility_flags = ["nodejs_compat"]
 binding = "AI"
 
 # Cloudflare Worker Environment Variables
-# Note: Sensitive variables (TELEGRAM_BOT_TOKEN, FIREBASE_PRIVATE_KEY, optional GEMINI_API_KEY)
-# should be added via GitHub Secrets or Cloudflare Dashboard (Settings > Variables).
+# Note: Add secrets (TELEGRAM_BOT_TOKEN, FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY,
+# CLOUDINARY_CLOUD_NAME, GEMINI_API_KEY) in Cloudflare Dashboard:
+# Workers & Pages -> abaybot-worker -> Settings -> Variables and Secrets
 [vars]
 REPOST_CHANNEL_ID = "@mebrigranite"
 ADMIN_UID = "admin_bot"
 ADMIN_EMAIL = "marbatu1@gmail.com"
 FIREBASE_PROJECT_ID = "yegna-gebeya"
-CLOUDINARY_CLOUD_NAME = "your_cloud_name"
 CLOUDINARY_UPLOAD_PRESET = "yegna_ads"
