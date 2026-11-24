@@ -1,19 +1,18 @@
+// FILE: worker.js
 /**
  * Yegna Gebeya Telegram Bot - Cloudflare Worker
- * 
- * Production Complete Edition (v7.4 Amharic NLP + Resilient Web & Telegram Sync + Admin Profile):
- * 1. Amharic Title, Category, Brand, Model, Price & Location Intelligence:
- *    - Correctly parses Amharic brand/model names without ASCII \b regex bugs.
- *    - Extracts clean Amharic titles (skipping greetings/price-only lines) & supports explicit ርዕስ:/አይነት: labels.
- *    - Parses compound Amharic prices (e.g. "4 ሚሊዮን 500 ሺህ" -> 4,500,000, Ethiopic numerals, ሺ/ሚ/ብር).
- *    - Detects Amharic categories, subcategories, condition (አዲስ/ለኪራይ), cities & Addis subcities.
- *    - Optional Gemini Flash Amharic text fallback when GEMINI_API_KEY is configured.
- * 2. Instant Website & Profile Sync (marbatu1@gmail.com):
- *    - Posts directly to Website API (/api/ads) tagged to marbatu1@gmail.com for profile edit/delete.
- *    - Resolves marbatu1@gmail.com UID in Firestore & includes ?migrate=old_bot_posts GET route.
- * 3. Precision Bot Watermark Shield & In-Memory Locking:
- *    - Prevents loopback without dropping legitimate seller ads.
- * 4. Dual Ingestion, Multi-Photo Album Aggregation & Complete Emoji/Contact Stripping.
+ *
+ * Production Complete Edition (v8.0 AI-Powered Category & Spec Engine):
+ * 1. Dual AI Category + Vision Classification:
+ *    - Primary: Google Gemini (`gemini-4-hydrogen` via env.GEMINI_API_KEY) with strict JSON schema + photo vision.
+ *    - Built-in Key-Free Fallback: Cloudflare Workers AI (`env.AI` binding) using Vision + Llama 3.1 8B Instruct.
+ *    - Final Safety Net: Context-weighted Ethiopian Bilingual Classifier (English + Amharic + Ethiopic numerals).
+ * 2. Eliminates Common Misclassifications:
+ *    - Houses/Rentals mentioning "granite kitchen", "ceramic tiles", or "TV/sofa" stay Houses/Rentals.
+ *    - Cars mentioning "new tires", "new battery", or "bumper" stay Cars (not Spare Parts).
+ *    - Missing hashtags (#BuildingMaterials, #SpareParts) fixed + category-matched default subcategories.
+ * 3. Precision Bot Watermark Shield & In-Memory Deduplication.
+ * 4. Instant Website Sync (/api/ads) + Firestore Persistent Sync.
  */
 
 // In-Memory Aggregators & Deduplication Stores
@@ -25,34 +24,64 @@ let tokenExpiresAt = 0;
 let cachedAdminUid = null;
 let cachedAdminEmailForUid = "";
 
+const MARKETPLACE_CATEGORIES = [
+  "Cars",
+  "Houses",
+  "Rentals",
+  "Electronics",
+  "Furniture",
+  "Clothes",
+  "Building Materials",
+  "Spare Parts",
+  "Labor & Services",
+  "ምንአለሽ_ተራ"
+];
+
+const DEFAULT_SUBCATEGORIES = {
+  Cars: "Vehicles",
+  Houses: "Villa / House",
+  Rentals: "Apartment Rent",
+  Electronics: "Smartphones & Gadgets",
+  Furniture: "Living Room / Sofa",
+  Clothes: "Clothing & Apparel",
+  "Building Materials": "Construction & Finishing",
+  "Spare Parts": "Auto & Machine Parts",
+  "Labor & Services": "Professional Services",
+  "ምንአለሽ_ተራ": "General Marketplace"
+};
+
+const DEFAULT_CATEGORY_IMAGES = {
+  Cars: "https://images.unsplash.com/photo-1549399542-7e3f8b79c341?auto=format&fit=crop&w=900&q=80",
+  Houses: "https://images.unsplash.com/photo-1600585154340-be6161a56a0c?auto=format&fit=crop&w=900&q=80",
+  Rentals: "https://images.unsplash.com/photo-1522708323590-d24dbb6b0267?auto=format&fit=crop&w=900&q=80",
+  Electronics: "https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?auto=format&fit=crop&w=900&q=80",
+  Furniture: "https://images.unsplash.com/photo-1555041469-a586c61ea9bc?auto=format&fit=crop&w=900&q=80",
+  Clothes: "https://images.unsplash.com/photo-1489987707025-afc232f7ea0f?auto=format&fit=crop&w=900&q=80",
+  "Building Materials": "https://images.unsplash.com/photo-1504307651254-35680f356dfd?auto=format&fit=crop&w=900&q=80",
+  "Spare Parts": "https://images.unsplash.com/photo-1486262715619-67b85e0b08d3?auto=format&fit=crop&w=900&q=80",
+  "Labor & Services": "https://images.unsplash.com/photo-1581578731548-c6464695cc69?auto=format&fit=crop&w=900&q=80",
+  "ምንአለሽ_ተራ": "https://images.unsplash.com/photo-1472851294608-062f824d29cc?auto=format&fit=crop&w=900&q=80"
+};
+
 export default {
   async fetch(request, env, ctx) {
-    // Health check & one-click old post migration endpoint on GET
+    // Health check endpoint on GET
     if (request.method !== "POST") {
-      const url = new URL(request.url);
-      if (url.searchParams.get("migrate") === "old_bot_posts") {
-        const result = await migrateOldBotPostsToProfile(env);
-        return new Response(JSON.stringify(result, null, 2), {
-          status: result.ok ? 200 : 500,
-          headers: { "Content-Type": "application/json; charset=utf-8" }
-        });
-      }
-
       const botConfigured = Boolean(env.TELEGRAM_BOT_TOKEN);
+      const geminiConfigured = Boolean(env.GEMINI_API_KEY);
+      const workersAiConfigured = Boolean(env.AI);
       const targetChannel = env.REPOST_CHANNEL_ID || "@mebrigranite";
-      const websiteUrl = env.WEBSITE_URL || "https://ais-dev-ligixirxwi2nidlsx5j5hb-166746593299.europe-west3.run.app";
+      const websiteUrl = env.WEBSITE_URL || "https://mebri.yegna.workers.dev";
 
       return new Response(
         `Yegna Gebeya Telegram Bot is Active ✅\n\n` +
         `• Status: Running\n` +
         `• Bot Token Configured: ${botConfigured ? "YES ✅" : "NO ❌ (Add TELEGRAM_BOT_TOKEN in Cloudflare Settings > Variables!)"}\n` +
+        `• AI Classification: ${geminiConfigured ? "Gemini 4 Hydrogen ✅" : workersAiConfigured ? "Cloudflare Workers AI (Free Built-in) ✅" : "Weighted Rule Classifier Only ⚠️ (Bind [ai] or set GEMINI_API_KEY)"}\n` +
         `• Repost Channel: ${targetChannel}\n` +
         `• Website API: ${websiteUrl}/api/ads\n` +
-        `• Admin Profile: ${env.ADMIN_EMAIL || "marbatu1@gmail.com"}\n` +
-        `• Amharic NLP Parser: Enabled ✅\n` +
-        `• Version: v7.4 Production Resilient\n` +
-        `• Old Post Migration: Visit ?migrate=old_bot_posts once to assign old bot posts to your profile\n`,
-        { 
+        `• Version: v8.0 AI Category Engine\n`,
+        {
           status: 200,
           headers: { "Content-Type": "text/plain; charset=utf-8" }
         }
@@ -61,7 +90,7 @@ export default {
 
     try {
       const update = await request.json();
-      
+
       // Fast ACK to Telegram: Return 200 OK immediately so Telegram never retries
       if (ctx && ctx.waitUntil) {
         ctx.waitUntil(processUpdateSafe(update, env, request));
@@ -215,7 +244,7 @@ async function processUpdate(update, env, request) {
   const cleanText = cleanTheText(rawText);
   if (cleanText.length < 2 && (!message.photo || message.photo.length === 0)) return;
 
-  const textHash = simpleHash((cleanText || "photo_ad").toLowerCase().replace(/\s+/g, ''));
+  const textHash = simpleHash((cleanText || "photo_ad").toLowerCase().replace(/\s+/g, " "));
   const singleAdLockKey = `single_${message.chat?.id || ""}_${textHash}`;
 
   if (isMemoryLocked(singleAdLockKey)) {
@@ -235,34 +264,30 @@ async function processUpdate(update, env, request) {
 }
 
 // ============================================
-// MEMORY LOCKING (ZERO DEPENDENCE ON FAILING CACHE APIS)
+// MEMORY LOCKING
 // ============================================
 function claimMemoryLock(key, ttlSeconds = 180) {
   const now = Date.now();
   const exp = memoryLocks.get(key);
   if (exp && exp > now) return false;
-  memoryLocks.set(key, now + (ttlSeconds * 1000));
+  memoryLocks.set(key, now + ttlSeconds * 1000);
   return true;
 }
 
 function isMemoryLocked(key) {
   const now = Date.now();
   const exp = memoryLocks.get(key);
-  if (exp && exp > now) return true;
-  return false;
+  return Boolean(exp && exp > now);
 }
 
 function hasBotWatermark(text) {
   if (!text) return false;
   const lower = text.toLowerCase();
-  if (
+  return (
     lower.includes("mebri.yegna.workers.dev") ||
     lower.includes("#yegnagebeya") ||
     (lower.includes("የኛ ገበያ") && lower.includes("@mebrigranite") && lower.includes("0911680790"))
-  ) {
-    return true;
-  }
-  return false;
+  );
 }
 
 function cleanupOldStores() {
@@ -289,7 +314,7 @@ function simpleHash(str) {
 
 async function callTelegram(method, body, env) {
   if (!env.TELEGRAM_BOT_TOKEN) {
-    console.error(`❌ TELEGRAM_BOT_TOKEN is missing! Set it in Cloudflare Dashboard Variables.`);
+    console.error("❌ TELEGRAM_BOT_TOKEN is missing! Set it in Cloudflare Dashboard Variables.");
     throw new Error("TELEGRAM_BOT_TOKEN is missing");
   }
 
@@ -315,186 +340,196 @@ function safeSubstring(str, maxLen) {
 }
 
 // ============================================
-// CARS & ELECTRONICS DATABASE (ENGLISH + AMHARIC)
-// Note: Amharic words are NOT wrapped in \b because \b only matches ASCII [a-zA-Z0-9_].
+// ETHIOPIC NUMERAL & TEXT NORMALIZER
+// ============================================
+const ETHIOPIC_ONES = { "፩": 1, "፪": 2, "፫": 3, "፬": 4, "፭": 5, "፮": 6, "፯": 7, "፰": 8, "፱": 9 };
+const ETHIOPIC_TENS = { "፲": 10, "፳": 20, "፴": 30, "፵": 40, "፶": 50, "፷": 60, "፸": 70, "፹": 80, "፺": 90 };
+
+function normalizeEthiopicNumerals(text) {
+  if (!text) return "";
+  return text.replace(/[፩-፼]+/g, (token) => {
+    let total = 0;
+    let current = 0;
+    for (const ch of token) {
+      if (ETHIOPIC_ONES[ch] !== undefined) current += ETHIOPIC_ONES[ch];
+      else if (ETHIOPIC_TENS[ch] !== undefined) current += ETHIOPIC_TENS[ch];
+      else if (ch === "፻") {
+        total += (current || 1) * 100;
+        current = 0;
+      } else if (ch === "፼") {
+        total = (total + (current || 1)) * 10000;
+        current = 0;
+      }
+    }
+    return String(total + current);
+  });
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+// ============================================
+// CARS & ELECTRONICS DATABASE (No \b around Amharic!)
 // ============================================
 const CAR_DATABASE = [
   {
     name: "BYD",
-    regex: /\bbyd\b|ባይድ|ቢዋይዲ/i,
+    regex: /(?:\bbyd\b|ባይድ|ቢዋይዲ)/i,
     models: [
-      { name: "Sealion 06 EV", regex: /sealion\s*06|ሲሊዮን\s*0?6/i, subcategory: "Electric (EV)" },
-      { name: "Sealion 07", regex: /sealion\s*07|ሲሊዮን\s*0?7/i, subcategory: "Electric (EV)" },
-      { name: "Seagull", regex: /seagull|ሲገል|ሲጋል/i, subcategory: "Electric (EV)" },
+      { name: "Sealion 06 EV", regex: /sealion\s*06|ሲላየን\s*06/i, subcategory: "Electric (EV)" },
+      { name: "Sealion 07", regex: /sealion\s*07|ሲላየን\s*07/i, subcategory: "Electric (EV)" },
+      { name: "Seagull", regex: /seagull|ሲገል/i, subcategory: "Electric (EV)" },
+      { name: "Seal", regex: /\bseal\b/i, subcategory: "Electric (EV)" },
       { name: "Song Plus EV", regex: /song\s*plus|ሶንግ\s*ፕላስ/i, subcategory: "Electric (EV)" },
-      { name: "Atto 3 / Yuan Plus", regex: /atto\s*3|yuan\s*plus|አቶ\s*3|ዩአን\s*ፕላስ/i, subcategory: "Electric (EV)" },
+      { name: "Atto 3 / Yuan Plus", regex: /(?:atto\s*3|yuan\s*plus|አቶ\s*3|ዩአን\s*ፕላስ)/i, subcategory: "Electric (EV)" },
       { name: "Tang", regex: /\btang\b|ታንግ/i, subcategory: "Electric (EV)" },
       { name: "Han", regex: /\bhan\b/i, subcategory: "Electric (EV)" },
-      { name: "Dolphin", regex: /dolphin|ዶልፊን\s*ኢቪ/i, subcategory: "Electric (EV)" },
+      { name: "Dolphin", regex: /dolphin|ዶልፊን/i, subcategory: "Electric (EV)" },
       { name: "Qin Plus", regex: /qin\s*plus|ቺን\s*ፕላስ/i, subcategory: "Sedan" },
-      { name: "Chazor / Destroyer 05", regex: /chazor|destroyer\s*05|ቻዞር/i, subcategory: "Sedan" }
+      { name: "Chazor / Destroyer 05", regex: /(?:chazor|destroyer\s*05)/i, subcategory: "Sedan" }
     ]
   },
   {
     name: "Toyota",
-    regex: /\btoyota\b|ቶዮታ|ቶየታ/i,
+    regex: /(?:\btoyota\b|ቶዮታ|ቶዬታ)/i,
     models: [
-      { name: "Corolla Cross", regex: /corolla\s*cross|ኮሮላ\s*ክሮስ/i, subcategory: "SUV / Crossover" },
       { name: "Corolla", regex: /corolla|ኮሮላ/i, subcategory: "Sedan" },
-      { name: "RAV4", regex: /rav\s*4|ራቭ\s*4/i, subcategory: "SUV / Crossover" },
+      { name: "RAV4", regex: /rav\s*4|ራቭ\s*4|ራቭ4/i, subcategory: "SUV / Crossover" },
       { name: "Land Cruiser", regex: /land\s*cruiser|ላንድ\s*ክሩዘር|ላንድክሩዘር/i, subcategory: "SUV / Crossover" },
       { name: "Prado", regex: /prado|ፕራዶ/i, subcategory: "SUV / Crossover" },
       { name: "Hilux", regex: /hilux|ሃይሉክስ|ሀይሉክስ/i, subcategory: "Pickup / Truck" },
       { name: "Yaris", regex: /yaris|ያሪስ/i, subcategory: "Hatchback / Compact" },
-      { name: "Vitz", regex: /vitz|ቪትዝ|ቪዝ/i, subcategory: "Hatchback / Compact" },
+      { name: "Vitz", regex: /vitz|ቪትዝ/i, subcategory: "Hatchback / Compact" },
       { name: "Camry", regex: /camry|ካምሪ/i, subcategory: "Sedan" },
       { name: "Rush", regex: /rush|ራሽ/i, subcategory: "SUV / Crossover" },
-      { name: "HiAce", regex: /hiace|ሀይአይስ|ሃይኤስ|ዶልፊን\s*ቫን|ዶልፊን/i, subcategory: "Van / Minibus" },
+      { name: "HiAce", regex: /hiace|ሀይአይስ|ሃይኤስ|ዶልፊን\s*ቫን/i, subcategory: "Van / Minibus" },
       { name: "bz4X", regex: /bz4x|ቢዜድ4ኤክስ/i, subcategory: "Electric (EV)" },
-      { name: "Fortuner", regex: /fortuner|ፎርቹነር|ፎርቹን/i, subcategory: "SUV / Crossover" },
-      { name: "Avanza", regex: /avanza|አቫንዛ/i, subcategory: "Van / Minibus" }
+      { name: "Fortuner", regex: /fortuner|ፎርቹነር|ፎርቹን/i, subcategory: "SUV / Crossover" }
     ]
   },
   {
     name: "Suzuki",
-    regex: /\bsuzuki\b|ሱዙኪ|ሱዚኪ/i,
+    regex: /(?:\bsuzuki\b|ሱዙኪ|ሱዚኪ)/i,
     models: [
       { name: "Swift", regex: /\bswift\b|ስዊፍት/i, subcategory: "Hatchback / Compact" },
-      { name: "Dzire", regex: /dzire|ዲዛየር|ዲዛይር/i, subcategory: "Sedan" },
-      { name: "Celerio", regex: /celerio|ሴሌሪዮ|ሰሌሪዮ/i, subcategory: "Hatchback / Compact" },
+      { name: "Dzire", regex: /dzire|ዲዛየር|ድዛየር/i, subcategory: "Sedan" },
+      { name: "Celerio", regex: /celerio|ሴሌሪዮ/i, subcategory: "Hatchback / Compact" },
       { name: "Alto", regex: /\balto\b|አልቶ/i, subcategory: "Hatchback / Compact" },
       { name: "Vitara", regex: /vitara|ቪታራ/i, subcategory: "SUV / Crossover" },
       { name: "Jimny", regex: /jimny|ጂምኒ/i, subcategory: "SUV / Crossover" },
       { name: "Ertiga", regex: /ertiga|ኤርቲጋ/i, subcategory: "Van / Minibus" },
-      { name: "Baleno", regex: /baleno|ባሌኖ/i, subcategory: "Hatchback / Compact" },
-      { name: "S-Presso", regex: /s-?presso|ኤስፕሬሶ|ኤስ-?ፕሬሶ/i, subcategory: "Hatchback / Compact" }
+      { name: "S-Presso", regex: /s-?presso|ኤስፕሬሶ/i, subcategory: "Hatchback / Compact" }
     ]
   },
   {
     name: "Hyundai",
-    regex: /\bhyundai\b|ሂዩንዳይ|ሃዩንዳይ|ሁንዳይ/i,
+    regex: /(?:\bhyundai\b|ሂዩንዳይ|ሃዩንዳይ|ሀዩንዳይ)/i,
     models: [
       { name: "Elantra", regex: /elantra|ኤላንትራ|ኢላንትራ/i, subcategory: "Sedan" },
-      { name: "Tucson", regex: /tucson|ቱክሰን|ታክሰን/i, subcategory: "SUV / Crossover" },
-      { name: "Avante", regex: /avante|አቫንቴ|አቫንተ/i, subcategory: "Sedan" },
-      { name: "Accent", regex: /accent|አክሰንት/i, subcategory: "Sedan" },
+      { name: "Tucson", regex: /tucson|ቱክሰን|ቱሰን/i, subcategory: "SUV / Crossover" },
+      { name: "Avante", regex: /avante|አቫንቴ/i, subcategory: "Sedan" },
       { name: "Creta", regex: /creta|ክሬታ/i, subcategory: "SUV / Crossover" },
       { name: "Santa Fe", regex: /santa\s*fe|ሳንታፌ|ሳንታ\s*ፌ/i, subcategory: "SUV / Crossover" },
       { name: "Ioniq 5", regex: /ioniq\s*5|አዮኒክ\s*5/i, subcategory: "Electric (EV)" },
-      { name: "Grand i10", regex: /\bi10\b|አይ\s*10/i, subcategory: "Hatchback / Compact" },
-      { name: "Kona", regex: /\bkona\b|ኮና/i, subcategory: "SUV / Crossover" },
+      { name: "Ioniq 6", regex: /ioniq\s*6/i, subcategory: "Electric (EV)" },
+      { name: "Grand i10", regex: /i10|አይ10|አይ\s*10/i, subcategory: "Hatchback / Compact" },
+      { name: "Kona", regex: /kona|ኮና/i, subcategory: "SUV / Crossover" },
       { name: "Staria", regex: /staria|ስታሪያ/i, subcategory: "Van / Minibus" }
     ]
   },
   {
     name: "Volkswagen",
-    regex: /\bvolkswagen\b|\bvw\b|ፎልክስዋገን|ቮልስዋገን|ቮልክስዋገን/i,
+    regex: /(?:\bvolkswagen\b|\bvw\b|ፎልክስዋገን|ቮልስዋገን|ቮልክስዋገን)/i,
     models: [
-      { name: "ID.4 Crozz", regex: /id\.?\s*4|አይዲ\.?\s*4/i, subcategory: "Electric (EV)" },
-      { name: "ID.6 Crozz", regex: /id\.?\s*6|አይዲ\.?\s*6/i, subcategory: "Electric (EV)" },
+      { name: "ID.4 Crozz", regex: /id\.?\s*4|አይዲ\s*4/i, subcategory: "Electric (EV)" },
+      { name: "ID.6 Crozz", regex: /id\.?\s*6|አይዲ\s*6/i, subcategory: "Electric (EV)" },
+      { name: "ID.3", regex: /id\.?\s*3|አይዲ\s*3/i, subcategory: "Electric (EV)" },
       { name: "Tiguan", regex: /tiguan|ቲጓን/i, subcategory: "SUV / Crossover" },
       { name: "Golf", regex: /\bgolf\b|ጎልፍ/i, subcategory: "Hatchback / Compact" }
     ]
   },
   {
     name: "Geely",
-    regex: /\bgeely\b|ጂሊ/i,
+    regex: /(?:\bgeely\b|ጂሊ)/i,
     models: [
       { name: "Coolray", regex: /coolray|ኩልሬይ/i, subcategory: "SUV / Crossover" },
-      { name: "Geometry C", regex: /geometry\s*c|ጂኦሜትሪ/i, subcategory: "Electric (EV)" },
-      { name: "Monjaro", regex: /monjaro|ሞንጃሮ/i, subcategory: "SUV / Crossover" }
+      { name: "Geometry C", regex: /geometry\s*c/i, subcategory: "Electric (EV)" },
+      { name: "Monjaro", regex: /monjaro/i, subcategory: "SUV / Crossover" }
     ]
   },
   {
     name: "Changan",
-    regex: /\bchangan\b|ቻንጋን/i,
+    regex: /(?:\bchangan\b|ቻንጋን)/i,
     models: [
-      { name: "CS35 Plus", regex: /cs\s*35|ሲኤስ\s*35/i, subcategory: "SUV / Crossover" },
-      { name: "CS55 Plus", regex: /cs\s*55|ሲኤስ\s*55/i, subcategory: "SUV / Crossover" },
-      { name: "UNI-T", regex: /uni-?t|ዩኒቲ/i, subcategory: "SUV / Crossover" },
-      { name: "UNI-K", regex: /uni-?k|ዩኒኬ/i, subcategory: "SUV / Crossover" },
-      { name: "BenBen E-Star", regex: /benben|ቤንቤን/i, subcategory: "Electric (EV)" }
+      { name: "CS35 Plus", regex: /cs35/i, subcategory: "SUV / Crossover" },
+      { name: "CS55 Plus", regex: /cs55/i, subcategory: "SUV / Crossover" },
+      { name: "UNI-T", regex: /uni-?t/i, subcategory: "SUV / Crossover" },
+      { name: "UNI-K", regex: /uni-?k/i, subcategory: "SUV / Crossover" },
+      { name: "BenBen E-Star", regex: /benben/i, subcategory: "Electric (EV)" }
     ]
   },
   {
     name: "Jetour",
-    regex: /\bjetour\b|ጄቱር|ጀቱር/i,
+    regex: /(?:\bjetour\b|ጄቱር)/i,
     models: [
-      { name: "Dashing", regex: /dashing|ዳሽንግ/i, subcategory: "SUV / Crossover" },
-      { name: "X70 Plus", regex: /x70|ኤክስ\s*70/i, subcategory: "SUV / Crossover" },
-      { name: "Traveler (T2)", regex: /traveler|\bt2\b|ትራቭለር/i, subcategory: "SUV / Crossover" }
+      { name: "Dashing", regex: /dashing|ዳሺንግ/i, subcategory: "SUV / Crossover" },
+      { name: "X70 Plus", regex: /x70/i, subcategory: "SUV / Crossover" },
+      { name: "Traveler (T2)", regex: /(?:traveler|\bt2\b)/i, subcategory: "SUV / Crossover" }
     ]
   },
   {
     name: "Kia",
-    regex: /\bkia\b|ኪያ/i,
+    regex: /(?:\bkia\b|ኪያ|ኪአ)/i,
     models: [
-      { name: "Sportage", regex: /sportage|ስፖርቴጅ|ስፖርተጅ/i, subcategory: "SUV / Crossover" },
+      { name: "Sportage", regex: /sportage|ስፖርቴጅ/i, subcategory: "SUV / Crossover" },
       { name: "Sorento", regex: /sorento|ሶሬንቶ/i, subcategory: "SUV / Crossover" },
       { name: "Picanto", regex: /picanto|ፒካንቶ/i, subcategory: "Hatchback / Compact" },
-      { name: "Rio", regex: /\brio\b|ሪዮ/i, subcategory: "Sedan" },
-      { name: "EV6", regex: /\bev6\b|ኢቪ6/i, subcategory: "Electric (EV)" }
+      { name: "EV6", regex: /\bev6\b/i, subcategory: "Electric (EV)" }
     ]
   },
   {
     name: "Mercedes-Benz",
-    regex: /\bmercedes\b|\bbenz\b|መርሴዲስ|መርሰዲስ|ቤንዝ/i,
+    regex: /(?:\bmercedes\b|\bbenz\b|መርሴዲስ|ሜርሴዲስ|ቤንዝ)/i,
     models: [
-      { name: "C-Class", regex: /c-?class|c200|c180|c300|ሲ\s*ክላስ/i, subcategory: "Sedan" },
-      { name: "E-Class", regex: /e-?class|e200|e300|e350|ኢ\s*ክላስ/i, subcategory: "Sedan" },
-      { name: "G-Wagon / G-Class", regex: /g-?wagon|g63|g500|ጂ\s*ዋገን/i, subcategory: "SUV / Crossover" },
+      { name: "C-Class", regex: /\b(?:c-?class|c\s*[123]\d{2})\b/i, subcategory: "Sedan" },
+      { name: "E-Class", regex: /\b(?:e-?class|e\s*[234]\d{2})\b/i, subcategory: "Sedan" },
+      { name: "S-Class", regex: /\b(?:s-?class|s\s*[456]\d{2})\b/i, subcategory: "Sedan" },
+      { name: "G-Wagon / G-Class", regex: /g-?wagon|g\s*63|g\s*500|ጂ\s*ክላስ/i, subcategory: "SUV / Crossover" },
       { name: "GLE", regex: /\bgle\b/i, subcategory: "SUV / Crossover" }
     ]
   },
   {
     name: "Nissan",
-    regex: /\bnissan\b|ኒሳን/i,
+    regex: /(?:\bnissan\b|ኒሳን)/i,
     models: [
       { name: "Patrol", regex: /patrol|ፓትሮል/i, subcategory: "SUV / Crossover" },
       { name: "X-Trail", regex: /x-?trail|ኤክስትሬል/i, subcategory: "SUV / Crossover" },
-      { name: "Qashqai", regex: /qashqai|ካሽካይ/i, subcategory: "SUV / Crossover" },
+      { name: "Qashqai", regex: /qashqai/i, subcategory: "SUV / Crossover" },
       { name: "Sunny", regex: /sunny|ሳኒ/i, subcategory: "Sedan" }
     ]
   },
   {
-    name: "Mitsubishi",
-    regex: /\bmitsubishi\b|ሚትሱቢሺ|ሚጽቡሺ/i,
-    models: [
-      { name: "Pajero", regex: /pajero|ፓጄሮ|ፓጀሮ/i, subcategory: "SUV / Crossover" },
-      { name: "L200", regex: /l200|ኤል\s*200/i, subcategory: "Pickup / Truck" },
-      { name: "Outlander", regex: /outlander|አውትላንደር/i, subcategory: "SUV / Crossover" }
-    ]
-  },
-  {
-    name: "Isuzu",
-    regex: /\bisuzu\b|አይሱዙ|ኢሱዙ/i,
-    models: [
-      { name: "NPR", regex: /\bnpr\b|ኤንፒአር/i, subcategory: "Pickup / Truck" },
-      { name: "FSR", regex: /\bfsr\b|ኤፍኤስአር/i, subcategory: "Pickup / Truck" },
-      { name: "D-Max", regex: /d-?max|ዲማክስ/i, subcategory: "Pickup / Truck" }
-    ]
-  },
-  {
-    name: "Sinotruk",
-    regex: /\bsinotruk\b|\bhowo\b|ሳይኖትራክ|ሲኖትራክ|ሆዎ/i,
-    models: [
-      { name: "HOWO Dump Truck", regex: /howo|ሆዎ|ገልባጭ/i, subcategory: "Pickup / Truck" }
-    ]
-  },
-  {
     name: "Land Rover",
-    regex: /range\s*rover|land\s*rover|ሬንጅ\s*ሮቨር|ላንድ\s*ሮቨር/i,
+    regex: /(?:\brange\s*rover\b|\bland\s*rover\b|ሬንጅ\s*ሮቨር)/i,
     models: [
       { name: "Defender", regex: /defender|ዲፌንደር/i, subcategory: "SUV / Crossover" },
-      { name: "Sport", regex: /range\s*rover\s*sport|ስፖርት/i, subcategory: "SUV / Crossover" },
-      { name: "Vogue", regex: /vogue|ቮግ/i, subcategory: "SUV / Crossover" },
-      { name: "Evoque", regex: /evoque|ኢቮክ/i, subcategory: "SUV / Crossover" }
+      { name: "Sport", regex: /range\s*rover\s*sport/i, subcategory: "SUV / Crossover" },
+      { name: "Vogue", regex: /vogue/i, subcategory: "SUV / Crossover" },
+      { name: "Evoque", regex: /evoque/i, subcategory: "SUV / Crossover" }
     ]
   },
   {
     name: "Chery",
-    regex: /\bchery\b|ቼሪ|ቸሪ/i,
+    regex: /(?:\bchery\b|ቼሪ|ቸሪ)/i,
     models: [
+      { name: "Tiggo 4 Pro", regex: /tiggo\s*4|ቲጎ\s*4/i, subcategory: "SUV / Crossover" },
       { name: "Tiggo 7 Pro", regex: /tiggo\s*7|ቲጎ\s*7/i, subcategory: "SUV / Crossover" },
       { name: "Tiggo 8 Pro", regex: /tiggo\s*8|ቲጎ\s*8/i, subcategory: "SUV / Crossover" },
       { name: "EQ1 / Little Ant", regex: /eq1|little\s*ant/i, subcategory: "Electric (EV)" }
@@ -502,22 +537,30 @@ const CAR_DATABASE = [
   },
   {
     name: "Zeekr",
-    regex: /\bzeekr\b|ዚከር/i,
+    regex: /(?:\bzeekr\b|ዚከር)/i,
     models: [
-      { name: "001", regex: /001/, subcategory: "Electric (EV)" },
-      { name: "007", regex: /007/, subcategory: "Electric (EV)" },
-      { name: "009", regex: /009/, subcategory: "Electric (EV)" },
+      { name: "001", regex: /\bzeekr\s*001\b/i, subcategory: "Electric (EV)" },
+      { name: "007", regex: /\bzeekr\s*007\b/i, subcategory: "Electric (EV)" },
+      { name: "009", regex: /\bzeekr\s*009\b/i, subcategory: "Electric (EV)" },
       { name: "X", regex: /\bzeekr\s*x\b/i, subcategory: "Electric (EV)" }
     ]
   },
   {
     name: "Li Auto (Li Xiang)",
-    regex: /li\s*auto|lixiang|ሊ\s*አውቶ|ሊ\s*ዢያንግ/i,
+    regex: /(?:\bli\s*auto\b|\blixiang\b|ሊ\s*አውቶ)/i,
     models: [
-      { name: "L6", regex: /\bl6\b/i, subcategory: "SUV / Crossover" },
-      { name: "L7", regex: /\bl7\b/i, subcategory: "SUV / Crossover" },
-      { name: "L8", regex: /\bl8\b/i, subcategory: "SUV / Crossover" },
-      { name: "L9", regex: /\bl9\b/i, subcategory: "SUV / Crossover" }
+      { name: "L6", regex: /\b(?:li\s*)?l6\b/i, subcategory: "SUV / Crossover", requireBrand: true },
+      { name: "L7", regex: /\b(?:li\s*)?l7\b/i, subcategory: "SUV / Crossover", requireBrand: true },
+      { name: "L8", regex: /\b(?:li\s*)?l8\b/i, subcategory: "SUV / Crossover", requireBrand: true },
+      { name: "L9", regex: /\b(?:li\s*)?l9\b/i, subcategory: "SUV / Crossover", requireBrand: true }
+    ]
+  },
+  {
+    name: "Isuzu",
+    regex: /(?:\bisuzu\b|ኢሱዙ)/i,
+    models: [
+      { name: "FSR / NPR Truck", regex: /(?:\bfsr\b|\bnpr\b|ኤፍኤስአር|ኤንፒአር)/i, subcategory: "Pickup / Truck" },
+      { name: "D-Max", regex: /d-?max|ዲማክስ/i, subcategory: "Pickup / Truck" }
     ]
   }
 ];
@@ -525,17 +568,16 @@ const CAR_DATABASE = [
 const ELECTRONICS_DATABASE = [
   {
     name: "Apple",
-    regex: /\b(apple|iphone|macbook|ipad)\b|አፕል|አይፎን|ማክቡክ|አይፓድ/i,
+    regex: /(?:\bapple\b|\biphone\b|\bmacbook\b|\bipad\b|አፕል|አይፎን|ማክቡክ|አይፓድ)/i,
     models: [
-      { name: "iPhone 16 Pro Max", regex: /(?:16|፲፮)\s*(?:pro\s*max|ፕሮ\s*ማክስ)/i, subcategory: "Smartphones & Tablets" },
-      { name: "iPhone 16 Pro", regex: /(?:16|፲፮)\s*(?:pro\b|ፕሮ)/i, subcategory: "Smartphones & Tablets" },
-      { name: "iPhone 16", regex: /(?:iphone|አይፎን)\s*16/i, subcategory: "Smartphones & Tablets" },
-      { name: "iPhone 15 Pro Max", regex: /15\s*(?:pro\s*max|ፕሮ\s*ማክስ)/i, subcategory: "Smartphones & Tablets" },
-      { name: "iPhone 15 Pro", regex: /15\s*(?:pro\b|ፕሮ)/i, subcategory: "Smartphones & Tablets" },
-      { name: "iPhone 15", regex: /(?:iphone|አይፎን)\s*15/i, subcategory: "Smartphones & Tablets" },
-      { name: "iPhone 14 Pro Max", regex: /14\s*(?:pro\s*max|ፕሮ\s*ማክስ)/i, subcategory: "Smartphones & Tablets" },
-      { name: "iPhone 14", regex: /(?:iphone|አይፎን)\s*14/i, subcategory: "Smartphones & Tablets" },
-      { name: "iPhone 13", regex: /(?:iphone|አይፎን)\s*13/i, subcategory: "Smartphones & Tablets" },
+      { name: "iPhone 16 Pro Max", regex: /16\s*pro\s*max|16\s*ፕሮ\s*ማክስ/i, subcategory: "Smartphones & Tablets" },
+      { name: "iPhone 16 Pro", regex: /16\s*pro\b|16\s*ፕሮ/i, subcategory: "Smartphones & Tablets" },
+      { name: "iPhone 16", regex: /iphone\s*16|አይፎን\s*16/i, subcategory: "Smartphones & Tablets" },
+      { name: "iPhone 15 Pro Max", regex: /15\s*pro\s*max|15\s*ፕሮ\s*ማክስ/i, subcategory: "Smartphones & Tablets" },
+      { name: "iPhone 15 Pro", regex: /15\s*pro\b|15\s*ፕሮ/i, subcategory: "Smartphones & Tablets" },
+      { name: "iPhone 15", regex: /iphone\s*15\b|አይፎን\s*15/i, subcategory: "Smartphones & Tablets" },
+      { name: "iPhone 14 Pro Max", regex: /14\s*pro\s*max|14\s*ፕሮ\s*ማክስ/i, subcategory: "Smartphones & Tablets" },
+      { name: "iPhone 13", regex: /iphone\s*13|አይፎን\s*13/i, subcategory: "Smartphones & Tablets" },
       { name: "MacBook Pro", regex: /macbook\s*pro|ማክቡክ\s*ፕሮ/i, subcategory: "Laptops & Computers" },
       { name: "MacBook Air", regex: /macbook\s*air|ማክቡክ\s*ኤር/i, subcategory: "Laptops & Computers" },
       { name: "iPad Pro", regex: /ipad|አይፓድ/i, subcategory: "Smartphones & Tablets" }
@@ -543,84 +585,21 @@ const ELECTRONICS_DATABASE = [
   },
   {
     name: "Samsung",
-    regex: /\b(samsung|galaxy)\b|ሳምሰንግ|ጋላክሲ/i,
+    regex: /(?:\bsamsung\b|\bgalaxy\b|ሳምሰንግ|ጋላክሲ)/i,
     models: [
-      { name: "Galaxy S24 Ultra", regex: /s24\s*(?:ultra|አልትራ)/i, subcategory: "Smartphones & Tablets" },
-      { name: "Galaxy S24", regex: /s24/i, subcategory: "Smartphones & Tablets" },
-      { name: "Galaxy S23 Ultra", regex: /s23\s*(?:ultra|አልትራ)/i, subcategory: "Smartphones & Tablets" },
+      { name: "Galaxy S24 Ultra", regex: /s24\s*ultra|ኤስ\s*24\s*አልትራ/i, subcategory: "Smartphones & Tablets" },
+      { name: "Galaxy S24", regex: /s24|ኤስ\s*24/i, subcategory: "Smartphones & Tablets" },
+      { name: "Galaxy S23 Ultra", regex: /s23\s*ultra|ኤስ\s*23\s*አልትራ/i, subcategory: "Smartphones & Tablets" },
       { name: "Galaxy Z Fold", regex: /z\s*fold/i, subcategory: "Smartphones & Tablets" },
       { name: "Galaxy Z Flip", regex: /z\s*flip/i, subcategory: "Smartphones & Tablets" }
     ]
   },
   {
-    name: "Tecno",
-    regex: /\btecno\b|ቴክኖ/i,
-    models: [
-      { name: "Camon", regex: /camon|ካሞን/i, subcategory: "Smartphones & Tablets" },
-      { name: "Spark", regex: /spark|ስፓርክ/i, subcategory: "Smartphones & Tablets" },
-      { name: "Phantom", regex: /phantom|ፋንተም/i, subcategory: "Smartphones & Tablets" }
-    ]
-  },
-  {
-    name: "Infinix",
-    regex: /\binfinix\b|ኢንፊኒክስ/i,
-    models: [
-      { name: "Note", regex: /\bnote\b|ኖት/i, subcategory: "Smartphones & Tablets" },
-      { name: "Hot", regex: /\bhot\b|ሆት/i, subcategory: "Smartphones & Tablets" }
-    ]
-  },
-  {
-    name: "Xiaomi",
-    regex: /\b(xiaomi|redmi|poco)\b|ሺያኦሚ|ሬድሚ|ፖኮ/i,
-    models: [
-      { name: "Redmi Note", regex: /redmi\s*note|ሬድሚ\s*ኖት/i, subcategory: "Smartphones & Tablets" }
-    ]
-  },
-  {
-    name: "HP",
-    regex: /\bhp\b|ኤችፒ/i,
-    models: [
-      { name: "EliteBook", regex: /elitebook|ኢሊትቡክ/i, subcategory: "Laptops & Computers" },
-      { name: "Pavilion", regex: /pavilion|ፓቪሊዮን/i, subcategory: "Laptops & Computers" },
-      { name: "ProBook", regex: /probook|ፕሮቡክ/i, subcategory: "Laptops & Computers" }
-    ]
-  },
-  {
-    name: "Dell",
-    regex: /\bdell\b|ዴል/i,
-    models: [
-      { name: "XPS", regex: /\bxps\b/i, subcategory: "Laptops & Computers" },
-      { name: "Latitude", regex: /latitude|ላቲቲዩድ/i, subcategory: "Laptops & Computers" }
-    ]
-  },
-  {
-    name: "Lenovo",
-    regex: /\blenovo\b|ሌኖቮ/i,
-    models: [
-      { name: "ThinkPad", regex: /thinkpad|ቲንክፓድ/i, subcategory: "Laptops & Computers" }
-    ]
-  },
-  {
-    name: "LG",
-    regex: /\blg\b|ኤልጂ/i,
-    models: [
-      { name: "Smart TV", regex: /tv|ቴሌቪዥን|ቲቪ/i, subcategory: "TV & Home Entertainment" }
-    ]
-  },
-  {
-    name: "Hisense",
-    regex: /\bhisense\b|ሃይሴንስ|ሀይሴንስ/i,
-    models: [
-      { name: "Smart TV", regex: /tv|ቴሌቪዥን|ቲቪ/i, subcategory: "TV & Home Entertainment" },
-      { name: "Refrigerator", regex: /fridge|ፍሪጅ|ማቀዝቀዣ/i, subcategory: "Home Appliances" }
-    ]
-  },
-  {
     name: "Sony",
-    regex: /\b(sony|playstation|ps5|ps4)\b|ሶኒ|ፕሌይስቴሽን/i,
+    regex: /(?:\bsony\b|\bplaystation\b|\bps5\b|\bps4\b|ሶኒ|ፕሌይስቴሽን)/i,
     models: [
-      { name: "PlayStation 5", regex: /ps5|playstation\s*5|ፕሌይስቴሽን\s*5/i, subcategory: "Gaming & Consoles" },
-      { name: "Bravia TV", regex: /bravia|tv|ቴሌቪዥን|ቲቪ/i, subcategory: "TV & Home Entertainment" }
+      { name: "PlayStation 5", regex: /ps5|playstation\s*5/i, subcategory: "Gaming & Consoles" },
+      { name: "Bravia TV", regex: /bravia|\btv\b|ቴሌቪዥን/i, subcategory: "TV & Home Entertainment" }
     ]
   }
 ];
@@ -630,101 +609,92 @@ const ELECTRONICS_DATABASE = [
 // ============================================
 async function processFinalAd(message, imageFileIds, messageIds, cleanText, env, mediaGroupId = null, isInsideTargetChannel = false) {
   const normalizedText = normalizeEthiopicNumerals(cleanText);
-  let { brand, model, year, trim, bodyType, fuelType, transmission, subcategory } = detectBrandModelYear(normalizedText);
-  let category = detectCategory(normalizedText, brand);
-  let { formattedPrice, rawPrice } = parseMathematicalPrice(normalizedText, year);
-  let condition = detectCondition(normalizedText, category);
-  let city = extractCity(normalizedText);
-  const subcity = extractSubcity(normalizedText);
+  let specs = detectBrandModelYear(normalizedText);
+  const ruleResult = detectCategoryWeighted(normalizedText, specs.brand, specs.subcategory);
 
-  if (!subcategory) {
-    subcategory = detectAmharicSubcategory(normalizedText, category) || bodyType || (category === "Cars" ? "Vehicles" : category);
-  }
-
+  let category = ruleResult.category;
+  let subcategory = ruleResult.subcategory;
   let aiTitle = "";
+  let aiSource = "rules";
 
-  // Optional Gemini Amharic Text Intelligence (fills gaps for Amharic titles, brands, categories, prices)
-  const hasAmharicChars = /[\u1200-\u137F]/.test(normalizedText);
-  if (env.GEMINI_API_KEY && hasAmharicChars && (!brand || !rawPrice || category === "ምንአለሽ_ተራ")) {
-    try {
-      const amharicAi = await analyzeAmharicAdWithGemini(normalizedText, env);
-      if (amharicAi) {
-        if (!brand && amharicAi.brand) brand = amharicAi.brand;
-        if (!model && amharicAi.model) model = amharicAi.model;
-        if (!year && amharicAi.year) year = String(amharicAi.year);
-        if (!trim && amharicAi.trim) trim = amharicAi.trim;
-        if (category === "ምንአለሽ_ተራ" && amharicAi.category) category = amharicAi.category;
-        if ((!subcategory || subcategory === category || subcategory === "Vehicles") && amharicAi.subcategory) {
-          subcategory = amharicAi.subcategory;
-        }
-        if (amharicAi.title && amharicAi.title.trim().length > 2) aiTitle = amharicAi.title.trim();
-        if (!rawPrice && amharicAi.priceETB && Number(amharicAi.priceETB) > 0) {
-          rawPrice = Math.round(Number(amharicAi.priceETB));
-          formattedPrice = rawPrice.toLocaleString("en-US");
-        }
-        if (amharicAi.city && city === "Addis Ababa") city = amharicAi.city;
-        if (amharicAi.condition) condition = amharicAi.condition;
-      }
-    } catch (aiErr) {
-      console.warn("Gemini Amharic NLP skipped:", aiErr.message);
+  // AI Classification (Runs for BOTH text-only & photo ads via Gemini or Cloudflare Workers AI)
+  const aiResult = await classifyAdWithAI(normalizedText, imageFileIds[0] || null, specs, ruleResult, env);
+  if (aiResult) {
+    aiSource = aiResult.provider || "ai";
+    const validatedCategory = normalizeCategory(aiResult.category);
+    if (validatedCategory && (aiResult.confidence === undefined || aiResult.confidence >= 0.45)) {
+      category = validatedCategory;
+    }
+    if (aiResult.subcategory && typeof aiResult.subcategory === "string") {
+      subcategory = aiResult.subcategory.trim();
+    } else if (category !== ruleResult.category) {
+      subcategory = DEFAULT_SUBCATEGORIES[category] || "General";
+    }
+
+    if (!specs.brand && aiResult.brand) specs.brand = cleanSpecValue(aiResult.brand);
+    if (!specs.model && aiResult.model) specs.model = cleanSpecValue(aiResult.model);
+    if (!specs.year && aiResult.year) specs.year = cleanSpecValue(aiResult.year);
+    if (!specs.trim && aiResult.trim) specs.trim = cleanSpecValue(aiResult.trim);
+    if (!specs.bodyType && aiResult.bodyType) specs.bodyType = cleanSpecValue(aiResult.bodyType);
+    if (!specs.fuelType && aiResult.fuelType) specs.fuelType = cleanSpecValue(aiResult.fuelType);
+    if (!specs.transmission && aiResult.transmission) specs.transmission = cleanSpecValue(aiResult.transmission);
+    if (aiResult.suggestedTitle) aiTitle = cleanSpecValue(aiResult.suggestedTitle);
+  }
+
+  // Only keep vehicle/electronics brand metadata when category matches Cars / Electronics / Spare Parts
+  if (!["Cars", "Electronics", "Spare Parts"].includes(category)) {
+    if (category === "Houses" || category === "Rentals" || category === "Furniture" || category === "Clothes" || category === "Building Materials" || category === "Labor & Services") {
+      specs.brand = "";
+      specs.model = "";
+      specs.fuelType = "";
+      specs.transmission = "";
     }
   }
 
-  // Optional Gemini Vision enrichment for vehicle photos
-  if (env.GEMINI_API_KEY && (!model || !brand) && category === "Cars" && imageFileIds.length > 0) {
-    try {
-      const visionResult = await inspectImageWithGemini(imageFileIds[0], normalizedText, env);
-      if (visionResult) {
-        if (!brand && visionResult.brand) brand = visionResult.brand;
-        if (!model && visionResult.model) model = visionResult.model;
-        if (!year && visionResult.year) year = visionResult.year;
-        if (!trim && visionResult.trim) trim = visionResult.trim;
-        if (visionResult.bodyType && !bodyType) bodyType = visionResult.bodyType;
-        if (visionResult.subcategory && (!subcategory || subcategory === "Vehicles")) subcategory = visionResult.subcategory;
-      }
-    } catch (vErr) {
-      console.warn("Vision enrichment skipped:", vErr.message);
-    }
+  if (!subcategory || (subcategory === "Vehicles" && category !== "Cars")) {
+    subcategory = DEFAULT_SUBCATEGORIES[category] || "General Marketplace";
   }
 
   const arrangedTitle = arrangeTitle({
-    brand,
-    model,
-    year,
-    trim,
-    cleanText: normalizedText,
+    brand: specs.brand,
+    model: specs.model,
+    year: specs.year,
+    trim: specs.trim,
+    cleanText,
     category,
     subcategory,
-    subcity,
     aiTitle
   });
-  const textHash = simpleHash(normalizedText.toLowerCase().replace(/\s+/g, ''));
+
+  const { formattedPrice, rawPrice } = parseMathematicalPrice(normalizedText, specs.year);
+  const { city, subcity } = extractCityAndSubcity(normalizedText);
+  const textHash = simpleHash((cleanText || arrangedTitle).toLowerCase().replace(/\s+/g, " "));
+
+  console.log(`🏷️ Classified [${aiSource}] -> ${category} > ${subcategory} | Title: ${arrangedTitle}`);
 
   // Upload photos to Cloudinary if configured
   const imageUrls = await uploadImagesToCloudinary(imageFileIds.slice(0, 4), env);
-  const finalDisplayImages = imageUrls.length > 0 
-    ? imageUrls 
-    : ["https://images.unsplash.com/photo-1549399542-7e3f8b79c341?auto=format&fit=crop&w=900&q=80"];
-
-  // Profile ownership & document ID for website + Firebase profile management
-  const websiteBaseUrl = (env.WEBSITE_URL || "https://ais-dev-ligixirxwi2nidlsx5j5hb-166746593299.europe-west3.run.app").replace(/\/$/, "");
-  const adOwnerEmail = env.ADMIN_EMAIL || "marbatu1@gmail.com";
-  const adDocId = mediaGroupId ? `tg_${message.chat?.id || ""}_${mediaGroupId}` : `tg_${textHash}`;
+  const finalDisplayImages = imageUrls.length > 0
+    ? imageUrls
+    : [DEFAULT_CATEGORY_IMAGES[category] || DEFAULT_CATEGORY_IMAGES["ምንአለሽ_ተራ"]];
 
   // ============================================
   // 1. SAVE TO WEBSITE DIRECTLY (/api/ads)
   // ============================================
+  const websiteBaseUrl = (env.WEBSITE_URL || "https://mebri.yegna.workers.dev").replace(/\/$/, "");
+  const adOwnerEmail = env.ADMIN_EMAIL || "marbatu1@gmail.com";
+  const adDocId = mediaGroupId ? `tg_${message.chat?.id || ""}_${mediaGroupId}` : `tg_${textHash}`;
+
   try {
     const webAdPayload = {
       id: adDocId,
       title: arrangedTitle,
-      category: category,
-      subcategory: subcategory,
-      brand: brand || "",
+      category,
+      subcategory,
       price: rawPrice,
-      city: city,
-      subcity: subcity,
-      condition: condition,
+      city,
+      subcity,
+      condition: /(brand\s*new|zero\s*km|0\s*km|አዲስ)/i.test(normalizedText) ? "New" : "Used",
       images: finalDisplayImages,
       description: cleanText,
       phone: "0911680790",
@@ -759,16 +729,15 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
       const adData = {
         fields: {
           title: { stringValue: arrangedTitle },
-          brand: { stringValue: brand || "" },
-          model: { stringValue: model || "" },
-          year: { stringValue: year || "" },
-          trim: { stringValue: trim || "" },
-          bodyType: { stringValue: bodyType || "" },
-          fuelType: { stringValue: fuelType || "" },
-          transmission: { stringValue: transmission || "" },
+          brand: { stringValue: specs.brand || "" },
+          model: { stringValue: specs.model || "" },
+          year: { stringValue: specs.year || "" },
+          trim: { stringValue: specs.trim || "" },
+          bodyType: { stringValue: specs.bodyType || "" },
+          fuelType: { stringValue: specs.fuelType || "" },
+          transmission: { stringValue: specs.transmission || "" },
           category: { stringValue: category },
           subcategory: { stringValue: subcategory },
-          condition: { stringValue: condition },
           description: { stringValue: cleanText },
           textHash: { stringValue: textHash },
           price: { stringValue: formattedPrice },
@@ -792,10 +761,10 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
         }
       };
 
-      await fetch(fbUrl, { 
-        method: "PATCH", 
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, 
-        body: JSON.stringify(adData) 
+      await fetch(fbUrl, {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify(adData)
       });
       console.log(`✅ Saved to Website (Firebase Firestore) for ${adOwnerEmail} (${adOwnerId})`);
     }
@@ -806,41 +775,39 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
   // ============================================
   // 3. BUILD STRUCTURED POST TEXT WITH BOT FOOTER
   // ============================================
-  const hashtagMap = { 
-    Cars: "#Cars", 
-    Houses: "#Houses", 
-    Rentals: "#Rentals", 
-    Electronics: "#Electronics", 
-    Furniture: "#Furniture", 
-    Clothes: "#Clothes", 
-    "Labor & Services": "#Labor", 
-    "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ" 
+  const hashtagMap = {
+    Cars: "#Cars",
+    Houses: "#Houses",
+    Rentals: "#Rentals",
+    Electronics: "#Electronics",
+    Furniture: "#Furniture",
+    Clothes: "#Clothes",
+    "Building Materials": "#BuildingMaterials",
+    "Spare Parts": "#SpareParts",
+    "Labor & Services": "#Labor",
+    "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ"
   };
-  const hashtag = hashtagMap[category] || "#Other";
+  const hashtag = hashtagMap[category] || "#ምንአለሽ_ተራ";
   const displayPriceText = formattedPrice && formattedPrice !== "0" ? `${formattedPrice} ETB` : "Negotiable / ተደራዳሪ";
 
-  // Build the Header
   let headerText = `📝 Title: ${arrangedTitle}\n`;
-  if (brand || model || year) {
+  if (specs.brand || specs.model || specs.year) {
     const metaParts = [];
-    if (brand) metaParts.push(`Brand: ${brand}`);
-    if (model) metaParts.push(`Model: ${model}`);
-    if (year) metaParts.push(`Year: ${year}`);
-    headerText += `🏷️ ${metaParts.join(" | ")}\n`;
+    if (specs.brand) metaParts.push(`Make: ${specs.brand}`);
+    if (specs.model) metaParts.push(`Model: ${specs.model}`);
+    if (specs.year && category === "Cars") metaParts.push(`Year: ${specs.year}`);
+    if (metaParts.length > 0) headerText += `🏷️ ${metaParts.join(" | ")}\n`;
   }
-  headerText += `📂 Category: ${category}${subcategory && subcategory !== category ? ` › ${subcategory}` : ""}\n`;
+  headerText += `📂 Category: ${category}${subcategory ? ` › ${subcategory}` : ""}\n`;
+  headerText += `📍 Location: ${subcity ? `${subcity}, ${city}` : city}\n`;
   headerText += `💰 Price: ${displayPriceText}\n`;
-  if (city || subcity) {
-    headerText += `📍 Location: ${city}${subcity ? ` (${subcity})` : ""}\n`;
-  }
-  if (transmission || fuelType) {
+  if (category === "Cars" && (specs.transmission || specs.fuelType)) {
     const specParts = [];
-    if (transmission) specParts.push(`⚙️ ${transmission}`);
-    if (fuelType) specParts.push(`⛽ ${fuelType}`);
+    if (specs.transmission) specParts.push(`⚙️ ${specs.transmission}`);
+    if (specs.fuelType) specParts.push(`⛽ ${specs.fuelType}`);
     headerText += `${specParts.join(" | ")}\n`;
   }
 
-  // Build the Protected Footer
   let footerText = `\n━━━━━━━━━━━━━━━\n`;
   footerText += `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
   footerText += `📞 Phone: 0911680790\n`;
@@ -866,15 +833,15 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
   if (isInsideTargetChannel) {
     try {
       if (isPhoto) {
-        await callTelegram("editMessageCaption", { 
-          chat_id: chatId, 
-          message_id: message.message_id, 
+        await callTelegram("editMessageCaption", {
+          chat_id: chatId,
+          message_id: message.message_id,
           caption: safeSubstring(newPostText, 1024)
         }, env);
       } else {
-        await callTelegram("editMessageText", { 
-          chat_id: chatId, 
-          message_id: message.message_id, 
+        await callTelegram("editMessageText", {
+          chat_id: chatId,
+          message_id: message.message_id,
           text: safeSubstring(newPostText, 4096)
         }, env);
       }
@@ -893,15 +860,15 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
 
   try {
     if (isPhoto) {
-      await callTelegram("editMessageCaption", { 
-        chat_id: chatId, 
-        message_id: message.message_id, 
+      await callTelegram("editMessageCaption", {
+        chat_id: chatId,
+        message_id: message.message_id,
         caption: safeSubstring(newPostText, 1024)
       }, env);
     } else {
-      await callTelegram("editMessageText", { 
-        chat_id: chatId, 
-        message_id: message.message_id, 
+      await callTelegram("editMessageText", {
+        chat_id: chatId,
+        message_id: message.message_id,
         text: safeSubstring(newPostText, 4096)
       }, env);
     }
@@ -918,7 +885,7 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
       } else if (messageIds.length > 1) {
         try {
           await callTelegram("deleteMessages", { chat_id: chatId, message_ids: messageIds }, env);
-        } catch (delManyErr) {
+        } catch {
           for (const mid of messageIds) {
             await callTelegram("deleteMessage", { chat_id: chatId, message_id: mid }, env).catch(() => {});
           }
@@ -931,14 +898,14 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
 
     try {
       if (imageFileIds.length === 0) {
-        await callTelegram("sendMessage", { 
-          chat_id: chatId, 
+        await callTelegram("sendMessage", {
+          chat_id: chatId,
           text: safeSubstring(newPostText, 4096)
         }, env);
       } else if (imageFileIds.length === 1) {
-        await callTelegram("sendPhoto", { 
-          chat_id: chatId, 
-          photo: lastPhotoFileId, 
+        await callTelegram("sendPhoto", {
+          chat_id: chatId,
+          photo: lastPhotoFileId,
           caption: safeSubstring(newPostText, 1024)
         }, env);
       } else {
@@ -982,7 +949,7 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
 
         await callTelegram("sendMediaGroup", {
           chat_id: targetChannel,
-          media: media
+          media
         }, env);
       }
       console.log(`✅ Broadcasted Clean Ad to Channel ${targetChannel} (${imageFileIds.length} photos)`);
@@ -993,35 +960,224 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
 }
 
 // ============================================
-// ETHIOPIC NUMERAL NORMALIZER
+// AI CATEGORY + VISION CLASSIFIER
 // ============================================
-function normalizeEthiopicNumerals(text) {
-  if (!text) return "";
-  const map = {
-    "፩": "1", "፪": "2", "፫": "3", "፬": "4", "፭": "5",
-    "፮": "6", "፯": "7", "፰": "8", "፱": "9", "፲": "10",
-    "፳": "20", "፴": "30", "፵": "40", "፶": "50",
-    "፷": "60", "፸": "70", "፹": "80", "፺": "90", "፻": "100"
-  };
-  return text.replace(/[፩-፻]+/g, (seq) => {
-    if (seq.length === 1 && map[seq]) return map[seq];
-    let total = 0;
-    let current = 0;
-    for (const ch of seq) {
-      const val = Number(map[ch] || 0);
-      if (val === 100) {
-        total += (current || 1) * 100;
-        current = 0;
-      } else {
-        current += val;
+function cleanSpecValue(val) {
+  if (typeof val !== "string") return "";
+  const cleaned = val.trim();
+  if (/^(null|none|n\/a|unknown|na)$/i.test(cleaned)) return "";
+  return cleaned;
+}
+
+function normalizeCategory(raw) {
+  if (!raw) return null;
+  const c = String(raw).trim().toLowerCase();
+  if (c === "cars" || c === "car" || c === "vehicles" || c === "auto" || c.includes("መኪና")) return "Cars";
+  if (c === "houses" || c === "house" || c === "real estate" || c === "property" || c.includes("ቤት")) return "Houses";
+  if (c === "rentals" || c === "rental" || c === "rent" || c.includes("ኪራይ")) return "Rentals";
+  if (c === "electronics" || c === "electronic" || c === "phones" || c.includes("ኤሌክትሮኒክ")) return "Electronics";
+  if (c === "furniture" || c.includes("ፈርኒቸር")) return "Furniture";
+  if (c === "clothes" || c === "fashion" || c === "clothing" || c.includes("ልብስ")) return "Clothes";
+  if (c === "building materials" || c === "construction" || c.includes("ግንባታ")) return "Building Materials";
+  if (c === "spare parts" || c === "auto parts" || c === "parts" || c.includes("መለዋወጫ")) return "Spare Parts";
+  if (c === "labor & services" || c === "services" || c === "service" || c.includes("አገልግሎት")) return "Labor & Services";
+  if (c === "ምንአለሽ_ተራ" || c === "ምንአለሽ ተራ" || c === "general" || c === "other") return "ምንአለሽ_ተራ";
+  return null;
+}
+
+function parseJsonObjectSafe(rawText) {
+  if (!rawText) return null;
+  if (typeof rawText === "object") return rawText;
+  let str = String(rawText).trim();
+  str = str.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  const firstBrace = str.indexOf("{");
+  const lastBrace = str.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    str = str.slice(firstBrace, lastBrace + 1);
+  }
+  try {
+    return JSON.parse(str);
+  } catch {
+    return null;
+  }
+}
+
+async function fetchTelegramPhotoBase64(fileId, env) {
+  if (!fileId || !env.TELEGRAM_BOT_TOKEN) return null;
+  try {
+    const fileRes = await callTelegram("getFile", { file_id: fileId }, env);
+    if (!fileRes?.file_path) return null;
+    const tgUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileRes.file_path}`;
+    const imgFetch = await fetch(tgUrl, { signal: AbortSignal.timeout(6000) });
+    if (!imgFetch.ok) return null;
+    const arrayBuffer = await imgFetch.arrayBuffer();
+    if (arrayBuffer.byteLength > 4 * 1024 * 1024) return null;
+    const ext = fileRes.file_path.split(".").pop()?.toLowerCase();
+    const mimeType = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
+    return { base64: arrayBufferToBase64(arrayBuffer), mimeType };
+  } catch {
+    return null;
+  }
+}
+
+function buildClassifierPrompt(cleanText, imageDescription = "") {
+  return `You are an expert Ethiopian marketplace (Yegna Gebeya) ad classifier for English and Amharic listings.
+Classify the PRIMARY item/service being sold or rented into EXACTLY ONE category from this list:
+- "Cars": Whole cars, SUVs, pickups, trucks, EVs, minibuses for sale (even if mentioning new tires/battery/parts).
+- "Houses": Houses, villas, condominiums, apartments, buildings, or land/plots FOR SALE (even if mentioning granite kitchen, ceramic floor, gypsum ceiling, or furnished items).
+- "Rentals": Apartments, houses, rooms, villas, offices, shops, or warehouses FOR RENT / LEASE (monthly/ኪራይ/ለኪራይ), even if furnished with TV/sofa/bed.
+- "Electronics": Smartphones, laptops, TVs, gaming consoles, cameras, fridges, washing machines, solar/inverters.
+- "Furniture": Sofas, beds, mattresses, dining tables, chairs, wardrobes, cabinets, office desks sold separately.
+- "Clothes": Clothing, shoes, sneakers, jackets, dresses, suits, watches, handbags, traditional habesha kemis.
+- "Building Materials": Standalone construction/finishing materials sold as supply (granite/marble slabs, ceramic tiles per sqm, cement bags, rebar, steel, gypsum board, paint buckets, sand, gravel, pipes).
+- "Spare Parts": Standalone auto/machine replacement parts sold individually (car battery, tires/rims, headlights, bumpers, shock absorbers, brake pads, filters, engine oil) when NOT selling a whole car.
+- "Labor & Services": Jobs or skilled services (driver, plumber, electrician, painter, mechanic, cleaner, tutor, delivery, construction contractor, brokerage service).
+- "ምንአለሽ_ተራ": Any other legitimate general merchandise (bicycles, gym equipment, kitchenware, perfumes, tools, farm goods, etc.).
+
+Subcategory examples:
+- Cars: "Electric (EV)", "SUV / Crossover", "Sedan", "Pickup / Truck", "Hatchback / Compact", "Van / Minibus"
+- Houses: "Villa / House", "Condominium", "Apartment", "Plot / Land"
+- Rentals: "Apartment Rent", "Villa Rent", "Commercial / Office", "Shop / Store", "Warehouse / Hall"
+- Electronics: "Smartphones & Tablets", "Laptops & Computers", "TV & Home Entertainment", "Gaming & Consoles", "Home Appliances"
+- Building Materials: "Granite, Marble & Tiles", "Cement & Steel", "Paint, Wood & Gypsum", "Plumbing & Electrical"
+- Spare Parts: "Tires & Rims", "Electrical & Lights", "Engine & Filters", "Body & Suspension"
+
+Listing text:
+"""
+${cleanText.slice(0, 1200)}
+"""${imageDescription ? `\nPhoto visual description:\n"""\n${imageDescription}\n"""` : ""}
+
+Return ONLY valid JSON with keys: category, subcategory, brand, model, year, trim, bodyType, fuelType, transmission, suggestedTitle, confidence (0.0 to 1.0).`;
+}
+
+async function classifyAdWithAI(cleanText, firstImageFileId, specs, ruleResult, env) {
+  const needsImage = Boolean(firstImageFileId && (env.GEMINI_API_KEY || env.AI));
+  const photoData = needsImage ? await fetchTelegramPhotoBase64(firstImageFileId, env) : null;
+
+  // 1. Primary AI: Google Gemini (`gemini-4-hydrogen`) when GEMINI_API_KEY is configured
+  if (env.GEMINI_API_KEY) {
+    try {
+      const parts = [{ text: buildClassifierPrompt(cleanText) }];
+      if (photoData) {
+        parts.push({ inlineData: { mimeType: photoData.mimeType, data: photoData.base64 } });
+      }
+
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: AbortSignal.timeout(9000),
+          body: JSON.stringify({
+            contents: [{ parts }],
+            generationConfig: {
+              temperature: 0.1,
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: "OBJECT",
+                properties: {
+                  category: { type: "STRING", enum: MARKETPLACE_CATEGORIES },
+                  subcategory: { type: "STRING" },
+                  brand: { type: "STRING" },
+                  model: { type: "STRING" },
+                  year: { type: "STRING" },
+                  trim: { type: "STRING" },
+                  bodyType: { type: "STRING" },
+                  fuelType: { type: "STRING" },
+                  transmission: { type: "STRING" },
+                  suggestedTitle: { type: "STRING" },
+                  confidence: { type: "NUMBER" }
+                },
+                required: ["category", "subcategory"]
+              }
+            }
+          })
+        }
+      );
+
+      if (res.ok) {
+        const data = await res.json();
+        const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+        const parsed = parseJsonObjectSafe(raw);
+        if (parsed && parsed.category) {
+          return { ...parsed, provider: "gemini-4-hydrogen" };
+        }
+      }
+    } catch (err) {
+      console.warn("Gemini classification fallback:", err.message);
+    }
+  }
+
+  // 2. Built-in Key-Free AI: Cloudflare Workers AI (`env.AI` binding)
+  if (env.AI) {
+    let imageDescription = "";
+
+    if (photoData && (cleanText.length < 40 || ruleResult.confidence < 0.8 || (!specs.brand && ruleResult.category === "Cars"))) {
+      try {
+        const visionOut = await Promise.race([
+          env.AI.run("@cf/meta/llama-3.2-11b-vision-instruct", {
+            messages: [
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "text",
+                    text: "Briefly describe what item is for sale in this image (e.g., car brand/model/body type, house/apartment, smartphone/laptop, sofa/furniture, shoes/clothes, granite/tiles/cement, or car spare part/tire) in 1-2 short sentences."
+                  },
+                  {
+                    type: "image_url",
+                    image_url: { url: `data:${photoData.mimeType};base64,${photoData.base64}` }
+                  }
+                ]
+              }
+            ],
+            max_tokens: 120
+          }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("vision_timeout")), 6500))
+        ]);
+        imageDescription = String(visionOut?.response || visionOut?.description || "").trim();
+      } catch (vErr) {
+        console.warn("Workers AI vision skipped:", vErr.message);
       }
     }
-    return String(total + current);
-  });
+
+    try {
+      const llmOut = await Promise.race([
+        env.AI.run("@cf/meta/llama-3.1-8b-instruct", {
+          messages: [
+            {
+              role: "system",
+              content: "You are an accurate JSON-only Ethiopian marketplace classifier. Never output markdown or explanations, only valid JSON."
+            },
+            {
+              role: "user",
+              content: buildClassifierPrompt(cleanText, imageDescription)
+            }
+          ],
+          temperature: 0.1,
+          max_tokens: 300,
+          response_format: { type: "json_object" }
+        }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("llm_timeout")), 7000))
+      ]);
+
+      const parsed = parseJsonObjectSafe(llmOut?.response ?? llmOut);
+      if (parsed && parsed.category) {
+        return {
+          ...parsed,
+          provider: imageDescription ? "workers-ai-vision+llama3.1" : "workers-ai-llama3.1"
+        };
+      }
+    } catch (aiErr) {
+      console.warn("Workers AI text classification fallback:", aiErr.message);
+    }
+  }
+
+  return null;
 }
 
 // ============================================
-// BRAND / MODEL / YEAR / SPECS PARSER (AMHARIC + ENGLISH)
+// BRAND / MODEL / YEAR / SPECS PARSER
 // ============================================
 function detectBrandModelYear(text) {
   let brand = "";
@@ -1033,33 +1189,25 @@ function detectBrandModelYear(text) {
   let transmission = "";
   let subcategory = "";
 
-  const makeMatch = text.match(/(?:Make|የመኪናው\s*ዓይነት|የመኪና\s*ዓይነት|Brand|ብራንድ|አይነት)[ \t:=-]+([^\n,;()]+)/i);
+  const makeMatch = text.match(/(?:Make|የመኪናው\s*ዓይነት|Brand|ብራንድ)[ \t:=-]+([a-zA-Z0-9\u1200-\u137F/._ -]+)/i);
   if (makeMatch && makeMatch[1]) {
-    const candidate = makeMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
-    if (!/^(?:new|brand\s*new|used|አዲስ|ያገለገለ)\b/i.test(candidate) && candidate.length < 30) {
-      brand = candidate;
-    }
+    brand = makeMatch[1].split("\n")[0].replace(/[💎📌⭐✔️•.]/g, "").trim();
+    if (/^(?:new|brand\s*new|used|አዲስ|ያገለገለ)\b/i.test(brand)) brand = "";
   }
 
   const modelMatch = text.match(/(?:Model|ሞዴል)[ \t:=-]+([a-zA-Z0-9\u1200-\u137F/._ -]+)/i);
   if (modelMatch && modelMatch[1]) {
-    model = modelMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
+    model = modelMatch[1].split("\n")[0].replace(/[💎📌⭐✔️•.]/g, "").trim();
   }
 
-  const yearMatch = text.match(/(?:Year|ዓመተ\s*ምህረት|የተሰራበት\s*ዓመት|ዓ\.?ም)[ \t:=-]+([0-9]{4}(?:\/[0-9]{1,2})?)/i);
+  const yearMatch = text.match(/(?:Year|ዓመተ\s*ምህረት|ዓ\.ም|ዘመን)[ \t:=-]+([0-9]{4}(?:\/[0-9]{1,2})?)/i);
   if (yearMatch && yearMatch[1]) {
     year = yearMatch[1].trim();
   } else {
-    const ecYearMatch = text.match(/\b(200\d|201\d)\s*(?:ዓ\.?ም|E\.?C)/i);
-    if (ecYearMatch) {
-      year = `${ecYearMatch[1]} E.C`;
-    } else {
-      const rawYear = text.match(/\b(199\d|200\d|201\d|202[0-9])(?:\/([0-9]{1,2}))?\b/);
-      if (rawYear) year = rawYear[0];
-    }
+    const rawYear = text.match(/\b(199\d|200\d|201\d|202[0-9])(?:\/([0-9]{1,2}))?\b/);
+    if (rawYear) year = rawYear[0];
   }
 
-  // Ethiopian ad convention: "Model 2022" or "ሞዴል 2022" is manufacture YEAR, not model name!
   if (model && /^(?:19|20)\d{2}(?:\/\d{1,2})?$/.test(model)) {
     if (!year) year = model;
     model = "";
@@ -1067,43 +1215,39 @@ function detectBrandModelYear(text) {
 
   const trimMatch = text.match(/(?:Trim|ትሪም|Edition)[ \t:=-]+([a-zA-Z0-9/._ -]+)/i);
   if (trimMatch && trimMatch[1]) {
-    trim = trimMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
+    trim = trimMatch[1].split("\n")[0].replace(/[💎📌⭐✔️•.]/g, "").trim();
   }
 
-  const bodyMatch = text.match(/(?:Body\s*Type|የቦዲ\s*ዓይነት)[ \t:=-]+([a-zA-Z0-9\u1200-\u137F/._ -]+)/i);
+  const bodyMatch = text.match(/(?:Body\s*Type|የቦዲ\s*ዓይነት)[ \t:=-]+([a-zA-Z0-9/._ -]+)/i);
   if (bodyMatch && bodyMatch[1]) {
-    bodyType = bodyMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
+    bodyType = bodyMatch[1].split("\n")[0].replace(/[💎📌⭐✔️•.]/g, "").trim();
   }
 
   const fuelMatch = text.match(/(?:Fuel|ነዳጅ)[ \t:=-]+([a-zA-Z0-9\u1200-\u137F/._ -]+)/i);
   if (fuelMatch && fuelMatch[1]) {
-    fuelType = fuelMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
-  }
-  if (!fuelType || /[\u1200-\u137F]/.test(fuelType)) {
-    if (/\bev\b|electric|ኤሌክትሪክ|በኤሌክትሪክ|በቻርጅ|ባትሪ/i.test(text)) {
-      fuelType = "Electric";
-    } else if (/benzin|petrol|ቤንዚን|በንዚን/i.test(text)) {
-      fuelType = "Petrol / Benzin";
-    } else if (/diesel|ናፍጣ/i.test(text)) {
-      fuelType = "Diesel";
-    } else if (/hybrid|ሃይብሪድ|ሀይብሪድ/i.test(text)) {
-      fuelType = "Hybrid";
-    }
+    fuelType = fuelMatch[1].split("\n")[0].replace(/[💎📌⭐✔️•.]/g, "").trim();
+  } else if (/(?:electric|ኤሌክትሪክ|\bev\b|ቻርጅ)/i.test(text)) {
+    fuelType = "Electric";
+  } else if (/(?:benzin|petrol|ቤንዚን)/i.test(text)) {
+    fuelType = "Petrol / Benzin";
+  } else if (/(?:diesel|ናፍጣ)/i.test(text)) {
+    fuelType = "Diesel";
+  } else if (/(?:hybrid|ሃይብሪድ)/i.test(text)) {
+    fuelType = "Hybrid";
   }
 
-  const transMatch = text.match(/(?:Transmission|ማስተላለፊያ|ጊር)[ \t:=-]+([a-zA-Z0-9\u1200-\u137F/._ -]+)/i);
+  const transMatch = text.match(/(?:Transmission|ማስተላለፊያ)[ \t:=-]+([a-zA-Z0-9\u1200-\u137F/._ -]+)/i);
   if (transMatch && transMatch[1]) {
-    const candidate = transMatch[1].replace(/[💎📌⭐✔️•.]/g, "").trim();
-    if (/automatic|ኦቶማቲክ|አውቶማቲክ|አውቶ/i.test(candidate)) transmission = "Automatic";
-    else if (/manual|ማኑዋል|ማንዋል/i.test(candidate)) transmission = "Manual";
+    const candidate = transMatch[1].split("\n")[0].replace(/[💎📌⭐✔️•.]/g, "").trim();
+    if (/(?:automatic|ኦቶማቲክ)/i.test(candidate)) transmission = "Automatic";
+    else if (/(?:manual|ማኑዋል)/i.test(candidate)) transmission = "Manual";
     else if (candidate.length < 20 && !/^(?:19|20)\d{2}/.test(candidate)) transmission = candidate;
   }
   if (!transmission) {
-    if (/automatic|ኦቶማቲክ|አውቶማቲክ/i.test(text)) transmission = "Automatic";
-    else if (/manual|ማኑዋል|ማንዋል/i.test(text)) transmission = "Manual";
+    if (/(?:automatic\s*transmission|ኦቶማቲክ)/i.test(text)) transmission = "Automatic";
+    else if (/(?:manual\s*transmission|ማኑዋል)/i.test(text)) transmission = "Manual";
   }
 
-  // Match car brand & model from CAR_DATABASE (including Amharic brand/model spellings)
   if (!brand) {
     for (const b of CAR_DATABASE) {
       if (b.regex.test(text)) {
@@ -1119,11 +1263,8 @@ function detectBrandModelYear(text) {
       }
     }
   } else {
-    const matchedBrandObj = CAR_DATABASE.find(
-      b => b.name.toLowerCase() === brand.toLowerCase() || b.regex.test(brand)
-    );
+    const matchedBrandObj = CAR_DATABASE.find((b) => b.name.toLowerCase() === brand.toLowerCase());
     if (matchedBrandObj) {
-      brand = matchedBrandObj.name;
       for (const m of matchedBrandObj.models) {
         if (m.regex.test(text)) {
           if (!model || /^\d+$/.test(model)) model = m.name;
@@ -1137,6 +1278,7 @@ function detectBrandModelYear(text) {
   if (!model || !brand) {
     for (const b of CAR_DATABASE) {
       for (const m of b.models) {
+        if (m.requireBrand) continue;
         if (m.regex.test(text)) {
           if (!brand) brand = b.name;
           if (!model || /^\d+$/.test(model)) model = m.name;
@@ -1148,7 +1290,6 @@ function detectBrandModelYear(text) {
     }
   }
 
-  // Match electronics brand & model
   if (!brand) {
     for (const eb of ELECTRONICS_DATABASE) {
       if (eb.regex.test(text)) {
@@ -1166,77 +1307,174 @@ function detectBrandModelYear(text) {
   }
 
   if (!subcategory && bodyType) {
-    if (/suv|ኤስዩቪ/i.test(bodyType) || /\bsuv\b/i.test(text)) {
-      subcategory = "SUV / Crossover";
-    } else if (/sedan|ሴዳን/i.test(bodyType) || /\bsedan\b/i.test(text)) {
-      subcategory = "Sedan";
-    }
+    if (bodyType.toLowerCase().includes("suv") || /\bsuv\b/i.test(text)) subcategory = "SUV / Crossover";
+    else if (bodyType.toLowerCase().includes("sedan") || /\bsedan\b/i.test(text)) subcategory = "Sedan";
   }
 
   return { brand, model, year, trim, bodyType, fuelType, transmission, subcategory };
 }
 
 // ============================================
-// AMHARIC TITLE EXTRACTOR & ARRANGER
+// CONTEXT-WEIGHTED FALLBACK CATEGORY CLASSIFIER
 // ============================================
-function extractAmharicTitle(cleanText, category, subcity) {
-  if (!cleanText) return "";
+function detectCategoryWeighted(text, brand = "", suggestedSubcat = "") {
+  const t = (text || "").toLowerCase();
+  const scores = {
+    Cars: 0,
+    Houses: 0,
+    Rentals: 0,
+    Electronics: 0,
+    Furniture: 0,
+    Clothes: 0,
+    "Building Materials": 0,
+    "Spare Parts": 0,
+    "Labor & Services": 0
+  };
 
-  // 1. Check explicit Amharic or English title labels
-  const explicitMatch = cleanText.match(
-    /(?:^|\n)[ \t]*(?:Title|ርዕስ|ስም|የእቃው\s*ስም|የእቃው\s*አይነት|የቤቱ\s*አይነት|አይነት)[ \t:：=-]+([^\n]+)/i
-  );
-  if (explicitMatch && explicitMatch[1]) {
-    const candidate = cleanTitleLine(explicitMatch[1]);
-    if (candidate.length >= 3) {
-      return appendSubcityIfMissing(candidate, subcity);
+  const hasCarBrand = Boolean(brand && CAR_DATABASE.some((b) => b.name.toLowerCase() === brand.toLowerCase()));
+  const hasElecBrand = Boolean(brand && ELECTRONICS_DATABASE.some((eb) => eb.name.toLowerCase() === brand.toLowerCase()));
+
+  const wholeCarSignals = /(መኪና|አውቶሞቢል|ተሽከርካሪ|ታርጋ|ኮድ\s*[1234]|mileage|odometer|\bkm\b|automatic|manual|ኦቶማቲክ|ማኑዋል|kwh|single\s*motor|dual\s*motor|\bsuv\b|\bsedan\b|hatchback|pickup)/gi;
+  const wholeCarMatches = (t.match(wholeCarSignals) || []).length;
+  const partSignals = /(spare\s*part|auto\s*part|car\s*part|brake\s*pad|shock\s*absorber|alternator|radiator|headlight|bumper|engine\s*oil|car\s*battery|tyre|\btire\b|alloy\s*rim|መለዋወጫ|ስፔር\s*ፓርት|ጎማ|የመኪና\s*ባትሪ|ፍሬን|ፋሮ|ፓራውልት|ቦምፐር|ራዲያተር|ፊልተር|ሞተር\s*ዘይት)/gi;
+  const partMatches = (t.match(partSignals) || []).length;
+
+  if (hasCarBrand) scores.Cars += 4;
+  scores.Cars += wholeCarMatches * 3;
+  if (/(?:\bcar\b|vitz|corolla|rav4|suzuki|hyundai|byd|elantra|sealion|tucson|toyota|yaris|hilux|dzire|isuzu)/i.test(t)) {
+    scores.Cars += 3;
+  }
+
+  if (partMatches > 0) {
+    if (wholeCarMatches >= 2 || (hasCarBrand && /(mileage|\bkm\b|ታርጋ|ኮድ|plate|year|20\d{2}|ሞዴል)/i.test(t) && !/(spare\s*part|መለዋወጫ|ስፔር\s*ፓርት)/i.test(t))) {
+      scores["Spare Parts"] += 1;
+    } else {
+      scores["Spare Parts"] += partMatches * 4 + (hasCarBrand ? 2 : 0);
     }
   }
 
-  // 2. Score lines to skip greetings, standalone phone/price/contact lines, and pick descriptive Amharic title
-  const lines = cleanText.split("\n").map((l) => l.trim()).filter(Boolean);
-  const fillerLineRegex = /^(?:ሰላም(?:\s+ለሁላችሁ)?|እንዴት\s+ናችሁ|በአስቸኳይ|አስቸኳይ|ለበለጠ\s+መረጃ|ስልክ|አድራሻ|ዋጋ|የመሸጫ\s*ዋጋ|price|contact|call|location)[ \t:：=-]*$/i;
-  const priceOnlyRegex = /^(?:ዋጋ|የመሸጫ\s*ዋጋ|price|በ|ብር|ETB)?[ \t:：=-]*[0-9.,]+[ \t]*(?:ETB|ብር|Birr|ሚሊዮን|ሚሊየን|ሚ|ሺህ|ሺ|k|m)?[ \t]*$/i;
+  const propertySignals = /(house|villa|condominium|condo|apartment|g\+\d|real\s*estate|compound|bedroom|office|shop|store|warehouse|hall|land|plot|ቤት|ቪላ|ኮንዶሚኒየም|ኮንዶ|አፓርታማ|ሪል\s*እስቴት|መኝታ|ቦታ|መሬት|ሱቅ|ቢሮ|መጋዘን|አዳራሽ|ካርታ)/gi;
+  const propertyMatches = (t.match(propertySignals) || []).length;
+  const rentalSignals = /(for\s*rent|\brent\b|\blease\b|\bmonthly\b|ኪራይ|የሚከራይ|ለኪራይ|ወርሃዊ|በወር)/gi;
+  const rentalMatches = (t.match(rentalSignals) || []).length;
 
-  for (const rawLine of lines) {
-    if (fillerLineRegex.test(rawLine) || priceOnlyRegex.test(rawLine)) continue;
-    // Strip leading labels like "መግለጫ፡" or bullet prefixes
-    const cleaned = cleanTitleLine(
-      rawLine
-        .replace(/^(?:አስቸኳይ\s*የሚሸጥ|በአስቸኳይ\s*የሚሸጥ|የሚሸጥ|ለሽያጭ\s*የቀረበ|ለኪራይ\s*የቀረበ)[ \t:：-]+/i, "")
-        .replace(/^(?:ዋጋ|price)[ \t:：=-]+.*$/i, "")
-    );
-    if (cleaned.length >= 4) {
-      return appendSubcityIfMissing(cleaned, subcity);
+  const materialSignals = /(cement|rebar|granite|marble|ceramic|porcelain|gypsum|corrugated|steel\s*bar|plywood|paint\s*bucket|building\s*material|construction\s*material|ሲሚንቶ|ብረት|ሪባር|ግራናይት|ማርብል|ሴራሚክ|ብሎኬት|ቆርቆሮ|አሸዋ|ጠጠር|ጂፕሰም|የግንባታ\s*እቃ|ቀለም\s*ባልዲ|ቧንቧ\s*እቃ)/gi;
+  const materialMatches = (t.match(materialSignals) || []).length;
+  const bulkSupplySignals = /(per\s*sqm|per\s*m2|slab|quintal|ton\b|factory|warehouse\s*stock|በካሬ|በኩንታል|ፋብሪካ|ስላብ|ባልዲ|በብዛት)/i.test(t);
+
+  if (propertyMatches > 0) {
+    if (rentalMatches > 0) {
+      scores.Rentals += propertyMatches * 3 + rentalMatches * 4;
+    } else {
+      scores.Houses += propertyMatches * 3 + (/\b(sqm|m2|ካሬ)\b/i.test(t) ? 2 : 0);
+    }
+  } else if (rentalMatches > 0 && /(room|flat|ክፍል)/i.test(t)) {
+    scores.Rentals += 5;
+  }
+
+  if (materialMatches > 0) {
+    if (propertyMatches >= 2 && !bulkSupplySignals && !/(building\s*material|የግንባታ\s*እቃ)/i.test(t)) {
+      scores["Building Materials"] += 1;
+    } else {
+      scores["Building Materials"] += materialMatches * 4 + (bulkSupplySignals ? 3 : 0);
     }
   }
 
-  return "";
+  const elecMatches = (t.match(/(iphone|samsung|laptop|computer|macbook|ipad|smartphone|tablet|smart\s*tv|television|camera|ps5|playstation|xbox|fridge|refrigerator|washing\s*machine|ስልክ|ሞባይል|ላፕቶፕ|ኮምፒውተር|ቴሌቪዥን|ቲቪ|ካሜራ|ፍሪጅ|የልብስ\s*ማጠቢያ)/gi) || []).length;
+  if (hasElecBrand) scores.Electronics += 4;
+  if (elecMatches > 0) {
+    scores.Electronics += propertyMatches >= 2 ? 1 : elecMatches * 3;
+  }
+
+  const furnMatches = (t.match(/(sofa|bed|mattress|table|chair|cupboard|wardrobe|furniture|cabinet|shelf|desk|ሶፋ|አልጋ|ፍራሽ|ጠረጴዛ|ወንበር|ቁምሳጥን|ፈርኒቸር|ቡፌ|መደርደሪያ)/gi) || []).length;
+  if (furnMatches > 0) {
+    scores.Furniture += propertyMatches >= 2 ? 1 : furnMatches * 3;
+  }
+
+  const clothMatches = (t.match(/(shoes|sneakers|boots|jacket|dress|suit|t-?shirt|clothes|pants|hoodie|handbag|watch|ጫማ|ጃኬት|ቀሚስ|ልብስ|ሱሪ|ቲሸርት|ኮት|ቦርሳ|ሀበሻ\s*ቀሚስ)/gi) || []).length;
+  scores.Clothes += clothMatches * 3;
+
+  const serviceMatches = (t.match(/(driver|plumber|electrician|painter|mechanic|cleaner|carpenter|technician|tutor|delivery|maintenance|service|ቧንቧ|ኤሌክትሪክ\s*ባለሙያ|ቀለም\s*ቀቢ|ሹፌር|መካኒክ|ጽዳት|ሠራተኛ|አገልግሎት|ጥገና)/gi) || []).length;
+  scores["Labor & Services"] += serviceMatches * 3;
+
+  let bestCategory = "ምንአለሽ_ተራ";
+  let bestScore = 0;
+  for (const [cat, score] of Object.entries(scores)) {
+    if (score > bestScore) {
+      bestScore = score;
+      bestCategory = cat;
+    }
+  }
+
+  const confidence = bestScore >= 6 ? 0.9 : bestScore >= 3 ? 0.72 : 0.35;
+  const subcategory = pickSubcategory(bestCategory, t, suggestedSubcat);
+  return { category: bestCategory, subcategory, confidence };
 }
 
-function cleanTitleLine(str) {
-  return (str || "")
-    .replace(/[💎📌⭐✔️•#*_~`]/g, "")
-    .replace(/\s+/g, " ")
-    .replace(/^[:：\-–—.,\s]+|[:：\-–—.,\s]+$/g, "")
-    .trim();
+function pickSubcategory(category, lowerText, suggestedSubcat = "") {
+  if (category === "Cars") {
+    if (suggestedSubcat) return suggestedSubcat;
+    if (/(electric|kwh|single motor|dual motor|\bev\b|ኤሌክትሪክ|ቻርጅ)/i.test(lowerText)) return "Electric (EV)";
+    if (/(suv|crossover|4wd|4x4|rav4|prado|land cruiser|tucson|tiggo|santa fe)/i.test(lowerText)) return "SUV / Crossover";
+    if (/(pickup|truck|hilux|ranger|isuzu|d-max|ፒክአፕ|ጭነት|ኤፍኤስአር)/i.test(lowerText)) return "Pickup / Truck";
+    if (/(hatchback|compact|vitz|swift|celerio|yaris|alto|i10)/i.test(lowerText)) return "Hatchback / Compact";
+    if (/(minibus|van|hiace|damas|ሚኒባስ|ቫን)/i.test(lowerText)) return "Van / Minibus";
+    return "Sedan";
+  }
+  if (category === "Houses") {
+    if (/(condo|condominium|ኮንዶ)/i.test(lowerText)) return "Condominium";
+    if (/(apartment|አፓርታማ)/i.test(lowerText)) return "Apartment";
+    if (/(land|plot|ቦታ|መሬት|ካርታ)/i.test(lowerText)) return "Plot / Land";
+    return "Villa / House";
+  }
+  if (category === "Rentals") {
+    if (/(office|ቢሮ)/i.test(lowerText)) return "Commercial / Office";
+    if (/(shop|store|ሱቅ)/i.test(lowerText)) return "Shop / Store";
+    if (/(warehouse|hall|መጋዘን|አዳራሽ)/i.test(lowerText)) return "Warehouse / Hall";
+    if (/(villa|g\+1|g\+2|ቪላ)/i.test(lowerText)) return "Villa Rent";
+    return "Apartment Rent";
+  }
+  if (category === "Electronics") {
+    if (suggestedSubcat) return suggestedSubcat;
+    if (/(laptop|macbook|computer|\bpc\b|desktop|ላፕቶፕ|ኮምፒውተር)/i.test(lowerText)) return "Laptops & Computers";
+    if (/(\btv\b|television|audio|soundbar|ቴሌቪዥን|ቲቪ|ስፒከር)/i.test(lowerText)) return "TV & Home Entertainment";
+    if (/(ps5|ps4|playstation|xbox|nintendo|ጌም)/i.test(lowerText)) return "Gaming & Consoles";
+    if (/(fridge|refrigerator|washing\s*machine|oven|ፍሪጅ|ማጠቢያ)/i.test(lowerText)) return "Home Appliances";
+    return "Smartphones & Tablets";
+  }
+  if (category === "Furniture") {
+    if (/(bed|mattress|አልጋ|ፍራሽ)/i.test(lowerText)) return "Bedroom & Mattresses";
+    if (/(office|desk|ቢሮ)/i.test(lowerText)) return "Office Furniture";
+    if (/(kitchen|dining|buffet|መመገቢያ|ቡፌ)/i.test(lowerText)) return "Kitchen & Dining";
+    return "Living Room / Sofa";
+  }
+  if (category === "Clothes") {
+    if (/(shoes|sneakers|boots|ጫማ)/i.test(lowerText)) return "Shoes & Footwear";
+    if (/(bag|watch|ቦርሳ|ሰዓት)/i.test(lowerText)) return "Bags & Accessories";
+    return "Clothing & Apparel";
+  }
+  if (category === "Building Materials") {
+    if (/(granite|marble|ceramic|porcelain|ግራናይት|ማርብል|ሴራሚክ)/i.test(lowerText)) return "Granite, Marble & Tiles";
+    if (/(cement|rebar|steel|block|ሲሚንቶ|ብረት|ሪባር|ብሎኬት)/i.test(lowerText)) return "Cement & Steel";
+    if (/(paint|gypsum|wood|ጂፕሰም|ቀለም)/i.test(lowerText)) return "Paint, Wood & Gypsum";
+    return "Construction & Finishing";
+  }
+  if (category === "Spare Parts") {
+    if (/(tire|tyre|rim|ጎማ|ቸርኬ)/i.test(lowerText)) return "Tires & Rims";
+    if (/(battery|alternator|headlight|ባትሪ|ፋሮ)/i.test(lowerText)) return "Electrical & Lights";
+    if (/(engine|oil|filter|radiator|ሞተር|ፊልተር|ዘይት)/i.test(lowerText)) return "Engine & Filters";
+    return "Auto Spare Parts";
+  }
+  return DEFAULT_SUBCATEGORIES[category] || "General Marketplace";
 }
 
-function appendSubcityIfMissing(title, subcity) {
-  if (!subcity) return safeSubstring(title, 68);
-  if (title.toLowerCase().includes(subcity.toLowerCase())) return safeSubstring(title, 68);
-  const combined = `${title} (${subcity})`;
-  return combined.length <= 68 ? combined : safeSubstring(title, 68);
-}
-
-function arrangeTitle({ brand, model, year, trim, cleanText, category, subcategory, subcity, aiTitle }) {
+function arrangeTitle({ brand, model, year, trim, cleanText, category, subcategory, aiTitle = "" }) {
   if (category === "Cars") {
     const cleanYear = year ? year.split("/")[0] : "";
     if (brand && model) {
       const parts = [];
       if (cleanYear) parts.push(cleanYear);
-      parts.push(brand);
-      parts.push(model);
+      parts.push(brand, model);
       if (trim && !model.toLowerCase().includes(trim.toLowerCase())) {
         parts.push(`(${trim})`);
       }
@@ -1244,7 +1482,7 @@ function arrangeTitle({ brand, model, year, trim, cleanText, category, subcatego
     }
     if (brand) {
       const parts = [cleanYear, brand, subcategory && subcategory !== "Vehicles" ? subcategory : ""].filter(Boolean);
-      return parts.join(" ");
+      if (parts.length > 0) return parts.join(" ");
     }
   }
 
@@ -1252,134 +1490,52 @@ function arrangeTitle({ brand, model, year, trim, cleanText, category, subcatego
     return `${brand} ${model}${trim ? ` ${trim}` : ""}`;
   }
 
-  if (aiTitle) {
-    return safeSubstring(aiTitle, 68);
+  const cleanLines = cleanText
+    .split("\n")
+    .map((l) => l.replace(/[💎📌⭐✔️•#🚨]/g, "").trim())
+    .filter((l) => l.length > 2 && !/^(?:urgent|very urgent|sale|for sale|አስቸኳይ|ሽያጭ|ለሽያጭ|ይደውሉ|ዋጋ|price)[:!.\s]*$/i.test(l));
+
+  if (aiTitle && aiTitle.length >= 6 && aiTitle.length <= 72) {
+    return safeSubstring(aiTitle, 70);
   }
 
-  const amharicTitle = extractAmharicTitle(cleanText, category, subcity);
-  if (amharicTitle) {
-    return amharicTitle;
+  if (cleanLines.length > 0) {
+    const best = cleanLines[0]
+      .replace(/^(?:urgent\s*(?:sale|sell)?|very\s*urgent\s*(?:sale)?|አስቸኳይ\s*(?:ሽያጭ)?)[ \t:!.-]*/i, "")
+      .trim();
+    if (best) return safeSubstring(best, 70);
   }
-
-  const firstLine = cleanTitleLine((cleanText.split("\n")[0] || ""));
-  return safeSubstring(firstLine, 65) || `${category} Item`;
+  return `${category === "ምንአለሽ_ተራ" ? "Marketplace" : category} Item`;
 }
 
-// ============================================
-// AMHARIC + ENGLISH CATEGORY, SUBCATEGORY & CONDITION
-// ============================================
-function detectCategory(text, brand) {
-  const t = text.toLowerCase();
-  if (brand && CAR_DATABASE.some(b => b.name.toLowerCase() === brand.toLowerCase())) return "Cars";
-  if (brand && ELECTRONICS_DATABASE.some(eb => eb.name.toLowerCase() === brand.toLowerCase())) return "Electronics";
-
-  // Rentals vs Sales
-  const isRentIntent = /(ኪራይ|ለኪራይ|የሚከራይ|ይከራያል|በወር|ወርሃዊ|\brent\b|\bfor\s*rent\b)/i.test(t);
-  const isHouseTerm = /(ቤት|ኮንዶሚኒየም|አፓርታማ|ቪላ|መኝታ|ህንጻ|ህንፃ|ሱቅ|ቢሮ|መጋዘን|ቦታ|መሬት|ሪል\s*እስቴት|ካሬ|apartment|villa|house|condominium|g\+|sqm|bedroom)/i.test(t);
-  const isCarTerm = /(መኪና|ተሽከርካሪ|አውቶሞቢል|ፒክአፕ|ቫን|ሚኒባስ|ባጃጅ|ታርጋ|ሰሌዳ|ኪሎ\s*ሜትር|ኮድ\s*[12345]|\bcar\b|vitz|corolla|rav4|suzuki|hyundai|byd|elantra|sealion|tucson|toyota|yaris|benz|mileage|\bkm\b|plate)/i.test(t);
-
-  if (isCarTerm) return "Cars";
-  if (isHouseTerm) {
-    if (isRentIntent) return "Rentals";
-    return "Houses";
-  }
-  if (isRentIntent) return "Rentals";
-
-  if (/(ስልክ|ሞባይል|አይፎን|ሳምሰንግ|ላፕቶፕ|ኮምፒውተር|ታብሌት|ቴሌቪዥን|ቲቪ|ፕሌይስቴሽን|ፍሪጅ|ልብስ\s*ማጠቢያ|ማይክሮዌቭ|ስፒከር|ካሜራ|phone|iphone|samsung|laptop|macbook|ipad|\btv\b|electronics|playstation|ps5)/i.test(t)) {
-    return "Electronics";
-  }
-  if (/(ሶፋ|አልጋ|ጠረጴዛ|ወንበር|ቁምሳጥን|ፍራሽ|መጋረጃ|ምንጣፍ|ፈርኒቸር|የቤት\s*እቃ|sofa|bed|table|chair|furniture|wardrobe|mattress)/i.test(t)) {
-    return "Furniture";
-  }
-  if (/(ጫማ|ጃኬት|ቀሚስ|ልብስ|ሱፍ|ሸሚዝ|ቦርሳ|ሰዓት|ሽቶ|ቲሸርት|shoes|jacket|dress|suit|clothes|pants)/i.test(t)) {
-    return "Clothes";
-  }
-  if (/(ቧንቧ|ኤሌክትሪክ\s*ሰራተኛ|ቀለም\s*ቀቢ|ሹፌር|ሰርቪስ|ጽዳት|ጥገና|ሞግዚት|አስተማሪ|ዲዛይን|driver|plumber|electrician|mechanic)/i.test(t)) {
-    return "Labor & Services";
-  }
-  return "ምንአለሽ_ተራ";
-}
-
-function detectAmharicSubcategory(text, category) {
-  if (category === "Cars") {
-    if (/ኤሌክትሪክ|በቻርጅ|\bev\b|electric/i.test(text)) return "Electric (EV)";
-    if (/ፒክአፕ|ገልባጭ|ትራክ|pickup|truck/i.test(text)) return "Pickup / Truck";
-    if (/ቫን|ሚኒባስ|ዶልፊን|van|minibus/i.test(text)) return "Van / Minibus";
-    if (/suv|ኤስዩቪ/i.test(text)) return "SUV / Crossover";
-    if (/sedan|ሴዳን/i.test(text)) return "Sedan";
-    return "Vehicles";
-  }
-  if (category === "Houses" || category === "Rentals") {
-    if (/ኮንዶሚኒየም|condo/i.test(text)) return "Condominium";
-    if (/አፓርታማ|apartment/i.test(text)) return "Apartment";
-    if (/ቪላ|villa/i.test(text)) return "Villa";
-    if (/ቦታ|መሬት|ይዞታ|land|plot/i.test(text)) return "Land / Plot";
-    if (/ቢሮ|ሱቅ|መጋዘን|ህንጻ|commercial|office|shop/i.test(text)) return "Commercial / Office";
-    return category === "Rentals" ? "For Rent" : "Residential";
-  }
-  if (category === "Electronics") {
-    if (/ስልክ|ሞባይል|አይፎን|ታብሌት|phone|tablet/i.test(text)) return "Smartphones & Tablets";
-    if (/ላፕቶፕ|ኮምፒውተር|laptop|computer/i.test(text)) return "Laptops & Computers";
-    if (/ቴሌቪዥን|ቲቪ|tv/i.test(text)) return "TV & Home Entertainment";
-    if (/ፍሪጅ|ማጠቢያ|ማይክሮዌቭ|fridge/i.test(text)) return "Home Appliances";
-    return "Electronics";
-  }
-  if (category === "Furniture") {
-    if (/ሶፋ|sofa/i.test(text)) return "Living Room";
-    if (/አልጋ|ፍራሽ|ቁምሳጥን|bed/i.test(text)) return "Bedroom";
-    if (/ጠረጴዛ|ወንበር|table|chair/i.test(text)) return "Dining & Office";
-    return "Furniture";
-  }
-  return category;
-}
-
-function detectCondition(text, category) {
-  if (category === "Rentals" || /(?:ለኪራይ|የሚከራይ|ይከራያል|\bfor\s*rent\b)/i.test(text)) {
-    return "For Rent";
-  }
-  if (/(?:ብራንድ\s*ኒው|አዲስ|ዜሮ\s*ኪሎ|00\s*km|\bbrand\s*new\b)/i.test(text) && !/ያገለገለ|used/i.test(text)) {
-    return "New";
-  }
-  return "Used";
-}
-
-// ============================================
-// MATHEMATICAL AMHARIC + ENGLISH PRICE PARSER
-// ============================================
 function parseMathematicalPrice(text, knownYear) {
   if (!text) return { formattedPrice: "0", rawPrice: 0 };
-  const detectedYear = (knownYear ? knownYear.split("/")[0].replace(/\D/g, "") : "") || "";
+  const detectedYear = (knownYear ? knownYear.split("/")[0] : "") || "";
 
   const isExcluded = (num, rawStr) => {
     if (detectedYear && (num.toString() === detectedYear || rawStr.includes(detectedYear))) return true;
     if (num >= 1970 && num <= 2035) {
-      const yearPattern = new RegExp(`(?:year|ዓመተ|ዓ\\.?ም|model|ሞዴል|month|ወር)?\\s*${num}`, "i");
+      const yearPattern = new RegExp(`(?:year|ዓመተ|model|ሞዴል|month|ወር)?\\s*${num}`, "i");
       if (yearPattern.test(text)) return true;
     }
     return false;
   };
 
-  // 1. Compound Amharic/English Million + Thousand (e.g. "4 ሚሊዮን 500 ሺህ" -> 4,500,000)
-  const compoundMillionMatch = text.match(
-    /([0-9]+(?:[.,][0-9]+)?)\s*(?:ETB|ብር|Birr)?\s*(?:million|mil|mln|ሚሊዮን|ሚሊየን|ሚ\.?)(?:\s*(?:ከ|እና)?\s*([0-9]+(?:[.,][0-9]+)?)\s*(?:thousand|ሺህ|ሺ|k))?/i
-  );
-  if (compoundMillionMatch && compoundMillionMatch[1]) {
-    const milVal = parseFloat(compoundMillionMatch[1].replace(/,/g, ""));
-    const thouVal = compoundMillionMatch[2] ? parseFloat(compoundMillionMatch[2].replace(/,/g, "")) : 0;
-    if (!isNaN(milVal) && milVal > 0 && milVal < 1000) {
-      const finalNum = Math.round(milVal * 1000000 + (isNaN(thouVal) ? 0 : thouVal * 1000));
-      return { formattedPrice: finalNum.toLocaleString("en-US"), rawPrice: finalNum };
+  const compoundMatch = text.match(/([0-9]+(?:\.[0-9]+)?)\s*(?:ሚሊዮን|ሚሊየን|million)\s*(?:ከ\s*|እና\s*)?([0-9]+(?:\.[0-9]+)?)\s*(?:ሺህ|ሺ|k|thousand)/i);
+  if (compoundMatch) {
+    const mVal = parseFloat(compoundMatch[1]);
+    const kVal = parseFloat(compoundMatch[2]);
+    if (!isNaN(mVal) && !isNaN(kVal)) {
+      const total = Math.round(mVal * 1000000 + kVal * 1000);
+      return { formattedPrice: total.toLocaleString("en-US"), rawPrice: total };
     }
   }
 
-  // 2. Explicit price label line (ዋጋ, የመሸጫ ዋጋ, መሸጫ, ኪራይ, Price, Fixed)
-  const explicitLineMatch = text.match(
-    /(?:💰|price|ዋጋ|fixed|የመሸጫ\s*ዋጋ|መሸጫ|ጠቅላላ\s*ዋጋ|ወርሃዊ\s*ኪራይ|ኪራይ)[ \t:：=-]+(?:በ\s*)?([0-9.,]+)\s*(?:ETB|ብር|Birr)?\s*(?:million|mil|mln|m|ሚሊዮን|ሚሊየን|ሚ|k|thousand|ሺህ|ሺ)?/i
-  );
+  const explicitLineMatch = text.match(/(?:💰|price|ዋጋ|fixed|የመሸጫ\s*ዋጋ)[ \t:=-]+([0-9.,]+)\s*(?:ETB|ብር|Birr)?\s*(?:million|mil|mln|m|ሚሊዮን|ሚሊየን|k|thousand|ሺህ|ሺ)?/i);
   if (explicitLineMatch && explicitLineMatch[1]) {
     const rawVal = explicitLineMatch[1];
-    const isMillion = /(?:million|mil|mln|\bm\b|ሚሊዮን|ሚሊየን|ሚ(?:\s|$))/i.test(explicitLineMatch[0]);
-    const isThousand = /(?:\bk\b|thousand|ሺህ|ሺ)/i.test(explicitLineMatch[0]);
+    const isMillion = /(?:million|mil|mln|m|ሚሊዮን|ሚሊየን)/i.test(explicitLineMatch[0]);
+    const isThousand = /(?:k|thousand|ሺህ|ሺ)/i.test(explicitLineMatch[0]);
 
     if (isMillion) {
       const val = parseFloat(rawVal.replace(/,/g, ""));
@@ -1401,21 +1557,25 @@ function parseMathematicalPrice(text, knownYear) {
     }
   }
 
-  // 3. Thousand patterns anywhere (e.g. "450 ሺህ", "250ሺ", "35k")
-  const thousandMatch = text.match(/([0-9]+(?:[.,][0-9]+)*)\s*(?:ETB|ብር|Birr)?\s*(?:k\b|thousand|ሺህ|ሺ)/i);
+  const generalMillionMatch = text.match(/([0-9]+(?:[.,][0-9]+)*)\s*(?:ETB|ብር|Birr)?\s*(?:million|mil|mln|m|ሚሊዮን|ሚሊየን)\b/i);
+  if (generalMillionMatch && generalMillionMatch[1]) {
+    const val = parseFloat(generalMillionMatch[1].replace(/,/g, ""));
+    if (!isNaN(val) && val > 0) {
+      const finalNum = val < 1000 ? Math.round(val * 1000000) : Math.round(val);
+      return { formattedPrice: finalNum.toLocaleString("en-US"), rawPrice: finalNum };
+    }
+  }
+
+  const thousandMatch = text.match(/([0-9]+(?:[.,][0-9]+)*)\s*(?:ETB|ብር|Birr)?\s*(?:k|thousand|ሺህ|ሺ)\b/i);
   if (thousandMatch && thousandMatch[1]) {
-    const rawVal = thousandMatch[1];
-    const val = parseFloat(rawVal.replace(/,/g, ""));
+    const val = parseFloat(thousandMatch[1].replace(/,/g, ""));
     if (!isNaN(val) && val > 0 && val < 10000) {
       const finalNum = Math.round(val * 1000);
       return { formattedPrice: finalNum.toLocaleString("en-US"), rawPrice: finalNum };
     }
   }
 
-  // 4. Currency adjacent numbers ("ETB 5,650,000", "45,000 ብር")
-  const currencyMatch = text.match(
-    /(?:ETB|ብር|Birr)\s*[:=.-]?\s*([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{4,10})|([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{4,10})\s*(?:ETB|ብር|Birr)/i
-  );
+  const currencyMatch = text.match(/(?:ETB|ብር|Birr)\s*[:=.-]?\s*([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{4,10})|([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{4,10})\s*(?:ETB|ብር|Birr)/i);
   if (currencyMatch) {
     const rawVal = currencyMatch[1] || currencyMatch[2];
     if (rawVal) {
@@ -1426,14 +1586,13 @@ function parseMathematicalPrice(text, knownYear) {
     }
   }
 
-  // 5. Fallback scan on lines containing ዋጋ or price
   const lines = text.split("\n");
   for (const line of lines) {
-    if (/(?:price|ዋጋ|መሸጫ|ኪራይ)/i.test(line)) {
-      const nums = line.match(/\b([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{4,9})\b/);
+    if (/(?:price|ዋጋ)/i.test(line)) {
+      const nums = line.match(/\b([0-9]{1,3}(?:[.,][0-9]{3})+|[0-9]{5,9})\b/);
       if (nums) {
         const num = parseInt(nums[1].replace(/[.,]/g, ""), 10);
-        if (!isNaN(num) && num > 500 && !isExcluded(num, nums[1])) {
+        if (!isNaN(num) && num > 1000 && !isExcluded(num, nums[1])) {
           return { formattedPrice: num.toLocaleString("en-US"), rawPrice: num };
         }
       }
@@ -1453,52 +1612,71 @@ function cleanTheText(text) {
     .replace(/(?:\+251|251|0)?[\s.-]?[97]\d(?:[\s.-]?\d){7}\b/gi, "")
     .replace(EMOJI, "")
     .replace(/[*_~`|]/g, "")
-    .replace(/(?:phone|call|mobile|ስልክ|ቴሌግራም|telegram|contact|ይደውሉ|ይደውሉልን|ለበለጠ\s*መረጃ)[ \t:：=-]+(?:or|\/|ወይም)?\s*(?=\n|$)/gi, "")
+    .replace(/(?:phone|call|mobile|ስልክ|ቴሌግራም|telegram|contact|ይደውሉ|ይደውሉልን)[ \t:=-]+(?:or|\/)?\s*(?=\n|$)/gi, "")
     .replace(/[ \t]+/g, " ")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
-function extractCity(text) {
-  const lower = text.toLowerCase();
-  if (/(አዲስ\s*አበባ|addis\s*ababa|finfinne|ቦሌ|ሳርቤት|ሲኤምሲ|ገርጂ|ፒያሳ|አያት|ሰሚት|መገናኛ|ለቡ|ጀሞ|bole|sarbet|cmc|gerji|piassa|ayat|summit)/i.test(lower)) return "Addis Ababa";
-  if (/(hawassa|ሀዋሳ|ሐዋሳ)/i.test(lower)) return "Hawassa";
-  if (/(adama|አዳማ|ናዝሬት|nazret)/i.test(lower)) return "Adama";
-  if (/(bahir\s*dar|ባህር\s*ዳር)/i.test(lower)) return "Bahir Dar";
-  if (/(dire\s*dawa|ድሬ\s*ዳዋ|ድሬዳዋ)/i.test(lower)) return "Dire Dawa";
-  if (/(gondar|ጎንደር)/i.test(lower)) return "Gondar";
-  if (/(mekelle|መቀሌ|መቀለ)/i.test(lower)) return "Mekelle";
-  if (/(jimma|ጅማ)/i.test(lower)) return "Jimma";
-  if (/(bishoftu|ቢሾፍቱ|ደብረ\s*ዘይት)/i.test(lower)) return "Bishoftu";
-  if (/(dessie|ደሴ)/i.test(lower)) return "Dessie";
-  if (/(harar|ሀረር|ሐረር)/i.test(lower)) return "Harar";
-  return "Addis Ababa";
-}
-
-function extractSubcity(text) {
-  const map = [
-    [/ቦሌ|\bbole\b/i, "Bole"],
-    [/ሰሚት|\bsummit\b/i, "Summit"],
-    [/ሲኤምሲ|\bcmc\b/i, "CMC"],
-    [/ገርጂ|\bgerji\b/i, "Gerji"],
-    [/አያት|\bayat\b/i, "Ayat"],
-    [/ሳር\s*ቤት|ሳርቤት|\bsarbet\b/i, "Sarbet"],
-    [/መገናኛ|\bmegenagna\b/i, "Megenagna"],
-    [/ካዛንቺስ|\bkazanchis\b/i, "Kazanchis"],
-    [/ለቡ|\blebu\b/i, "Lebu"],
-    [/ጀሞ|\bjemo\b/i, "Jemo"],
-    [/ፒያሳ|\bpiassa\b/i, "Piassa"],
-    [/የካ|\byeka\b/i, "Yeka"],
-    [/ቃሊቲ|\bkaliti\b/i, "Kaliti"],
-    [/መርካቶ|\bmerkato\b/i, "Merkato"],
-    [/4\s*ኪሎ|አራት\s*ኪሎ/i, "Arat Kilo"],
-    [/22|ሃያ\s*ሁለት/i, "Haya Hulet"]
+function extractCityAndSubcity(text) {
+  const lower = (text || "").toLowerCase();
+  const subcityMap = [
+    { regex: /bole\s*bulbula|ቦሌ\s*ቡልቡላ/i, label: "Bole Bulbula" },
+    { regex: /bole\s*medhanialem|ቦሌ\s*መድሃኒያለም/i, label: "Bole Medhanialem" },
+    { regex: /bole\s*atlas|ቦሌ\s*አትላስ/i, label: "Bole Atlas" },
+    { regex: /bole\s*arabsa|ቦሌ\s*አራብሳ/i, label: "Bole Arabsa" },
+    { regex: /bole|ቦሌ/i, label: "Bole" },
+    { regex: /summit|ሰሚት/i, label: "Summit" },
+    { regex: /\bcmc\b|ሲኤምሲ/i, label: "CMC" },
+    { regex: /ayat|አያት/i, label: "Ayat" },
+    { regex: /kazanchis|ካዛንቺስ/i, label: "Kazanchis" },
+    { regex: /sarbet|ሳርቤት/i, label: "Sarbet" },
+    { regex: /gerji|ገርጂ/i, label: "Gerji" },
+    { regex: /megenagna|መገናኛ/i, label: "Megenagna" },
+    { regex: /piassa|piazza|ፒያሳ/i, label: "Piassa" },
+    { regex: /lebu|ለቡ/i, label: "Lebu" },
+    { regex: /jemo|ጀሞ/i, label: "Jemo" },
+    { regex: /figa|ፊጋ/i, label: "Figa" },
+    { regex: /hayahulet|22\s*mazoria|ሃያ\s*ሁለት|ሀያሁለት/i, label: "Hayahulet" },
+    { regex: /saris|ሳሪስ/i, label: "Saris" },
+    { regex: /kality|akaki|ቃሊቲ|አቃቂ/i, label: "Akaki Kality" },
+    { regex: /tulu\s*dimtu|ቱሉ\s*ዲምቱ/i, label: "Tulu Dimtu" },
+    { regex: /tafo|ጣፎ/i, label: "Tafo" },
+    { regex: /yeka|የካ/i, label: "Yeka" },
+    { regex: /lemi\s*kura|ለሚ\s*ኩራ/i, label: "Lemi Kura" },
+    { regex: /kirkos|ቂርቆስ/i, label: "Kirkos" },
+    { regex: /lideta|ልደታ/i, label: "Lideta" },
+    { regex: /merkato|መርካቶ/i, label: "Merkato" },
+    { regex: /mexico|ሜክሲኮ/i, label: "Mexico" },
+    { regex: /gotera|ጎተራ/i, label: "Gotera" },
+    { regex: /kera|ቄራ/i, label: "Kera" },
+    { regex: /4\s*kilo|አራት\s*ኪሎ/i, label: "4 Kilo" },
+    { regex: /6\s*kilo|ስድስት\s*ኪሎ/i, label: "6 Kilo" }
   ];
-  for (const [regex, label] of map) {
-    if (regex.test(text)) return label;
+
+  let subcity = "";
+  for (const s of subcityMap) {
+    if (s.regex.test(text || "")) {
+      subcity = s.label;
+      break;
+    }
   }
-  return "";
+
+  if (/(hawassa|awassa|ሀዋሳ|አዋሳ)/i.test(lower)) return { city: "Hawassa", subcity };
+  if (/(adama|nazret|nazreth|አዳማ|ናዝሬት)/i.test(lower)) return { city: "Adama", subcity };
+  if (/(bahir\s*dar|ባህር\s*ዳር|ባሕር\s*ዳር)/i.test(lower)) return { city: "Bahir Dar", subcity };
+  if (/(dire\s*dawa|ድሬዳዋ|ድሬ\s*ዳዋ)/i.test(lower)) return { city: "Dire Dawa", subcity };
+  if (/(mekelle|mekele|መቐለ|መቀሌ)/i.test(lower)) return { city: "Mekelle", subcity };
+  if (/(gondar|gonder|ጎንደር)/i.test(lower)) return { city: "Gondar", subcity };
+  if (/(jimma|ጅማ)/i.test(lower)) return { city: "Jimma", subcity };
+  if (/(dessie|desse|ደሴ)/i.test(lower)) return { city: "Dessie", subcity };
+  if (/(bishoftu|debre\s*zeit|ቢሾፍቱ|ደብረ\s*ዘይት)/i.test(lower)) return { city: "Bishoftu", subcity };
+  if (/(shashemene|shashamane|ሻሸመኔ)/i.test(lower)) return { city: "Shashemene", subcity };
+  if (/(jigjiga|jijiga|ጅግጅጋ)/i.test(lower)) return { city: "Jigjiga", subcity };
+  if (/(harar|ሐረር|ሀረር)/i.test(lower)) return { city: "Harar", subcity };
+  if (/(arba\s*minch|arbaminch|አርባ\s*ምንጭ)/i.test(lower)) return { city: "Arba Minch", subcity };
+  return { city: "Addis Ababa", subcity };
 }
 
 async function uploadImagesToCloudinary(imageFileIds, env) {
@@ -1527,82 +1705,6 @@ async function uploadImagesToCloudinary(imageFileIds, env) {
   return urls;
 }
 
-async function analyzeAmharicAdWithGemini(cleanText, env) {
-  if (!env.GEMINI_API_KEY || !cleanText) return null;
-  try {
-    const prompt = `You are an Ethiopian marketplace classifier for Amharic and English Telegram ads.
-Extract structured details from this listing text:
-"""
-${cleanText.substring(0, 900)}
-"""
-Return ONLY valid JSON:
-{
-  "title": "concise clean listing title (keep key Amharic or English product name, max 60 chars)",
-  "category": "one of: Cars, Houses, Rentals, Electronics, Furniture, Clothes, Labor & Services, ምንአለሽ_ተራ",
-  "subcategory": "concise subcategory",
-  "brand": "brand name in English if present, else empty string",
-  "model": "model name if present, else empty string",
-  "year": "4-digit year if present, else empty string",
-  "trim": "",
-  "priceETB": 0,
-  "city": "Addis Ababa",
-  "condition": "New or Used or For Rent"
-}`;
-
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { response_mime_type: "application/json" }
-      })
-    });
-    const data = await res.json();
-    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null;
-  }
-}
-
-async function inspectImageWithGemini(fileId, contextText, env) {
-  if (!env.GEMINI_API_KEY) return null;
-  try {
-    const fileRes = await callTelegram("getFile", { file_id: fileId }, env);
-    if (!fileRes?.file_path) return null;
-    const tgUrl = `https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${fileRes.file_path}`;
-    const imgFetch = await fetch(tgUrl);
-    const arrayBuffer = await imgFetch.arrayBuffer();
-    const base64Image = btoa(String.fromCharCode(...new Uint8Array(arrayBuffer)));
-
-    const prompt = `Analyze this vehicle photo for an Ethiopian marketplace ad.
-Context: "${contextText.substring(0, 200)}"
-Return ONLY valid JSON matching this schema:
-{
-  "brand": "Hyundai",
-  "model": "Elantra",
-  "year": "2022",
-  "trim": "",
-  "bodyType": "Sedan",
-  "subcategory": "Sedan"
-}`;
-
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${env.GEMINI_API_KEY}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: "image/jpeg", data: base64Image } }] }],
-        generationConfig: { response_mime_type: "application/json" }
-      })
-    });
-    const data = await res.json();
-    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    return raw ? JSON.parse(raw) : null;
-  } catch (err) {
-    return null;
-  }
-}
-
 async function getFirebaseToken(env) {
   const now = Math.floor(Date.now() / 1000);
   if (cachedFirebaseToken && tokenExpiresAt > now + 300) return cachedFirebaseToken;
@@ -1612,12 +1714,12 @@ async function getFirebaseToken(env) {
 
   try {
     const header = { alg: "RS256", typ: "JWT" };
-    const payload = { 
-      iss: clientEmail, 
-      scope: "https://www.googleapis.com/auth/datastore", 
-      aud: "https://oauth2.googleapis.com/token", 
-      iat: now, 
-      exp: now + 3600 
+    const payload = {
+      iss: clientEmail,
+      scope: "https://www.googleapis.com/auth/datastore",
+      aud: "https://oauth2.googleapis.com/token",
+      iat: now,
+      exp: now + 3600
     };
     const encHeader = base64UrlEncode(JSON.stringify(header));
     const encPayload = base64UrlEncode(JSON.stringify(payload));
@@ -1631,10 +1733,10 @@ async function getFirebaseToken(env) {
     for (let i = 0; i < sigBytes.length; i++) binary += String.fromCharCode(sigBytes[i]);
     const signature = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
     const jwt = `${signingInput}.${signature}`;
-    const tokRes = await fetch("https://oauth2.googleapis.com/token", { 
-      method: "POST", 
-      headers: { "Content-Type": "application/x-www-form-urlencoded" }, 
-      body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}` 
+    const tokRes = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
     });
     const tokData = await tokRes.json();
     if (!tokData.access_token) return "";
@@ -1706,118 +1808,4 @@ async function resolveAdminUidByEmail(token, projectId, email, fallbackUid = "ad
   }
 
   return fallbackUid;
-}
-
-async function migrateOldBotPostsToProfile(env) {
-  const token = await getFirebaseToken(env);
-  const projectId = env.FIREBASE_PROJECT_ID;
-  const adOwnerEmail = env.ADMIN_EMAIL || "marbatu1@gmail.com";
-
-  if (!token || !projectId) {
-    return {
-      ok: false,
-      error: "Missing FIREBASE_CLIENT_EMAIL, FIREBASE_PRIVATE_KEY, or FIREBASE_PROJECT_ID in Cloudflare Variables."
-    };
-  }
-
-  const adOwnerId = await resolveAdminUidByEmail(token, projectId, adOwnerEmail, env.ADMIN_UID || "admin_bot");
-  const baseAdsUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads`;
-  const maskParams = [
-    "userId",
-    "uid",
-    "ownerId",
-    "userEmail",
-    "email",
-    "ownerEmail",
-    "source",
-    "isBotPost"
-  ].map((f) => `updateMask.fieldPaths=${f}`).join("&");
-
-  let pageToken = "";
-  let scanned = 0;
-  let updated = 0;
-  let skippedAlreadyOwned = 0;
-  let errors = 0;
-
-  do {
-    const listUrl = `${baseAdsUrl}?pageSize=100${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ""}`;
-    const listRes = await fetch(listUrl, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    const listData = await listRes.json();
-
-    if (!listRes.ok) {
-      return {
-        ok: false,
-        error: listData?.error?.message || `Firestore list failed (${listRes.status})`
-      };
-    }
-
-    const docs = listData.documents || [];
-    for (const doc of docs) {
-      scanned++;
-      const docId = doc.name.split("/").pop() || "";
-      const f = doc.fields || {};
-      const existingUid = f.userId?.stringValue || "";
-      const existingEmail = f.userEmail?.stringValue || f.ownerEmail?.stringValue || "";
-      const source = f.source?.stringValue || "";
-
-      const isOldBotPost =
-        source === "telegram" ||
-        existingUid === "admin_bot" ||
-        docId.startsWith("tg_") ||
-        (docId.startsWith("ad_") && (!existingUid || existingUid === "admin_bot") && !existingEmail);
-
-      if (!isOldBotPost) continue;
-
-      const alreadyOwned = existingEmail === adOwnerEmail && existingUid === adOwnerId;
-      if (alreadyOwned) {
-        skippedAlreadyOwned++;
-        continue;
-      }
-
-      const patchRes = await fetch(`${baseAdsUrl}/${encodeURIComponent(docId)}?${maskParams}`, {
-        method: "PATCH",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          fields: {
-            userId: { stringValue: adOwnerId },
-            uid: { stringValue: adOwnerId },
-            ownerId: { stringValue: adOwnerId },
-            userEmail: { stringValue: adOwnerEmail },
-            email: { stringValue: adOwnerEmail },
-            ownerEmail: { stringValue: adOwnerEmail },
-            source: { stringValue: "telegram" },
-            isBotPost: { booleanValue: true }
-          }
-        })
-      });
-
-      if (patchRes.ok) {
-        updated++;
-      } else {
-        errors++;
-      }
-    }
-
-    pageToken = listData.nextPageToken || "";
-  } while (pageToken);
-
-  return {
-    ok: true,
-    adminEmail: adOwnerEmail,
-    resolvedUid: adOwnerId,
-    uidAutoMatched: adOwnerId !== "admin_bot",
-    scanned,
-    updated,
-    skippedAlreadyOwned,
-    errors,
-    note:
-      adOwnerId === "admin_bot"
-        ? "UID not found in Firestore users collection; set ADMIN_UID in Cloudflare Variables to your Firebase Auth UID and re-run if your profile filters only by UID."
-        : "All old bot posts now match your profile UID and email."
-  };
 }
