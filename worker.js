@@ -79,16 +79,53 @@ export default {
       );
     }
 
+    // Live Firebase Firestore connection diagnostic: GET /?test=firebase
+    if (request.method === "GET" && url.searchParams.get("test") === "firebase") {
+      const projectId = cleanEnv(env.FIREBASE_PROJECT_ID) || "yeegna-gebeya";
+      const tokenResult = await getFirebaseTokenDetailed(env);
+      if (!tokenResult.token) {
+        return new Response(
+          JSON.stringify({ ok: false, projectId, step: "auth_token", error: tokenResult.error }, null, 2),
+          { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } }
+        );
+      }
+      try {
+        const checkRes = await fetch(
+          `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads?pageSize=1`,
+          { headers: { Authorization: `Bearer ${tokenResult.token}` } }
+        );
+        const bodyText = await checkRes.text();
+        let parsedBody = bodyText;
+        try { parsedBody = JSON.parse(bodyText); } catch {}
+        return new Response(
+          JSON.stringify({
+            ok: checkRes.ok,
+            status: checkRes.status,
+            projectId,
+            docsFound: Array.isArray(parsedBody?.documents) ? parsedBody.documents.length : 0,
+            error: checkRes.ok ? null : parsedBody
+          }, null, 2),
+          { status: checkRes.ok ? 200 : checkRes.status, headers: { "Content-Type": "application/json; charset=utf-8" } }
+        );
+      } catch (e) {
+        return new Response(
+          JSON.stringify({ ok: false, projectId, step: "firestore_read", error: e.message }, null, 2),
+          { status: 500, headers: { "Content-Type": "application/json; charset=utf-8" } }
+        );
+      }
+    }
+
     // Health & diagnostics endpoint on GET
     if (request.method !== "POST") {
       const botToken = cleanEnv(env.TELEGRAM_BOT_TOKEN);
       const geminiKey = cleanEnv(env.GEMINI_API_KEY);
       const cloudName = cleanEnv(env.CLOUDINARY_CLOUD_NAME);
+      const uploadPreset = cleanEnv(env.CLOUDINARY_UPLOAD_PRESET);
+      const fbProjectId = cleanEnv(env.FIREBASE_PROJECT_ID) || "yeegna-gebeya";
       const botConfigured = Boolean(botToken);
       const geminiConfigured = Boolean(geminiKey);
       const workersAiConfigured = Boolean(env.AI);
-      const firebaseConfigured = Boolean(cleanEnv(env.FIREBASE_PROJECT_ID) && cleanEnv(env.FIREBASE_CLIENT_EMAIL) && cleanEnv(env.FIREBASE_PRIVATE_KEY));
-      const cloudinaryConfigured = Boolean(cloudName && cloudName !== "your_cloud_name");
+      const cloudinaryConfigured = Boolean(cloudName && cloudName !== "your_cloud_name" && uploadPreset);
       const targetChannel = cleanEnv(env.REPOST_CHANNEL_ID) || "@mebrigranite";
       const websiteUrl = cleanEnv(env.WEBSITE_URL) || "https://mebri.yegna.workers.dev";
 
@@ -109,18 +146,25 @@ export default {
         }
       }
 
+      const fbAuth = await getFirebaseTokenDetailed(env);
+      const firebaseStatus = fbAuth.token
+        ? `YES ✅ (Project: ${fbProjectId})`
+        : `NO ❌ (${fbAuth.error})`;
+
       return new Response(
         `Yegna Gebeya Telegram Bot is Active ✅\n\n` +
         `• Worker URL: ${url.origin}\n` +
         `• Bot Token Configured: ${botConfigured ? "YES ✅" : "NO ❌ (Add TELEGRAM_BOT_TOKEN in Cloudflare Settings > Variables and Secrets!)"}\n` +
         `• Telegram Webhook URL: ${webhookStatus}\n` +
         `• AI Classification: ${geminiConfigured ? "Gemini 4 Hydrogen ✅" : workersAiConfigured ? "Cloudflare Workers AI (Free Built-in) ✅" : "Weighted Rule Classifier Only ⚠️"}\n` +
-        `• Firebase Firestore Sync: ${firebaseConfigured ? "YES ✅" : "NO ⚠️ (Missing FIREBASE_CLIENT_EMAIL or FIREBASE_PRIVATE_KEY)"}\n` +
-        `• Cloudinary Photo Upload: ${cloudinaryConfigured ? "YES ✅" : "NO ⚠️ (Set CLOUDINARY_CLOUD_NAME)"}\n` +
+        `• Firebase Firestore Sync: ${firebaseStatus}\n` +
+        `• Cloudinary Photo Upload: ${cloudinaryConfigured ? `YES ✅ (${cloudName} / ${uploadPreset})` : "NO ⚠️ (Set CLOUDINARY_CLOUD_NAME)"}\n` +
         `• Repost Channel: ${targetChannel}\n` +
         `• Website API: ${websiteUrl}/api/ads\n` +
-        `• Version: v8.1 AI Category Engine\n` +
-        `\nTip: Test AI classification at ${url.origin}/?test=ai&q=Toyota+Corolla+2020\n`,
+        `• Version: v8.2 Firestore Sync Fix\n` +
+        `\nDiagnostics:\n` +
+        `• Test Firebase: ${url.origin}/?test=firebase\n` +
+        `• Test AI: ${url.origin}/?test=ai&q=Toyota+Corolla+2020\n`,
         {
           status: 200,
           headers: { "Content-Type": "text/plain; charset=utf-8" }
@@ -766,11 +810,15 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
   // 2. SAVE TO FIREBASE FIRESTORE (IF CONFIGURED)
   // ============================================
   try {
-    const token = await getFirebaseToken(env);
-    if (token && env.FIREBASE_PROJECT_ID) {
-      const projectId = env.FIREBASE_PROJECT_ID;
+    const projectId = cleanEnv(env.FIREBASE_PROJECT_ID) || "yeegna-gebeya";
+    const fbAuth = await getFirebaseTokenDetailed(env);
+    if (!fbAuth.token) {
+      console.warn("Firebase sync skipped:", fbAuth.error);
+    } else {
+      const token = fbAuth.token;
       const adOwnerId = await resolveAdminUidByEmail(token, projectId, adOwnerEmail, env.ADMIN_UID || "admin_bot");
       const fbUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/ads/${adDocId}`;
+      const adCondition = /(brand\s*new|zero\s*km|0\s*km|አዲስ)/i.test(normalizedText) ? "New" : "Used";
 
       const adData = {
         fields: {
@@ -784,16 +832,20 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
           transmission: { stringValue: specs.transmission || "" },
           category: { stringValue: category },
           subcategory: { stringValue: subcategory },
+          condition: { stringValue: adCondition },
           description: { stringValue: cleanText },
           textHash: { stringValue: textHash },
-          price: { stringValue: formattedPrice },
-          rawPrice: { integerValue: String(rawPrice) },
+          price: { stringValue: String(rawPrice || 0) },
+          formattedPrice: { stringValue: formattedPrice },
+          rawPrice: { integerValue: String(rawPrice || 0) },
           phone: { stringValue: "0911680790" },
+          sellerName: { stringValue: "የኛ ገበያ (Telegram Bot)" },
           city: { stringValue: city },
           subcity: { stringValue: subcity },
           image: { stringValue: finalDisplayImages[0] },
           images: { arrayValue: { values: finalDisplayImages.map((url) => ({ stringValue: url })) } },
           status: { stringValue: "available" },
+          featured: { booleanValue: true },
           source: { stringValue: "telegram" },
           isBotPost: { booleanValue: true },
           userId: { stringValue: adOwnerId },
@@ -807,12 +859,17 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
         }
       };
 
-      await fetch(fbUrl, {
+      const fbRes = await fetch(fbUrl, {
         method: "PATCH",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         body: JSON.stringify(adData)
       });
-      console.log(`✅ Saved to Website (Firebase Firestore) for ${adOwnerEmail} (${adOwnerId})`);
+      if (!fbRes.ok) {
+        const fbErrText = await fbRes.text().catch(() => fbRes.statusText);
+        console.error(`❌ Firestore PATCH failed (${fbRes.status}) on ${projectId}:`, fbErrText);
+      } else {
+        console.log(`✅ Saved to Website Firestore (${projectId}) for ${adOwnerEmail} (${adOwnerId})`);
+      }
     }
   } catch (fbErr) {
     console.warn("Firebase sync skipped:", fbErr.message);
@@ -1773,12 +1830,34 @@ async function uploadImagesToCloudinary(imageFileIds, env) {
   return urls;
 }
 
-async function getFirebaseToken(env) {
+async function getFirebaseTokenDetailed(env) {
   const now = Math.floor(Date.now() / 1000);
-  if (cachedFirebaseToken && tokenExpiresAt > now + 300) return cachedFirebaseToken;
-  const clientEmail = cleanEnv(env.FIREBASE_CLIENT_EMAIL);
-  const privateKey = cleanEnv(env.FIREBASE_PRIVATE_KEY).replace(/\\n/g, "\n");
-  if (!clientEmail || !privateKey) return "";
+  if (cachedFirebaseToken && tokenExpiresAt > now + 300) {
+    return { token: cachedFirebaseToken, error: null };
+  }
+
+  let clientEmail = cleanEnv(env.FIREBASE_CLIENT_EMAIL);
+  let rawKey = cleanEnv(env.FIREBASE_PRIVATE_KEY);
+
+  // Support accidental paste of full Service Account JSON into FIREBASE_PRIVATE_KEY
+  if (rawKey.startsWith("{")) {
+    try {
+      const sa = JSON.parse(rawKey);
+      if (sa.private_key) rawKey = String(sa.private_key);
+      if (!clientEmail && sa.client_email) clientEmail = String(sa.client_email).trim();
+    } catch {}
+  }
+
+  // Strip accidental surrounding quotes / trailing comma from JSON line copy-paste
+  rawKey = rawKey.replace(/^["']|["'],?$/g, "").trim();
+  const privateKey = rawKey.replace(/\\n/g, "\n");
+
+  if (!clientEmail || !privateKey) {
+    const missing = [];
+    if (!clientEmail) missing.push("FIREBASE_CLIENT_EMAIL");
+    if (!privateKey) missing.push("FIREBASE_PRIVATE_KEY");
+    return { token: "", error: `Missing ${missing.join(" and ")}` };
+  }
 
   try {
     const header = { alg: "RS256", typ: "JWT" };
@@ -1792,9 +1871,18 @@ async function getFirebaseToken(env) {
     const encHeader = base64UrlEncode(JSON.stringify(header));
     const encPayload = base64UrlEncode(JSON.stringify(payload));
     const signingInput = `${encHeader}.${encPayload}`;
-    const pemContents = privateKey.replace("-----BEGIN PRIVATE KEY-----", "").replace("-----END PRIVATE KEY-----", "").replace(/\s/g, "");
+    const pemContents = privateKey
+      .replace(/-----BEGIN PRIVATE KEY-----/g, "")
+      .replace(/-----END PRIVATE KEY-----/g, "")
+      .replace(/\s/g, "");
     const binaryDer = Uint8Array.from(atob(pemContents), (c) => c.charCodeAt(0));
-    const cryptoKey = await crypto.subtle.importKey("pkcs8", binaryDer, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
+    const cryptoKey = await crypto.subtle.importKey(
+      "pkcs8",
+      binaryDer,
+      { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
     const sigBuffer = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", cryptoKey, new TextEncoder().encode(signingInput));
     const sigBytes = new Uint8Array(sigBuffer);
     let binary = "";
@@ -1806,15 +1894,22 @@ async function getFirebaseToken(env) {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
     });
-    const tokData = await tokRes.json();
-    if (!tokData.access_token) return "";
+    const tokData = await tokRes.json().catch(() => ({}));
+    if (!tokData.access_token) {
+      return { token: "", error: tokData.error_description || tokData.error || `OAuth HTTP ${tokRes.status}` };
+    }
     cachedFirebaseToken = tokData.access_token;
     tokenExpiresAt = now + (tokData.expires_in || 3600);
-    return cachedFirebaseToken;
+    return { token: cachedFirebaseToken, error: null };
   } catch (err) {
     console.warn("Failed to generate Firebase token:", err.message);
-    return "";
+    return { token: "", error: err.message };
   }
+}
+
+async function getFirebaseToken(env) {
+  const res = await getFirebaseTokenDetailed(env);
+  return res.token;
 }
 
 function base64UrlEncode(str) {
