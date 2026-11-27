@@ -62,9 +62,40 @@ const DEFAULT_CATEGORY_IMAGES = {
   "ምንአለሽ_ተራ": "https://images.unsplash.com/photo-1472851294608-062f824d29cc?auto=format&fit=crop&w=900&q=80"
 };
 
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type"
+};
+
+function jsonCorsResponse(payload, status = 200) {
+  return new Response(JSON.stringify(payload, null, 2), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      ...CORS_HEADERS
+    }
+  });
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    // Handle CORS preflight from website (mebri.yegna.workers.dev / localhost)
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
+    // Website AI Listing Preparer: POST /api/ai-prepare (Multi-photo Vision + Amharic/English)
+    if (request.method === "POST" && url.pathname === "/api/ai-prepare") {
+      return handleWebsiteAiPrepare(request, env);
+    }
+
+    // Website -> Telegram Channel Broadcaster: POST /api/telegram-post
+    if (request.method === "POST" && url.pathname === "/api/telegram-post") {
+      return handleWebsiteTelegramPost(request, env);
+    }
 
     // Interactive AI classifier test endpoint: GET /?test=ai&q=...
     if (request.method === "GET" && url.searchParams.get("test") === "ai") {
@@ -161,7 +192,11 @@ export default {
         `• Cloudinary Photo Upload: ${cloudinaryConfigured ? `YES ✅ (${cloudName} / ${uploadPreset})` : "NO ⚠️ (Set CLOUDINARY_CLOUD_NAME)"}\n` +
         `• Repost Channel: ${targetChannel}\n` +
         `• Website API: ${websiteUrl}/api/ads\n` +
+<<<<<<< HEAD
         `• Version: v8.2 Firestore Sync Fix\n` +
+=======
+        `• Version: v8.3 Bilingual Vision + Structured Post\n` +
+>>>>>>> 71740e8 (Update bot worker v8.3)
         `\nDiagnostics:\n` +
         `• Test Firebase: ${url.origin}/?test=firebase\n` +
         `• Test AI: ${url.origin}/?test=ai&q=Toyota+Corolla+2020\n`,
@@ -707,8 +742,8 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
   let aiTitle = "";
   let aiSource = "rules";
 
-  // AI Classification (Runs for BOTH text-only & photo ads via Gemini or Cloudflare Workers AI)
-  const aiResult = await classifyAdWithAI(normalizedText, imageFileIds[0] || null, specs, ruleResult, env);
+  // AI Classification & Vision Spec Extraction (Inspects up to 3 photos + Amharic/English text)
+  const aiResult = await classifyAdWithAI(normalizedText, imageFileIds.slice(0, 3), specs, ruleResult, env);
   if (aiResult) {
     aiSource = aiResult.provider || "ai";
     const validatedCategory = normalizeCategory(aiResult.category);
@@ -723,12 +758,25 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
 
     if (!specs.brand && aiResult.brand) specs.brand = cleanSpecValue(aiResult.brand);
     if (!specs.model && aiResult.model) specs.model = cleanSpecValue(aiResult.model);
+    if (!specs.makeModel && aiResult.makeModel) specs.makeModel = cleanSpecValue(aiResult.makeModel);
     if (!specs.year && aiResult.year) specs.year = cleanSpecValue(aiResult.year);
     if (!specs.trim && aiResult.trim) specs.trim = cleanSpecValue(aiResult.trim);
     if (!specs.bodyType && aiResult.bodyType) specs.bodyType = cleanSpecValue(aiResult.bodyType);
+    if (!specs.engine && aiResult.engine) specs.engine = cleanSpecValue(aiResult.engine);
     if (!specs.fuelType && aiResult.fuelType) specs.fuelType = cleanSpecValue(aiResult.fuelType);
     if (!specs.transmission && aiResult.transmission) specs.transmission = cleanSpecValue(aiResult.transmission);
-    if (aiResult.suggestedTitle) aiTitle = cleanSpecValue(aiResult.suggestedTitle);
+    if (!specs.drivetrain && aiResult.drivetrain) specs.drivetrain = cleanSpecValue(aiResult.drivetrain);
+    if (!specs.steering && aiResult.steering) specs.steering = cleanSpecValue(aiResult.steering);
+    if (!specs.plateNumber && aiResult.plateNumber) specs.plateNumber = cleanSpecValue(aiResult.plateNumber);
+    if (!specs.mileage && aiResult.mileage) specs.mileage = cleanSpecValue(aiResult.mileage);
+    if (!specs.color && aiResult.color) specs.color = cleanSpecValue(aiResult.color);
+    if (!specs.priceType && aiResult.priceType) specs.priceType = cleanSpecValue(aiResult.priceType);
+    if (Array.isArray(aiResult.keyFeatures) && aiResult.keyFeatures.length > 0) {
+      specs.keyFeatures = aiResult.keyFeatures.map((f) => cleanSpecValue(f)).filter(Boolean).slice(0, 6);
+    }
+    if (aiResult.suggestedTitle || aiResult.title) {
+      aiTitle = cleanSpecValue(aiResult.suggestedTitle || aiResult.title);
+    }
   }
 
   // Only keep vehicle/electronics brand metadata when category matches Cars / Electronics / Spare Parts
@@ -736,12 +784,18 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
     if (category === "Houses" || category === "Rentals" || category === "Furniture" || category === "Clothes" || category === "Building Materials" || category === "Labor & Services") {
       specs.brand = "";
       specs.model = "";
+      specs.makeModel = "";
+      specs.engine = "";
       specs.fuelType = "";
       specs.transmission = "";
+      specs.drivetrain = "";
+      specs.steering = "";
+      specs.plateNumber = "";
+      specs.mileage = "";
     }
   }
 
-  if (!subcategory || subcategory === "Vehicles" && category !== "Cars") {
+  if (!subcategory || (subcategory === "Vehicles" && category !== "Cars")) {
     subcategory = DEFAULT_SUBCATEGORIES[category] || "General Marketplace";
   }
 
@@ -756,8 +810,21 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
     aiTitle
   });
 
-  const { formattedPrice, rawPrice } = parseMathematicalPrice(normalizedText, specs.year);
-  const { city, subcity } = extractCityAndSubcity(normalizedText);
+  const parsedPrice = parseMathematicalPrice(normalizedText, specs.year);
+  let rawPrice = parsedPrice.rawPrice;
+  if ((!rawPrice || rawPrice === 0) && aiResult?.price) {
+    const aiNum = Number(String(aiResult.price).replace(/[^0-9.]/g, ""));
+    if (!Number.isNaN(aiNum) && aiNum > 0) rawPrice = Math.round(aiNum);
+  }
+  const formattedPrice = rawPrice > 0 ? rawPrice.toLocaleString("en-US") : "0";
+  const detectedLocation = extractCityAndSubcity(normalizedText);
+  const city = detectedLocation.city || cleanSpecValue(aiResult?.city) || "Addis Ababa";
+  const subcity = detectedLocation.subcity || cleanSpecValue(aiResult?.subcity) || "";
+  const priceType = specs.priceType || (/(fixed|ፊክስድ)/i.test(normalizedText) ? "Fixed" : /(negotiable|neg|ድርድር|ተደራዳሪ)/i.test(normalizedText) ? "Negotiable" : "");
+  const makeModelLabel = specs.makeModel || [specs.brand, specs.model].filter(Boolean).join(" ").trim();
+  const keyFeaturesList = Array.isArray(specs.keyFeatures) ? specs.keyFeatures : [];
+  const adCondition = /(brand\s*new|zero\s*km|0\s*km|አዲስ)/i.test(normalizedText) ? "New" : "Used";
+
   const textHash = simpleHash((cleanText || arrangedTitle).toLowerCase().replace(/\s+/g, " "));
 
   console.log(`🏷️ Classified [${aiSource}] -> ${category} > ${subcategory} | Title: ${arrangedTitle}`);
@@ -782,11 +849,26 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
       category,
       subcategory,
       price: rawPrice,
+      priceType,
       city,
       subcity,
-      condition: /(brand\s*new|zero\s*km|0\s*km|አዲስ)/i.test(normalizedText) ? "New" : "Used",
+      condition: adCondition,
+      makeModel: makeModelLabel,
+      brand: specs.brand || "",
+      model: specs.model || "",
+      year: specs.year || "",
+      bodyType: specs.bodyType || "",
+      engine: specs.engine || "",
+      fuelType: specs.fuelType || "",
+      transmission: specs.transmission || "",
+      drivetrain: specs.drivetrain || "",
+      steering: specs.steering || "",
+      plateNumber: specs.plateNumber || "",
+      mileage: specs.mileage || "",
+      color: specs.color || "",
+      keyFeatures: keyFeaturesList,
       images: finalDisplayImages,
-      description: cleanText,
+      description: cleanSpecValue(aiResult?.description) || cleanText,
       phone: "0911680790",
       sellerName: "የኛ ገበያ (Telegram Bot)",
       featured: true,
@@ -823,17 +905,30 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
       const adData = {
         fields: {
           title: { stringValue: arrangedTitle },
+          makeModel: { stringValue: makeModelLabel },
           brand: { stringValue: specs.brand || "" },
           model: { stringValue: specs.model || "" },
           year: { stringValue: specs.year || "" },
           trim: { stringValue: specs.trim || "" },
           bodyType: { stringValue: specs.bodyType || "" },
+          engine: { stringValue: specs.engine || "" },
           fuelType: { stringValue: specs.fuelType || "" },
           transmission: { stringValue: specs.transmission || "" },
+          drivetrain: { stringValue: specs.drivetrain || "" },
+          steering: { stringValue: specs.steering || "" },
+          plateNumber: { stringValue: specs.plateNumber || "" },
+          mileage: { stringValue: specs.mileage || "" },
+          color: { stringValue: specs.color || "" },
+          priceType: { stringValue: priceType },
+          keyFeatures: { arrayValue: { values: keyFeaturesList.map((f) => ({ stringValue: f })) } },
           category: { stringValue: category },
           subcategory: { stringValue: subcategory },
           condition: { stringValue: adCondition },
+<<<<<<< HEAD
           description: { stringValue: cleanText },
+=======
+          description: { stringValue: cleanSpecValue(aiResult?.description) || cleanText },
+>>>>>>> 71740e8 (Update bot worker v8.3)
           textHash: { stringValue: textHash },
           price: { stringValue: String(rawPrice || 0) },
           formattedPrice: { stringValue: formattedPrice },
@@ -878,53 +973,32 @@ async function processFinalAd(message, imageFileIds, messageIds, cleanText, env,
   // ============================================
   // 3. BUILD STRUCTURED POST TEXT WITH BOT FOOTER
   // ============================================
-  const hashtagMap = {
-    Cars: "#Cars",
-    Houses: "#Houses",
-    Rentals: "#Rentals",
-    Electronics: "#Electronics",
-    Furniture: "#Furniture",
-    Clothes: "#Clothes",
-    "Building Materials": "#BuildingMaterials",
-    "Spare Parts": "#SpareParts",
-    "Labor & Services": "#Labor",
-    "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ"
-  };
-  const hashtag = hashtagMap[category] || "#ምንአለሽ_ተራ";
-  const displayPriceText = formattedPrice && formattedPrice !== "0" ? `${formattedPrice} ETB` : "Negotiable / ተደራዳሪ";
-
-  let headerText = `📝 Title: ${arrangedTitle}\n`;
-  if (specs.brand || specs.model || specs.year) {
-    const metaParts = [];
-    if (specs.brand) metaParts.push(`Make: ${specs.brand}`);
-    if (specs.model) metaParts.push(`Model: ${specs.model}`);
-    if (specs.year && category === "Cars") metaParts.push(`Year: ${specs.year}`);
-    if (metaParts.length > 0) headerText += `🏷️ ${metaParts.join(" | ")}\n`;
-  }
-  headerText += `📂 Category: ${category}${subcategory ? ` › ${subcategory}` : ""}\n`;
-  headerText += `📍 Location: ${subcity ? `${subcity}, ${city}` : city}\n`;
-  headerText += `💰 Price: ${displayPriceText}\n`;
-  if (category === "Cars" && (specs.transmission || specs.fuelType)) {
-    const specParts = [];
-    if (specs.transmission) specParts.push(`⚙️ ${specs.transmission}`);
-    if (specs.fuelType) specParts.push(`⛽ ${specs.fuelType}`);
-    headerText += `${specParts.join(" | ")}\n`;
-  }
-
-  let footerText = `\n━━━━━━━━━━━━━━━\n`;
-  footerText += `🏢 የኛ ገበያ (Yegna Gebeya)\n`;
-  footerText += `📞 Phone: 0911680790\n`;
-  footerText += `🌐 Website: mebri.yegna.workers.dev\n`;
-  footerText += `✈️ Telegram: @mebrigranite\n`;
-  footerText += `━━━━━━━━━━━━━━━\n\n`;
-  footerText += `${hashtag} #YegnaGebeya`;
-
-  const fixedLen = headerText.length + footerText.length + 15;
-  const maxDetailsLen = Math.max(100, 1020 - fixedLen);
-  let safeDetails = safeSubstring(cleanText, maxDetailsLen);
-  if (cleanText.length > maxDetailsLen) safeDetails = safeDetails.trimEnd() + "…";
-
-  const newPostText = `${headerText}\n📄 Details:\n${safeDetails}${footerText}`;
+  const newPostText = buildStructuredTelegramPost({
+    title: arrangedTitle,
+    category,
+    subcategory,
+    condition: adCondition,
+    makeModel: makeModelLabel,
+    brand: specs.brand,
+    model: specs.model,
+    year: specs.year,
+    bodyType: specs.bodyType,
+    engine: specs.engine,
+    fuelType: specs.fuelType,
+    transmission: specs.transmission,
+    drivetrain: specs.drivetrain,
+    steering: specs.steering,
+    plateNumber: specs.plateNumber,
+    mileage: specs.mileage,
+    color: specs.color,
+    keyFeatures: keyFeaturesList,
+    price: rawPrice,
+    priceType,
+    city,
+    subcity,
+    phone: "0911680790",
+    description: cleanSpecValue(aiResult?.description) || cleanText
+  }, imageFileIds && imageFileIds.length > 0 ? 1020 : 4000);
 
   const isPhoto = imageFileIds && imageFileIds.length > 0;
   const chatId = message.chat.id;
@@ -1131,48 +1205,179 @@ async function fetchTelegramPhotoBase64(fileId, env) {
   }
 }
 
+function buildStructuredTelegramPost(data, maxLength = 1020) {
+  const category = data.category || "ምንአለሽ_ተራ";
+  const title = data.title || "Marketplace Item";
+  const isRental = category === "Rentals" || /rent|ኪራይ/i.test(data.condition || "");
+  const icon =
+    category === "Cars" ? "🚗"
+      : category === "Houses" ? "🏠"
+      : category === "Rentals" ? "🏢"
+      : category === "Electronics" ? "📱"
+      : category === "Furniture" ? "🛋️"
+      : category === "Building Materials" ? "🧱"
+      : category === "Spare Parts" ? "🔧"
+      : category === "Labor & Services" ? "👷"
+      : "🏪";
+
+  const headline = category === "Cars" && !/^for\s+(sale|rent)/i.test(title)
+    ? `${icon} ${isRental ? "FOR RENT" : "FOR SALE"}: ${title} ${icon}`
+    : `${icon} ${title}`;
+
+  const specLines = [];
+  const makeModel = (data.makeModel || "").trim() || [data.brand, data.model].filter(Boolean).join(" ").trim();
+  if (category === "Cars") {
+    if (makeModel) specLines.push(`• Make & Model: ${makeModel}`);
+    if (data.year) specLines.push(`• Year: ${data.year}`);
+    if (data.bodyType) specLines.push(`• Body Type: ${data.bodyType}`);
+    if (data.engine) specLines.push(`• Engine: ${data.engine}`);
+    if (data.fuelType) specLines.push(`• Fuel Type: ${data.fuelType}`);
+    if (data.transmission) specLines.push(`• Transmission: ${data.transmission}`);
+    if (data.drivetrain) specLines.push(`• Drivetrain: ${data.drivetrain}`);
+    if (data.steering) specLines.push(`• Steering: ${data.steering}`);
+    if (data.plateNumber) specLines.push(`• Plate Number: ${data.plateNumber}`);
+    if (data.mileage) {
+      const mStr = String(data.mileage).trim();
+      specLines.push(`• Mileage: ${/km$/i.test(mStr) ? mStr : `${mStr} km`}`);
+    }
+    if (data.color) specLines.push(`• Color: ${data.color}`);
+  } else {
+    specLines.push(`• Category: ${category}${data.subcategory ? ` › ${data.subcategory}` : ""}`);
+    if (makeModel) specLines.push(`• Brand & Model: ${makeModel}`);
+    if (data.condition) specLines.push(`• Condition: ${data.condition}`);
+    if (data.color) specLines.push(`• Color: ${data.color}`);
+  }
+
+  const numericPrice = Number(String(data.price || 0).replace(/[^0-9.]/g, ""));
+  const priceLabel = numericPrice > 0 ? `${Math.round(numericPrice).toLocaleString("en-US")} ETB` : "Negotiable / ተደራዳሪ";
+  const priceSuffix = data.priceType && numericPrice > 0 ? ` (${data.priceType})` : "";
+  const locationParts = [data.subcity, data.city].map((s) => (s || "").trim()).filter(Boolean);
+  const locationText = locationParts.length > 0 ? locationParts.join(", ") : "Addis Ababa";
+  const contactPhone = (data.phone || "").trim() || "0911680790";
+
+  const bottomLines = [
+    `💰 Price: ${priceLabel}${priceSuffix}`,
+    `📍 Location: ${locationText}`,
+    `📞 Contact: ${contactPhone}`
+  ];
+
+  const hashtagMap = {
+    Cars: "#Cars",
+    Houses: "#Houses",
+    Rentals: "#Rentals",
+    Electronics: "#Electronics",
+    Furniture: "#Furniture",
+    Clothes: "#Clothes",
+    "Building Materials": "#BuildingMaterials",
+    "Spare Parts": "#SpareParts",
+    "Labor & Services": "#Labor",
+    "ምንአለሽ_ተራ": "#ምንአለሽ_ተራ"
+  };
+  const hashtag = hashtagMap[category] || "#ምንአለሽ_ተራ";
+  const footerText =
+    `\n━━━━━━━━━━━━━━━\n` +
+    `🏢 የኛ ገበያ (Yegna Gebeya)\n` +
+    `🌐 Website: mebri.yegna.workers.dev\n` +
+    `✈️ Telegram: @mebrigranite\n` +
+    `━━━━━━━━━━━━━━━\n` +
+    `${hashtag} #YegnaGebeya`;
+
+  const features = Array.isArray(data.keyFeatures)
+    ? data.keyFeatures.map((f) => String(f || "").trim()).filter(Boolean)
+    : [];
+
+  const assemble = (featureSubset, descText) => {
+    const blocks = [headline];
+    if (specLines.length > 0) blocks.push(specLines.join("\n"));
+    if (featureSubset.length > 0) {
+      blocks.push("✨ Key Features & Extras:\n" + featureSubset.map((f) => `• ${f.replace(/^[•\-*]\s*/, "")}`).join("\n"));
+    } else if (descText) {
+      blocks.push(`📄 Details:\n${descText}`);
+    }
+    blocks.push(bottomLines.join("\n"));
+    return `${blocks.join("\n\n")}${footerText}`;
+  };
+
+  let subset = features.slice(0, 6);
+  let output = assemble(subset, (data.description || "").trim());
+  while (output.length > maxLength && subset.length > 2) {
+    subset = subset.slice(0, subset.length - 1);
+    output = assemble(subset, "");
+  }
+  if (output.length > maxLength && subset.length === 0) {
+    const overhead = assemble([], "").length + 5;
+    const avail = Math.max(40, maxLength - overhead);
+    const trimmedDesc = safeSubstring((data.description || "").trim(), avail);
+    output = assemble([], trimmedDesc ? `${trimmedDesc}…` : "");
+  }
+  return safeSubstring(output, maxLength);
+}
+
 function buildClassifierPrompt(cleanText, imageDescription = "") {
-  return `You are an expert Ethiopian marketplace (Yegna Gebeya) ad classifier for English and Amharic listings.
-Classify the PRIMARY item/service being sold or rented into EXACTLY ONE category from this list:
+  return `You are an expert Ethiopian marketplace (Yegna Gebeya) listing specialist fluent in BOTH Amharic (አማርኛ) and English.
+Carefully inspect ALL provided photos AND read the listing text (Amharic, English, or mixed) to classify and extract accurate structured details.
+
+Categories (choose EXACTLY ONE):
 - "Cars": Whole cars, SUVs, pickups, trucks, EVs, minibuses for sale (even if mentioning new tires/battery/parts).
-- "Houses": Houses, villas, condominiums, apartments, buildings, or land/plots FOR SALE (even if mentioning granite kitchen, ceramic floor, gypsum ceiling, or furnished items).
-- "Rentals": Apartments, houses, rooms, villas, offices, shops, or warehouses FOR RENT / LEASE (monthly/ኪራይ/ለኪራይ), even if furnished with TV/sofa/bed.
+- "Houses": Houses, villas, condominiums, apartments, buildings, or land/plots FOR SALE (even if mentioning granite kitchen, ceramic floor, or furnished items).
+- "Rentals": Apartments, houses, rooms, villas, offices, shops, or warehouses FOR RENT / LEASE (monthly/ኪራይ/ለኪራይ).
 - "Electronics": Smartphones, laptops, TVs, gaming consoles, cameras, fridges, washing machines, solar/inverters.
 - "Furniture": Sofas, beds, mattresses, dining tables, chairs, wardrobes, cabinets, office desks sold separately.
 - "Clothes": Clothing, shoes, sneakers, jackets, dresses, suits, watches, handbags, traditional habesha kemis.
-- "Building Materials": Standalone construction/finishing materials sold as supply (granite/marble slabs, ceramic tiles per sqm, cement bags, rebar, steel, gypsum board, paint buckets, sand, gravel, pipes).
-- "Spare Parts": Standalone auto/machine replacement parts sold individually (car battery, tires/rims, headlights, bumpers, shock absorbers, brake pads, filters, engine oil) when NOT selling a whole car.
-- "Labor & Services": Jobs or skilled services (driver, plumber, electrician, painter, mechanic, cleaner, tutor, delivery, construction contractor, brokerage service).
-- "ምንአለሽ_ተራ": Any other legitimate general merchandise (bicycles, gym equipment, kitchenware, perfumes, tools, farm goods, etc.).
+- "Building Materials": Standalone construction/finishing materials sold as supply (granite/marble slabs, ceramic tiles per sqm, cement bags, rebar, steel, gypsum board, paint buckets).
+- "Spare Parts": Standalone auto/machine replacement parts sold individually (car battery, tires/rims, headlights, bumpers, shock absorbers, brake pads, filters) when NOT selling a whole car.
+- "Labor & Services": Jobs or skilled services (driver, plumber, electrician, painter, mechanic, cleaner, tutor, delivery, brokerage).
+- "ምንአለሽ_ተራ": Any other general merchandise.
 
-Subcategory examples:
-- Cars: "Electric (EV)", "SUV / Crossover", "Sedan", "Pickup / Truck", "Hatchback / Compact", "Van / Minibus"
-- Houses: "Villa / House", "Condominium", "Apartment", "Plot / Land"
-- Rentals: "Apartment Rent", "Villa Rent", "Commercial / Office", "Shop / Store", "Warehouse / Hall"
-- Electronics: "Smartphones & Tablets", "Laptops & Computers", "TV & Home Entertainment", "Gaming & Consoles", "Home Appliances"
-- Building Materials: "Granite, Marble & Tiles", "Cement & Steel", "Paint, Wood & Gypsum", "Plumbing & Electrical"
-- Spare Parts: "Tires & Rims", "Electrical & Lights", "Engine & Filters", "Body & Suspension"
+Amharic/Ethiopian context guide:
+- Prices: ሚሊዮን (million), ሺህ (thousand), ብር (ETB), ድርድር/ተደራዳሪ (Negotiable), ፊክስድ (Fixed).
+- Fuel/Gear: ናፍጣ (Diesel), ቤንዚን (Petrol), ኤሌክትሪክ (Electric), ኦቶማቲክ (Automatic), ማኑዋል (Manual).
+- Cars: ዶልፊን/ሀይኤስ (Toyota HiAce Dolphin), ታርጋ/ኮድ (Plate e.g. Code 3 AA, Code 2 OR), 2WD/4WD, LHD/RHD.
+
+Rules:
+- Inspect photos visually for make, model, bodyType (e.g. "Short / Standard Roof Minibus (Full Side Windows)"), color (e.g. "Blue (with Black Bumper & Alloy Wheels)"), and visible extras (roof cargo rack, alloy rims, sliding door, glass windows, interior condition).
+- NEVER guess or invent unseen engine codes, odometer readings, or plate numbers; return "" if neither visible nor stated.
+- keyFeatures: 3 to 6 concise bullet points combining visual details observed in the photos and condition/extras from the text.
+- title / suggestedTitle: clean headline WITHOUT emojis or "FOR SALE:" prefix (e.g. "Toyota HiAce (Dolphin) – Full Glass Van").
 
 Listing text:
 """
-${cleanText.slice(0, 1200)}
+${(cleanText || "(No text provided — inspect the photos carefully.)").slice(0, 1400)}
 """${imageDescription ? `\nPhoto visual description:\n"""\n${imageDescription}\n"""` : ""}
 
-Return ONLY valid JSON with keys: category, subcategory, brand, model, year, trim, bodyType, fuelType, transmission, suggestedTitle, confidence (0.0 to 1.0).`;
+Return ONLY valid JSON with keys: category, subcategory, title, suggestedTitle, makeModel, brand, model, year, trim, bodyType, engine, fuelType, transmission, drivetrain, steering, plateNumber, mileage, color, keyFeatures (string array), price (number), priceType ("Negotiable" or "Fixed" or ""), city, subcity, condition ("New" or "Used"), description, confidence (0.0 to 1.0).`;
 }
 
-async function classifyAdWithAI(cleanText, firstImageFileId, specs, ruleResult, env) {
+async function classifyAdWithAI(cleanText, imageInputs, specs, ruleResult, env) {
   const geminiKey = cleanEnv(env.GEMINI_API_KEY);
-  // Fetch photo once if either Gemini or Workers AI needs visual context
-  const needsImage = Boolean(firstImageFileId && (geminiKey || env.AI));
-  const photoData = needsImage ? await fetchTelegramPhotoBase64(firstImageFileId, env) : null;
+  const inputList = Array.isArray(imageInputs)
+    ? imageInputs.filter(Boolean).slice(0, 4)
+    : imageInputs
+      ? [imageInputs]
+      : [];
+
+  // Normalize image inputs: either pre-encoded { base64, mimeType } from website OR Telegram file_ids
+  const photoDataList = [];
+  if (inputList.length > 0 && (geminiKey || env.AI)) {
+    for (const item of inputList) {
+      if (item && typeof item === "object" && typeof item.base64 === "string" && item.base64.length > 0) {
+        photoDataList.push({
+          base64: item.base64.replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, ""),
+          mimeType: String(item.mimeType || "image/jpeg").split(";")[0]
+        });
+      } else if (typeof item === "string") {
+        const fetched = await fetchTelegramPhotoBase64(item, env);
+        if (fetched) photoDataList.push(fetched);
+      }
+    }
+  }
 
   // 1. Primary AI: Google Gemini (`gemini-4-hydrogen`) when GEMINI_API_KEY is configured
   if (geminiKey) {
     try {
       const parts = [{ text: buildClassifierPrompt(cleanText) }];
-      if (photoData) {
-        parts.push({ inlineData: { mimeType: photoData.mimeType, data: photoData.base64 } });
+      for (const p of photoDataList) {
+        parts.push({ inlineData: { mimeType: p.mimeType, data: p.base64 } });
       }
 
       const res = await fetch(
@@ -1180,25 +1385,39 @@ async function classifyAdWithAI(cleanText, firstImageFileId, specs, ruleResult, 
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          signal: getTimeoutSignal(9000),
+          signal: getTimeoutSignal(12000),
           body: JSON.stringify({
             contents: [{ parts }],
             generationConfig: {
-              temperature: 0.1,
               responseMimeType: "application/json",
               responseSchema: {
                 type: "OBJECT",
                 properties: {
                   category: { type: "STRING", enum: MARKETPLACE_CATEGORIES },
                   subcategory: { type: "STRING" },
+                  title: { type: "STRING" },
+                  suggestedTitle: { type: "STRING" },
+                  makeModel: { type: "STRING" },
                   brand: { type: "STRING" },
                   model: { type: "STRING" },
                   year: { type: "STRING" },
                   trim: { type: "STRING" },
                   bodyType: { type: "STRING" },
+                  engine: { type: "STRING" },
                   fuelType: { type: "STRING" },
                   transmission: { type: "STRING" },
-                  suggestedTitle: { type: "STRING" },
+                  drivetrain: { type: "STRING" },
+                  steering: { type: "STRING" },
+                  plateNumber: { type: "STRING" },
+                  mileage: { type: "STRING" },
+                  color: { type: "STRING" },
+                  keyFeatures: { type: "ARRAY", items: { type: "STRING" } },
+                  price: { type: "NUMBER" },
+                  priceType: { type: "STRING" },
+                  city: { type: "STRING" },
+                  subcity: { type: "STRING" },
+                  condition: { type: "STRING" },
+                  description: { type: "STRING" },
                   confidence: { type: "NUMBER" }
                 },
                 required: ["category", "subcategory"]
@@ -1225,34 +1444,38 @@ async function classifyAdWithAI(cleanText, firstImageFileId, specs, ruleResult, 
   if (env.AI) {
     let imageDescription = "";
 
-    // If post has an image (especially helpful when caption is short/missing or ambiguous), inspect photo via Llama 3.2 Vision
-    if (photoData && (cleanText.length < 40 || ruleResult.confidence < 0.8 || (!specs.brand && ruleResult.category === "Cars"))) {
-      try {
-        const visionOut = await Promise.race([
-          env.AI.run("@cf/meta/llama-3.2-11b-vision-instruct", {
-            messages: [
-              {
-                role: "user",
-                content: [
-                  {
-                    type: "text",
-                    text: "Briefly describe what item is for sale in this image (e.g., car brand/model/body type, house/apartment, smartphone/laptop, sofa/furniture, shoes/clothes, granite/tiles/cement, or car spare part/tire) in 1-2 short sentences."
-                  },
-                  {
-                    type: "image_url",
-                    image_url: { url: `data:${photoData.mimeType};base64,${photoData.base64}` }
-                  }
-                ]
-              }
-            ],
-            max_tokens: 120
-          }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("vision_timeout")), 6500))
-        ]);
-        imageDescription = String(visionOut?.response || visionOut?.description || "").trim();
-      } catch (vErr) {
-        console.warn("Workers AI vision skipped:", vErr.message);
+    if (photoDataList.length > 0) {
+      const descriptions = [];
+      for (const p of photoDataList.slice(0, 2)) {
+        try {
+          const visionOut = await Promise.race([
+            env.AI.run("@cf/meta/llama-3.2-11b-vision-instruct", {
+              messages: [
+                {
+                  role: "user",
+                  content: [
+                    {
+                      type: "text",
+                      text: "Describe this marketplace item in detail: exact vehicle make/model/series or product, body style (e.g. minibus, full glass van, SUV, sedan), exterior color, visible extras (roof cargo rack, alloy rims, sliding door, seats, interior condition, plate code if readable), or property/electronics details."
+                    },
+                    {
+                      type: "image_url",
+                      image_url: { url: `data:${p.mimeType};base64,${p.base64}` }
+                    }
+                  ]
+                }
+              ],
+              max_tokens: 180
+            }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("vision_timeout")), 7000))
+          ]);
+          const desc = String(visionOut?.response || visionOut?.description || "").trim();
+          if (desc) descriptions.push(desc);
+        } catch (vErr) {
+          console.warn("Workers AI vision skipped:", vErr.message);
+        }
       }
+      imageDescription = descriptions.join(" | ");
     }
 
     try {
@@ -1261,7 +1484,7 @@ async function classifyAdWithAI(cleanText, firstImageFileId, specs, ruleResult, 
           messages: [
             {
               role: "system",
-              content: "You are an accurate JSON-only Ethiopian marketplace classifier. Never output markdown or explanations, only valid JSON."
+              content: "You are an accurate JSON-only Ethiopian marketplace classifier fluent in Amharic and English. Never output markdown or explanations, only valid JSON."
             },
             {
               role: "user",
@@ -1269,9 +1492,9 @@ async function classifyAdWithAI(cleanText, firstImageFileId, specs, ruleResult, 
             }
           ],
           temperature: 0.1,
-          max_tokens: 300
+          max_tokens: 550
         }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("llm_timeout")), 7000))
+        new Promise((_, reject) => setTimeout(() => reject(new Error("llm_timeout")), 8000))
       ]);
 
       const parsed = parseJsonObjectSafe(llmOut?.response ?? llmOut);
@@ -1287,6 +1510,117 @@ async function classifyAdWithAI(cleanText, firstImageFileId, specs, ruleResult, 
   }
 
   return null;
+}
+
+async function handleWebsiteAiPrepare(request, env) {
+  try {
+    const body = await request.json().catch(() => ({}));
+    const images = Array.isArray(body.images) ? body.images.slice(0, 4) : [];
+    const rawText = typeof body.text === "string" ? body.text.trim() : "";
+
+    if (images.length === 0 && !rawText) {
+      return jsonCorsResponse({ error: "Please select at least one photo or write brief ad notes." }, 400);
+    }
+
+    const normalized = normalizeEthiopicNumerals(rawText);
+    const specs = detectBrandModelYear(normalized);
+    const ruleResult = detectCategoryWeighted(normalized, specs.brand, specs.subcategory);
+    const aiResult = await classifyAdWithAI(normalized, images, specs, ruleResult, env);
+
+    const category = normalizeCategory(aiResult?.category) || ruleResult.category;
+    const subcategory = cleanSpecValue(aiResult?.subcategory) || ruleResult.subcategory || DEFAULT_SUBCATEGORIES[category] || "";
+    const brand = cleanSpecValue(aiResult?.brand) || specs.brand;
+    const model = cleanSpecValue(aiResult?.model) || specs.model;
+    const year = cleanSpecValue(aiResult?.year) || specs.year;
+    const makeModel = cleanSpecValue(aiResult?.makeModel) || [brand, model].filter(Boolean).join(" ").trim();
+    const title =
+      cleanSpecValue(aiResult?.title || aiResult?.suggestedTitle) ||
+      arrangeTitle({ brand, model, year, trim: specs.trim, cleanText: rawText, category, subcategory });
+
+    const parsedPrice = parseMathematicalPrice(normalized, year);
+    const aiPriceNum = aiResult?.price ? Number(String(aiResult.price).replace(/[^0-9.]/g, "")) : 0;
+    const finalPrice = parsedPrice.rawPrice > 0 ? parsedPrice.rawPrice : !Number.isNaN(aiPriceNum) && aiPriceNum > 0 ? Math.round(aiPriceNum) : 0;
+    const loc = extractCityAndSubcity(normalized);
+
+    const prepared = {
+      title,
+      category,
+      subcategory,
+      condition: cleanSpecValue(aiResult?.condition) || (/(brand\s*new|zero\s*km|0\s*km|አዲስ)/i.test(normalized) ? "New" : "Used"),
+      makeModel,
+      brand,
+      model,
+      year,
+      bodyType: cleanSpecValue(aiResult?.bodyType) || specs.bodyType,
+      engine: cleanSpecValue(aiResult?.engine),
+      fuelType: cleanSpecValue(aiResult?.fuelType) || specs.fuelType,
+      transmission: cleanSpecValue(aiResult?.transmission) || specs.transmission,
+      drivetrain: cleanSpecValue(aiResult?.drivetrain),
+      steering: cleanSpecValue(aiResult?.steering),
+      plateNumber: cleanSpecValue(aiResult?.plateNumber),
+      mileage: cleanSpecValue(aiResult?.mileage),
+      color: cleanSpecValue(aiResult?.color),
+      keyFeatures: Array.isArray(aiResult?.keyFeatures)
+        ? aiResult.keyFeatures.map((f) => cleanSpecValue(f)).filter(Boolean).slice(0, 6)
+        : [],
+      price: finalPrice,
+      priceType: cleanSpecValue(aiResult?.priceType) || (/(fixed|ፊክስድ)/i.test(normalized) ? "Fixed" : /(negotiable|ድርድር|ተደራዳሪ)/i.test(normalized) ? "Negotiable" : ""),
+      city: cleanSpecValue(aiResult?.city) || loc.city || "Addis Ababa",
+      subcity: cleanSpecValue(aiResult?.subcity) || loc.subcity || "",
+      description: cleanSpecValue(aiResult?.description) || rawText
+    };
+
+    return jsonCorsResponse({
+      success: true,
+      provider: aiResult?.provider || "rules",
+      prepared
+    });
+  } catch (err) {
+    return jsonCorsResponse({ error: err.message || "AI prepare failed" }, 500);
+  }
+}
+
+async function handleWebsiteTelegramPost(request, env) {
+  try {
+    const botToken = cleanEnv(env.TELEGRAM_BOT_TOKEN);
+    const targetChannel = cleanEnv(env.REPOST_CHANNEL_ID) || "@mebrigranite";
+    if (!botToken) {
+      return jsonCorsResponse({ ok: false, error: "TELEGRAM_BOT_TOKEN is not configured on Worker." }, 503);
+    }
+
+    const body = await request.json().catch(() => ({}));
+    const imageUrls = Array.isArray(body.images)
+      ? body.images.filter((u) => typeof u === "string" && /^https?:\/\//i.test(u)).slice(0, 10)
+      : [];
+    const postText = buildStructuredTelegramPost(body, imageUrls.length > 0 ? 1020 : 4000);
+
+    if (imageUrls.length === 0) {
+      await callTelegram("sendMessage", {
+        chat_id: targetChannel,
+        text: safeSubstring(postText, 4096)
+      }, env);
+    } else if (imageUrls.length === 1) {
+      await callTelegram("sendPhoto", {
+        chat_id: targetChannel,
+        photo: imageUrls[0],
+        caption: safeSubstring(postText, 1024)
+      }, env);
+    } else {
+      const media = imageUrls.map((url, index) => ({
+        type: "photo",
+        media: url,
+        ...(index === 0 ? { caption: safeSubstring(postText, 1024) } : {})
+      }));
+      await callTelegram("sendMediaGroup", {
+        chat_id: targetChannel,
+        media
+      }, env);
+    }
+
+    return jsonCorsResponse({ ok: true, channel: targetChannel });
+  } catch (err) {
+    return jsonCorsResponse({ ok: false, error: err.message || "Telegram broadcast failed" }, 500);
+  }
 }
 
 // ============================================
@@ -1679,7 +2013,7 @@ function parseMathematicalPrice(text, knownYear) {
     }
   }
 
-  const generalMillionMatch = text.match(/([0-9]+(?:[.,][0-9]+)*)\s*(?:ETB|ብር|Birr)?\s*(?:million|mil|mln|m|ሚሊዮን|ሚሊየን)\b/i);
+  const generalMillionMatch = text.match(/([0-9]+(?:[.,][0-9]+)*)\s*(?:ETB|ብር|Birr)?\s*(?:(?:million|mil|mln|m)\b|ሚሊዮን|ሚሊየን)/i);
   if (generalMillionMatch && generalMillionMatch[1]) {
     const val = parseFloat(generalMillionMatch[1].replace(/,/g, ""));
     if (!isNaN(val) && val > 0) {
@@ -1688,7 +2022,7 @@ function parseMathematicalPrice(text, knownYear) {
     }
   }
 
-  const thousandMatch = text.match(/([0-9]+(?:[.,][0-9]+)*)\s*(?:ETB|ብር|Birr)?\s*(?:k|thousand|ሺህ|ሺ)\b/i);
+  const thousandMatch = text.match(/([0-9]+(?:[.,][0-9]+)*)\s*(?:ETB|ብር|Birr)?\s*(?:(?:k|thousand)\b|ሺህ|ሺ)/i);
   if (thousandMatch && thousandMatch[1]) {
     const val = parseFloat(thousandMatch[1].replace(/,/g, ""));
     if (!isNaN(val) && val > 0 && val < 10000) {
